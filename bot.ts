@@ -4,12 +4,16 @@ import {
   Keypair,
   VersionedTransaction,
   PublicKey,
+  SystemProgram,
+  Transaction,
+  type Finality,
 } from "@solana/web3.js";
 import fetch from "node-fetch";
 import bs58 from "bs58";
 import https from "https";
+import express from "express";
 
-/* ================= THE CONFIGURATION MATRIX ================= */
+/* ================= CONFIG ================= */
 
 const RPC_URL = process.env.RPC_URL!;
 const connection = new Connection(RPC_URL, {
@@ -20,39 +24,83 @@ const connection = new Connection(RPC_URL, {
 const wallet = Keypair.fromSecretKey(bs58.decode(process.env.PRIVATE_KEY!));
 const TARGET_WALLET = new PublicKey(process.env.TARGET_WALLET!);
 
-// Execution bounds
 const BUY_AMOUNT = Number(process.env.BUY_AMOUNT_SOL) * 1e9;
-const BASE_PRIORITY_FEE = Number(process.env.PRIORITY_FEE_LAMPORTS ?? 3_000_000);
-const SLIPPAGE_BPS = Number(process.env.SLIPPAGE_BPS ?? 1500); // 15% slippage
+const BASE_PRIORITY_FEE = Number(process.env.PRIORITY_FEE_LAMPORTS ?? 500_000);
+const SLIPPAGE_BPS = Number(process.env.SLIPPAGE_BPS ?? 1500);
+const MIN_BUY_SOL = Number(process.env.MIN_BUY_SOL ?? 0.01) * 1e9;
 
 const SOL_MINT = "So11111111111111111111111111111111111111112";
 const JUP_BASE = "https://quote-api.jup.ag/v6";
 
-// Tactical Exit Strategy
 const TP_TIERS = [
-  { tp: 7.0, sellFraction: 0.5 },   // At +700%, sell 50% of the bag
-  { tp: 11.0, sellFraction: 0.3 },  // At +1100%, sell 30% of the bag
-  { tp: 15.0, sellFraction: 0.2 },  // At +1500%, sell the remaining 20%
+  { tp: 7.0, sellFraction: 0.5 },
+  { tp: 11.0, sellFraction: 0.3 },
+  { tp: 15.0, sellFraction: 0.2 },
 ];
-const SL_PCT = -0.35;         // Hard panic stop at -35%
-const TRAIL_DRAWDOWN = -0.2;  // 20% trailing stop (activates only in profit)
-const MAX_HOLD_MS = 5 * 60 * 1000; // Time-based exit limit (5 minutes)
+const SL_PCT = -0.35;
+const TRAIL_DRAWDOWN = -0.2;
+const MAX_HOLD_MS = 5 * 60 * 1000;
 
-/* ================= NETWORK LAYER ================= */
+/* ================= KNOWN SWAP PROGRAMS ================= */
 
-// Keep-Alive agent prevents network handshake delays on rapid requests
+const PUMPFUN_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
+const PUMPSWAP_PROGRAM = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
+const RAYDIUM_V4_PROGRAM = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
+const JUPITER_PROGRAM = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4";
+const SWAP_PROGRAMS = new Set([PUMPFUN_PROGRAM, PUMPSWAP_PROGRAM, RAYDIUM_V4_PROGRAM, JUPITER_PROGRAM]);
+
+function getResolvedAccountKeys(tx: any): PublicKey[] {
+  const staticKeys: PublicKey[] = tx.transaction?.message?.staticAccountKeys ?? [];
+  const loaded = tx.meta?.loadedAddresses;
+  const writable: PublicKey[] = loaded?.writable ?? [];
+  const readonly: PublicKey[] = loaded?.readonly ?? [];
+  return [...staticKeys, ...writable, ...readonly];
+}
+
+function isRealSwap(tx: any): boolean {
+  const keys = getResolvedAccountKeys(tx).map((k) => k.toString());
+  return keys.some((key) => SWAP_PROGRAMS.has(key));
+}
+
+function getTargetSolDelta(tx: any): number | null {
+  const keys = getResolvedAccountKeys(tx);
+  const idx = keys.findIndex((k) => k.toString() === TARGET_WALLET.toString());
+  if (idx === -1 || !tx.meta?.preBalances || !tx.meta?.postBalances) return null;
+  return tx.meta.preBalances[idx] - tx.meta.postBalances[idx];
+}
+
+/* ================= JITO ================= */
+
+const JITO_BLOCK_ENGINE_URL = "https://mainnet.block-engine.jito.wtf/api/v1/bundles";
+const JITO_TIP_ACCOUNTS = [
+  "9n3d1K5YD2vECAbRFhFFGYNNjiXtHXJWn9F31t89vsAV",
+  "aTtUk2DHgLhKZRDjePq6eiHRKC1XXFMBiSUfQ2JNDbN",
+  "B1mrQSpdeMU9gCvkJ6VsXVVoYjRGkNA7TtjMyqxrhecH",
+  "9ttgPBBhRYFuQccdR1DSnb7hydsWANoDsV3P9kaGMCEh",
+  "4xgEmT58RwTNsF5xm2RMYCnR1EVukdK8a1i2qFjnJFu3",
+  "EoW3SUQap7ZeynXQ2QJ847aerhxbPVr843uMeTfc9dxM",
+  "E2eSqe33tuhAHKTrwky5uEjaVqnb2T9ns6nHHUrN8588",
+  "ARTtviJkLLt6cHGQDydfo1Wyk6M4VGZdKZ2ZhdnJL336",
+];
+const JITO_TIP_LAMPORTS = Number(process.env.JITO_TIP_LAMPORTS ?? 2_000_000);
+
+function randomTipAccount(): PublicKey {
+  return new PublicKey(JITO_TIP_ACCOUNTS[Math.floor(Math.random() * JITO_TIP_ACCOUNTS.length)]);
+}
+
+/* ================= NETWORK ================= */
+
 const agent = new https.Agent({ keepAlive: true });
 
 async function fetchJson(url: string, options: any = {}) {
   return fetch(url, { agent, ...options }).then((r: any) => r.json());
 }
 
-// Jittered priority fee to avoid block bundling collisions
 function getPriorityFee() {
   return Math.floor(BASE_PRIORITY_FEE * (1 + Math.random()));
 }
 
-/* ================= POSITION STATE MACHINE ================= */
+/* ================= STATE ================= */
 
 interface Position {
   mint: string;
@@ -60,7 +108,7 @@ interface Position {
   remainingAmount: number;
   costBasisLamports: number;
   entryTime: number;
-  highestValue: number; 
+  highestValue: number;
   tiersHit: boolean[];
 }
 
@@ -68,7 +116,7 @@ const positions = new Map<string, Position>();
 const inFlight = new Set<string>();
 const seenSignatures = new Set<string>();
 
-/* ================= JUPITER ROUTING ================= */
+/* ================= JUPITER ================= */
 
 async function getQuote(inputMint: string, outputMint: string, amount: number) {
   const url = `${JUP_BASE}/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${Math.floor(
@@ -86,33 +134,42 @@ async function buildSwapTx(quoteResponse: any) {
     body: JSON.stringify({
       quoteResponse,
       userPublicKey: wallet.publicKey.toString(),
-      wrapAndUnwrapSol: true, // Crucial correct key for Jupiter v6
+      wrapAndUnwrapSol: true,
       prioritizationFeeLamports: getPriorityFee(),
       dynamicComputeUnitLimit: true,
     }),
   });
-  if (!data || data.error || !data.swapTransaction) {
-    console.log("❌ Swap build error:", data?.error ?? "unknown");
-    return null;
-  }
+  if (!data || data.error || !data.swapTransaction) return null;
   return data.swapTransaction;
 }
 
-async function sendSwap(txBase64: string) {
+async function sendSwapViaJito(txBase64: string): Promise<string | null> {
   try {
-    const tx = VersionedTransaction.deserialize(Buffer.from(txBase64, "base64"));
-    tx.sign([wallet]);
-    return await connection.sendRawTransaction(tx.serialize(), {
-      skipPreflight: true,
-      maxRetries: 3,
+    const swapTx = VersionedTransaction.deserialize(Buffer.from(txBase64, "base64"));
+    swapTx.sign([wallet]);
+
+    const { blockhash } = await connection.getLatestBlockhash("processed");
+    const tipTx = new Transaction({ feePayer: wallet.publicKey, recentBlockhash: blockhash }).add(
+      SystemProgram.transfer({
+        fromPubkey: wallet.publicKey,
+        toPubkey: randomTipAccount(),
+        lamports: JITO_TIP_LAMPORTS,
+      })
+    );
+    tipTx.sign(wallet);
+
+    const bundle = [bs58.encode(swapTx.serialize()), bs58.encode(tipTx.serialize())];
+    const res = await fetchJson(JITO_BLOCK_ENGINE_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "sendBundle", params: [bundle] }),
     });
-  } catch (e: any) {
-    console.log("❌ Send error:", e.message);
-    return null;
-  }
+
+    return res?.result ?? null;
+  } catch { return null; }
 }
 
-/* ================= ASYNC BALANCE VERIFICATION ================= */
+/* ================= BALANCE ================= */
 
 async function getTokenBalance(mint: string): Promise<number> {
   try {
@@ -120,12 +177,9 @@ async function getTokenBalance(mint: string): Promise<number> {
       mint: new PublicKey(mint),
     });
     return Number(accs.value[0]?.account.data.parsed.info.tokenAmount.amount ?? 0);
-  } catch {
-    return 0;
-  }
+  } catch { return 0; }
 }
 
-// Retries checking the balance to prevent race conditions where processed blocks lag
 async function waitForBalance(mint: string, attempts = 6, delayMs = 500): Promise<number> {
   for (let i = 0; i < attempts; i++) {
     const bal = await getTokenBalance(mint);
@@ -135,17 +189,7 @@ async function waitForBalance(mint: string, attempts = 6, delayMs = 500): Promis
   return 0;
 }
 
-/* ================= HOT PATH: BUY EXECUTION ================= */
-
-function passesFilters(quote: any) {
-  const impact = Number(quote.priceImpactPct ?? 0);
-  if (impact > 0.15) {
-    console.log(`⏭️ Skipped: Price impact too high (${(impact * 100).toFixed(2)}%)`);
-    return false;
-  }
-  if (Number(quote.outAmount) <= 0) return false;
-  return true;
-}
+/* ================= EXECUTION ================= */
 
 async function executeBuy(mint: string) {
   if (positions.has(mint) || inFlight.has(mint)) return;
@@ -153,41 +197,30 @@ async function executeBuy(mint: string) {
 
   try {
     const quote = await getQuote(SOL_MINT, mint, BUY_AMOUNT);
-    if (!quote || !passesFilters(quote)) return;
+    if (!quote || Number(quote.priceImpactPct) > 0.15) return;
 
     const tx = await buildSwapTx(quote);
     if (!tx) return;
 
-    const sig = await sendSwap(tx);
+    const sig = await sendSwapViaJito(tx);
     if (!sig) return;
 
-    console.log(`🚀 BUY Executed | Mint: ${mint} | Sig: ${sig}`);
-
-    // Wait for the on-chain balance to confirm before tracking
     const actual = await waitForBalance(mint);
-    if (actual <= 0) {
-      console.log(`⚠️ Balance unconfirmed for ${mint}. Manual intervention may be required.`);
-      return;
-    }
+    if (actual <= 0) return;
 
-    // Register into the Position State Machine
     positions.set(mint, {
       mint,
       originalAmount: actual,
       remainingAmount: actual,
       costBasisLamports: BUY_AMOUNT,
       entryTime: Date.now(),
-      highestValue: 0, 
+      highestValue: 0,
       tiersHit: TP_TIERS.map(() => false),
     });
-    
-    console.log(`🎯 Position Tracked: ${actual} tokens secured.`);
   } finally {
     inFlight.delete(mint);
   }
 }
-
-/* ================= COLD PATH: SELL EXECUTION ================= */
 
 async function executeSell(mint: string, amount: number, reason: string) {
   const pos = positions.get(mint);
@@ -199,22 +232,17 @@ async function executeSell(mint: string, amount: number, reason: string) {
   const tx = await buildSwapTx(quote);
   if (!tx) return;
 
-  const sig = await sendSwap(tx);
+  const sig = await sendSwapViaJito(tx);
   if (!sig) return;
-
-  console.log(`✅ SELL Executed (${reason}) | Mint: ${mint} | Sig: ${sig}`);
 
   const soldFraction = amount / pos.remainingAmount;
   pos.remainingAmount -= amount;
   pos.costBasisLamports -= pos.costBasisLamports * soldFraction;
 
-  if (pos.remainingAmount <= 0) {
-    positions.delete(mint);
-    console.log(`🏁 Position fully closed for ${mint}.`);
-  }
+  if (pos.remainingAmount <= 0) positions.delete(mint);
 }
 
-/* ================= BACKGROUND RISK MONITOR ================= */
+/* ================= MONITOR ================= */
 
 async function monitor() {
   for (const [mint, pos] of positions.entries()) {
@@ -222,91 +250,54 @@ async function monitor() {
 
     getQuote(mint, SOL_MINT, pos.remainingAmount).then((quote) => {
       if (!quote) return;
-
       const value = Number(quote.outAmount);
       const pnl = (value - pos.costBasisLamports) / pos.costBasisLamports;
 
-      // 1. Hard Stop Loss (Checked independently)
-      if (pnl <= SL_PCT) {
-        executeSell(mint, pos.remainingAmount, `Hard SL ${(pnl * 100).toFixed(0)}%`);
+      if (pnl <= SL_PCT || Date.now() - pos.entryTime > MAX_HOLD_MS) {
+        executeSell(mint, pos.remainingAmount, "Panic/Time Exit");
         return;
       }
-
-      // 2. Time-Based Ejection
-      if (Date.now() - pos.entryTime > MAX_HOLD_MS) {
-        executeSell(mint, pos.remainingAmount, "Max Hold Time Exceeded");
-        return;
-      }
-
-      // 3. Dynamic Trailing Stop (Only activates once the position hits true profit)
       if (value > pos.costBasisLamports) {
         if (value > pos.highestValue) pos.highestValue = value;
-
         const drawdown = (value - pos.highestValue) / pos.highestValue;
         if (pos.highestValue > pos.costBasisLamports && drawdown < TRAIL_DRAWDOWN) {
-          executeSell(mint, pos.remainingAmount, `Trailing Stop (${(drawdown * 100).toFixed(0)}% from peak)`);
-          return;
-        }
-      }
-
-      // 4. Fractional Take Profit Tiers
-      for (let i = 0; i < TP_TIERS.length; i++) {
-        if (pos.tiersHit[i]) continue;
-        
-        if (pnl >= TP_TIERS[i].tp) {
-          const sellAmount = Math.min(
-            Math.floor(pos.originalAmount * TP_TIERS[i].sellFraction),
-            pos.remainingAmount
-          );
-          
-          if (sellAmount > 0) {
-            executeSell(mint, sellAmount, `TP Tier ${i + 1} Hit (+${(TP_TIERS[i].tp * 100).toFixed(0)}%)`);
-            pos.tiersHit[i] = true;
-          }
+          executeSell(mint, pos.remainingAmount, "Trailing Stop");
         }
       }
     });
   }
 }
-
-// Decoupled monitor loop polling every 1.5 seconds
 setInterval(monitor, 1500);
 
-/* ================= ZERO-LATENCY EVENT LISTENER ================= */
+/* ================= DETECTION ================= */
 
 async function handleTx(signature: string) {
   if (seenSignatures.has(signature)) return;
   seenSignatures.add(signature);
 
   try {
-    // FIXED: Swapped 'processed' to 'confirmed' finality target to satisfy the Solana API requirements
     const tx = await connection.getTransaction(signature, {
-      commitment: "confirmed",
+      commitment: "processed" as Finality,
       maxSupportedTransactionVersion: 0,
     });
     if (!tx?.meta) return;
 
-    for (const b of tx.meta.postTokenBalances ?? []) {
-      if (b.owner !== TARGET_WALLET.toString()) continue;
-      if (b.mint === SOL_MINT) continue;
+    if (!isRealSwap(tx)) return;
 
-      console.log(`🔥 Signal Detected: Wallet purchased ${b.mint}`);
-      executeBuy(b.mint);
+    const solDelta = getTargetSolDelta(tx);
+    if (solDelta !== null && solDelta < MIN_BUY_SOL) return;
+
+    for (const b of tx.meta.postTokenBalances ?? []) {
+      if (b.owner === TARGET_WALLET.toString() && b.mint !== SOL_MINT) {
+        executeBuy(b.mint);
+      }
     }
   } catch {}
 }
 
-/* ================= SYSTEM BOOT ================= */
-
-console.log("=========================================");
-console.log("🚀 V11 Quantitative Execution Engine Armed");
-console.log(`📡 Tracking Target: ${TARGET_WALLET.toString()}`);
-console.log("=========================================");
+/* ================= KEEP-ALIVE SERVER ================= */
+const app = express();
+app.get("/", (req, res) => res.send("Engine Active"));
+app.listen(process.env.PORT || 3000);
 
 connection.onLogs(TARGET_WALLET, (log) => handleTx(log.signature), "processed");
-/* ================= CLOUD DISGUISE ================= */
-import express from "express";
-const app = express();
-app.get("/", (req, res) => res.send("V11 Engine is Live"));
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Web server listening on port ${PORT}`));
