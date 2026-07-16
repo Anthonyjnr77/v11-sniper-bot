@@ -47,6 +47,30 @@ const SL_PCT = -0.35;
 const TRAIL_DRAWDOWN = -0.2;
 const MAX_HOLD_MS = 5 * 60 * 1000;
 
+/* ================= TELEGRAM ALERTS ================= */
+
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+
+async function sendTelegramAlert(message: string) {
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
+  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+  try {
+    await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: TELEGRAM_CHAT_ID,
+        text: message,
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+      }),
+    });
+  } catch (e: any) {
+    console.log("Telegram alert failed:", e.message);
+  }
+}
+
 /* ================= KNOWN SWAP PROGRAMS ================= */
 
 const PUMPFUN_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
@@ -84,13 +108,13 @@ async function initPumpDecoder() {
     const provider = new AnchorProvider(connection, {} as any, {});
     const idl = await Program.fetchIdl(new PublicKey(PUMPFUN_PROGRAM), provider);
     if (!idl) {
-      console.log("⚠️ Could not fetch Pump.fun IDL — fast path disabled, using getTransaction fallback only.");
+      console.log("⚠️ Could not fetch Pump.fun IDL — fast path disabled.");
       return;
     }
     pumpEventCoder = new BorshEventCoder(idl as any);
     console.log("✅ Pump.fun fast-path decoder ready");
   } catch (e: any) {
-    console.log("⚠️ Pump.fun decoder init failed:", e.message, "— fallback path only.");
+    console.log("⚠️ Pump.fun decoder init failed:", e.message);
   }
 }
 
@@ -172,10 +196,7 @@ async function persistPositions() {
 }
 
 async function loadPositions() {
-  if (!UPSTASH_URL || !UPSTASH_TOKEN) {
-    console.log("⚠️ No Upstash configured — positions will NOT survive a restart.");
-    return;
-  }
+  if (!UPSTASH_URL || !UPSTASH_TOKEN) return;
   try {
     const res = await fetch(`${UPSTASH_URL}/get/positions`, {
       headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` },
@@ -230,10 +251,7 @@ async function buildSwapTx(quoteResponse: any) {
       dynamicComputeUnitLimit: true,
     }),
   });
-  if (!data || data.error || !data.swapTransaction) {
-    console.log("Swap build error:", data?.error ?? "unknown");
-    return null;
-  }
+  if (!data || data.error || !data.swapTransaction) return null;
   return data.swapTransaction;
 }
 
@@ -313,11 +331,7 @@ async function waitForBalance(mint: string, attempts = 6, delayMs = 500): Promis
 
 function passesFilters(quote: any) {
   const impact = Number(quote.priceImpactPct ?? 0);
-  if (impact > 0.15) {
-    console.log("❌ Skipped — price impact too high:", impact);
-    return false;
-  }
-  return Number(quote.outAmount) > 0;
+  return impact <= 0.15 && Number(quote.outAmount) > 0;
 }
 
 /* ================= BUY ================= */
@@ -336,11 +350,12 @@ async function executeBuy(mint: string) {
     const sig = await sendSwapDual(tx);
     if (!sig) return;
 
-    console.log("🚀 BUY sent:", mint, sig, "at", Date.now());
+    console.log("🚀 BUY sent:", mint, sig);
 
     const actual = await waitForBalance(mint);
     if (actual <= 0) {
-      console.log("⚠️ Could not confirm balance for", mint, "— position NOT tracked. Check manually.");
+      console.log("⚠️ Could not confirm balance for", mint);
+      await sendTelegramAlert(`⚠️ <b>BALANCE WARNING</b>\nCould not confirm balance for <code>${mint}</code> after buy. Check manually.`);
       return;
     }
 
@@ -353,7 +368,13 @@ async function executeBuy(mint: string) {
       highestValue: 0,
       tiersHit: TP_TIERS.map(() => false),
     });
+    
     await persistPositions();
+    
+    // Telegram Buy Alert
+    const cleanSig = sig.split(":")[1] || sig;
+    await sendTelegramAlert(`🚀 <b>BUY EXECUTED</b>\nMint: <code>${mint}</code>\nAmount: ${(BUY_AMOUNT / 1e9).toFixed(3)} SOL\n<a href="https://solscan.io/tx/${cleanSig}">View on Solscan</a>`);
+    
   } finally {
     inFlight.delete(mint);
   }
@@ -382,6 +403,10 @@ async function executeSell(mint: string, amount: number, reason: string) {
 
   if (pos.remainingAmount <= 0) positions.delete(mint);
   await persistPositions();
+
+  // Telegram Sell Alert
+  const cleanSig = sig.split(":")[1] || sig;
+  await sendTelegramAlert(`✅ <b>SELL EXECUTED</b> (${reason})\nMint: <code>${mint}</code>\n<a href="https://solscan.io/tx/${cleanSig}">View on Solscan</a>`);
 }
 
 /* ================= MONITOR ================= */
@@ -434,7 +459,7 @@ async function monitor() {
 
 setInterval(monitor, 1500);
 
-/* ================= DETECTION (slow-path fallback) ================= */
+/* ================= DETECTION ================= */
 
 async function handleTx(signature: string) {
   if (seenSignatures.has(signature)) return;
@@ -446,25 +471,18 @@ async function handleTx(signature: string) {
       maxSupportedTransactionVersion: 0,
     });
     if (!tx?.meta) return;
-
     if (!isRealSwap(tx)) return;
 
     const solDelta = getTargetSolDelta(tx);
-    if (solDelta !== null && solDelta < MIN_BUY_SOL) {
-      console.log("⏭️ Skipped — below SOL threshold:", solDelta / 1e9);
-      return;
-    }
+    if (solDelta !== null && solDelta < MIN_BUY_SOL) return;
 
     for (const b of tx.meta.postTokenBalances ?? []) {
       if (b.owner !== TARGET_WALLET.toString()) continue;
       if (b.mint === SOL_MINT) continue;
 
-      console.log("🔥 DETECTED (slow path) real swap buy:", b.mint);
       executeBuy(b.mint);
     }
-  } catch (e: any) {
-    console.log("Detection error:", e.message);
-  }
+  } catch (e: any) {}
 }
 
 /* ================= KEEP-ALIVE SERVER ================= */
@@ -486,17 +504,17 @@ async function start() {
     (log) => {
       const fast = tryFastDecode(log.logs);
       if (fast && fast.user === TARGET_WALLET.toString() && fast.isBuy && fast.solAmount >= MIN_BUY_SOL) {
-        console.log("⚡ FAST-PATH detected buy:", fast.mint, "at", Date.now());
+        console.log("⚡ FAST-PATH detected buy:", fast.mint);
         executeBuy(fast.mint);
         return;
       }
-      // fallback path for anything the fast decoder didn't confidently catch
       handleTx(log.signature);
     },
     "processed"
   );
 
   console.log("✅ Bot fully running");
+  await sendTelegramAlert(`🟢 <b>V11 Engine Online</b>\nSniper deployed and actively watching target wallet:\n<code>${TARGET_WALLET.toString()}</code>`);
 }
 
 start();
