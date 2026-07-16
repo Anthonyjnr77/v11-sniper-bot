@@ -71,33 +71,9 @@ async function sendTelegramAlert(message: string) {
   }
 }
 
-/* ================= KNOWN SWAP PROGRAMS ================= */
+/* ================= KNOWN SWAP PROGRAMS (kept for reference / optional use) ================= */
 
 const PUMPFUN_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
-const PUMPSWAP_PROGRAM = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
-const RAYDIUM_V4_PROGRAM = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
-const JUPITER_PROGRAM = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4";
-const SWAP_PROGRAMS = new Set([PUMPFUN_PROGRAM, PUMPSWAP_PROGRAM, RAYDIUM_V4_PROGRAM, JUPITER_PROGRAM]);
-
-function getResolvedAccountKeys(tx: any): PublicKey[] {
-  const staticKeys: PublicKey[] = tx.transaction?.message?.staticAccountKeys ?? [];
-  const loaded = tx.meta?.loadedAddresses;
-  const writable: PublicKey[] = loaded?.writable ?? [];
-  const readonly: PublicKey[] = loaded?.readonly ?? [];
-  return [...staticKeys, ...writable, ...readonly];
-}
-
-function isRealSwap(tx: any): boolean {
-  const keys = getResolvedAccountKeys(tx).map((k) => k.toString());
-  return keys.some((key) => SWAP_PROGRAMS.has(key));
-}
-
-function getTargetSolDelta(tx: any): number | null {
-  const keys = getResolvedAccountKeys(tx);
-  const idx = keys.findIndex((k) => k.toString() === TARGET_WALLET.toString());
-  if (idx === -1 || !tx.meta?.preBalances || !tx.meta?.postBalances) return null;
-  return tx.meta.preBalances[idx] - tx.meta.postBalances[idx];
-}
 
 /* ================= PUMP.FUN FAST-PATH DECODER ================= */
 
@@ -342,13 +318,22 @@ async function executeBuy(mint: string) {
 
   try {
     const quote = await getQuote(SOL_MINT, mint, BUY_AMOUNT);
-    if (!quote || !passesFilters(quote)) return;
+    if (!quote || !passesFilters(quote)) {
+      console.log("❌ Buy aborted — bad/failed quote for", mint);
+      return;
+    }
 
     const tx = await buildSwapTx(quote);
-    if (!tx) return;
+    if (!tx) {
+      console.log("❌ Buy aborted — swap build failed for", mint);
+      return;
+    }
 
     const sig = await sendSwapDual(tx);
-    if (!sig) return;
+    if (!sig) {
+      console.log("❌ Buy aborted — both Jito and RPC submission failed for", mint);
+      return;
+    }
 
     console.log("🚀 BUY sent:", mint, sig);
 
@@ -368,13 +353,11 @@ async function executeBuy(mint: string) {
       highestValue: 0,
       tiersHit: TP_TIERS.map(() => false),
     });
-    
+
     await persistPositions();
-    
-    // Telegram Buy Alert
+
     const cleanSig = sig.split(":")[1] || sig;
     await sendTelegramAlert(`🚀 <b>BUY EXECUTED</b>\nMint: <code>${mint}</code>\nAmount: ${(BUY_AMOUNT / 1e9).toFixed(3)} SOL\n<a href="https://solscan.io/tx/${cleanSig}">View on Solscan</a>`);
-    
   } finally {
     inFlight.delete(mint);
   }
@@ -404,7 +387,6 @@ async function executeSell(mint: string, amount: number, reason: string) {
   if (pos.remainingAmount <= 0) positions.delete(mint);
   await persistPositions();
 
-  // Telegram Sell Alert
   const cleanSig = sig.split(":")[1] || sig;
   await sendTelegramAlert(`✅ <b>SELL EXECUTED</b> (${reason})\nMint: <code>${mint}</code>\n<a href="https://solscan.io/tx/${cleanSig}">View on Solscan</a>`);
 }
@@ -459,10 +441,21 @@ async function monitor() {
 
 setInterval(monitor, 1500);
 
-/* ================= DETECTION (Router-Agnostic) ================= */
+/* ================= DETECTION (Router-Agnostic, with full rejection logging) ================= */
+
+function getResolvedAccountKeys(tx: any): PublicKey[] {
+  const staticKeys: PublicKey[] = tx.transaction?.message?.staticAccountKeys ?? [];
+  const loaded = tx.meta?.loadedAddresses;
+  const writable: PublicKey[] = loaded?.writable ?? [];
+  const readonly: PublicKey[] = loaded?.readonly ?? [];
+  return [...staticKeys, ...writable, ...readonly];
+}
 
 async function handleTx(signature: string) {
-  if (seenSignatures.has(signature)) return;
+  if (seenSignatures.has(signature)) {
+    console.log("↩️ Duplicate signature, skipping:", signature);
+    return;
+  }
   seenSignatures.add(signature);
 
   try {
@@ -470,41 +463,51 @@ async function handleTx(signature: string) {
       commitment: "confirmed",
       maxSupportedTransactionVersion: 0,
     });
-    if (!tx?.meta) return;
+    if (!tx?.meta) {
+      console.log("❌ No tx/meta returned for", signature, "— RPC may not have it yet or it failed");
+      return;
+    }
 
-    // 1. Check if SOL left the target wallet
     const keys = getResolvedAccountKeys(tx);
     const targetIdx = keys.findIndex((k) => k.toString() === TARGET_WALLET.toString());
-    if (targetIdx === -1) return;
+    if (targetIdx === -1) {
+      console.log("❌ Target wallet not found in account keys for", signature);
+      return;
+    }
 
     const solDelta = (tx.meta.preBalances?.[targetIdx] ?? 0) - (tx.meta.postBalances?.[targetIdx] ?? 0);
-    
-    // If they didn't spend enough SOL, ignore it
-    if (solDelta < MIN_BUY_SOL) return;
+    if (solDelta < MIN_BUY_SOL) {
+      console.log(`⏭️ Skipped — SOL delta ${(solDelta / 1e9).toFixed(4)} below threshold`, signature);
+      return;
+    }
 
-    // 2. Find which token balance INCREASED (Router-Agnostic Check)
     const preBalances = tx.meta.preTokenBalances ?? [];
     const postBalances = tx.meta.postTokenBalances ?? [];
 
+    let foundAnyIncrease = false;
     for (const post of postBalances) {
       if (post.owner !== TARGET_WALLET.toString()) continue;
       if (post.mint === SOL_MINT) continue;
 
-      // Find the previous balance for this specific token
-      const pre = preBalances.find(p => p.owner === post.owner && p.mint === post.mint);
+      const pre = preBalances.find((p) => p.owner === post.owner && p.mint === post.mint);
       const preAmount = pre ? Number(pre.uiTokenAmount.uiAmount) : 0;
       const postAmount = Number(post.uiTokenAmount.uiAmount);
 
-      // If they have MORE of this token now than before the transaction, it is a BUY.
       if (postAmount > preAmount) {
-        console.log("🔥 DETECTED router-agnostic buy:", post.mint);
+        foundAnyIncrease = true;
+        console.log("🔥 DETECTED router-agnostic buy:", post.mint, signature);
         executeBuy(post.mint);
       }
     }
+
+    if (!foundAnyIncrease) {
+      console.log("❌ SOL decreased but no token balance increase found for target wallet —", signature);
+    }
   } catch (e: any) {
-    console.log("Detection error:", e.message);
+    console.log("Detection error:", e.message, signature);
   }
 }
+
 /* ================= KEEP-ALIVE SERVER ================= */
 
 const app = express();
@@ -519,40 +522,51 @@ async function start() {
   await loadPositions();
   await initPumpDecoder();
 
-  let subId: number = 0;
+  let subId: number | null = null;
 
   function subscribeToWallet() {
-    // Cleanly remove any existing listener to prevent duplicate events or memory leaks
-    if (subId) {
-      connection.removeOnLogsListener(subId).catch(() => {});
-    }
-    
-    console.log("🔌 (Re)connecting WebSocket to listen for trades...");
-    
+    const oldSubId = subId;
+
+    console.log("🔌 Opening new WebSocket subscription...");
     subId = connection.onLogs(
       TARGET_WALLET,
       (log) => {
-        // THE LIE DETECTOR: This will print every single time the wallet breathes.
         console.log(`👀 Raw activity heard: https://solscan.io/tx/${log.signature}`);
-        
+
         const fast = tryFastDecode(log.logs);
-        if (fast && fast.user === TARGET_WALLET.toString() && fast.isBuy && fast.solAmount >= MIN_BUY_SOL) {
-          console.log("⚡ FAST-PATH detected buy:", fast.mint);
-          executeBuy(fast.mint);
-          return;
+        if (fast) {
+          if (fast.user !== TARGET_WALLET.toString()) {
+            console.log("⏭️ Fast-path: decoded event but user mismatch");
+          } else if (!fast.isBuy) {
+            console.log("⏭️ Fast-path: decoded event but isBuy=false (sell/other)");
+          } else if (fast.solAmount < MIN_BUY_SOL) {
+            console.log(`⏭️ Fast-path: solAmount ${(fast.solAmount / 1e9).toFixed(4)} below threshold`);
+          } else {
+            console.log("⚡ FAST-PATH detected buy:", fast.mint);
+            executeBuy(fast.mint);
+            return;
+          }
+        } else {
+          console.log("↪️ Fast-path found no TradeEvent — falling back to getTransaction");
         }
-        
-        // Fallback path
+
         handleTx(log.signature);
       },
       "processed"
     );
+    console.log("✅ New subscription active:", subId);
+
+    // Non-destructive: keep the old listener alive for a few seconds after the
+    // new one attaches, so there's never a gap with zero active listeners.
+    if (oldSubId !== null) {
+      setTimeout(() => {
+        connection.removeOnLogsListener(oldSubId).catch(() => {});
+        console.log("🗑️ Old subscription removed:", oldSubId);
+      }, 3000);
+    }
   }
 
-  // Start the first connection
   subscribeToWallet();
-
-  // Force-refresh the WebSocket every 5 minutes (300,000 ms) to prevent silent drops
   setInterval(subscribeToWallet, 5 * 60 * 1000);
 
   console.log("✅ Bot fully running");
