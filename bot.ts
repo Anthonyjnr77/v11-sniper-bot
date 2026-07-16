@@ -459,7 +459,7 @@ async function monitor() {
 
 setInterval(monitor, 1500);
 
-/* ================= DETECTION ================= */
+/* ================= DETECTION (Router-Agnostic) ================= */
 
 async function handleTx(signature: string) {
   if (seenSignatures.has(signature)) return;
@@ -471,20 +471,40 @@ async function handleTx(signature: string) {
       maxSupportedTransactionVersion: 0,
     });
     if (!tx?.meta) return;
-    if (!isRealSwap(tx)) return;
 
-    const solDelta = getTargetSolDelta(tx);
-    if (solDelta !== null && solDelta < MIN_BUY_SOL) return;
+    // 1. Check if SOL left the target wallet
+    const keys = getResolvedAccountKeys(tx);
+    const targetIdx = keys.findIndex((k) => k.toString() === TARGET_WALLET.toString());
+    if (targetIdx === -1) return;
 
-    for (const b of tx.meta.postTokenBalances ?? []) {
-      if (b.owner !== TARGET_WALLET.toString()) continue;
-      if (b.mint === SOL_MINT) continue;
+    const solDelta = (tx.meta.preBalances?.[targetIdx] ?? 0) - (tx.meta.postBalances?.[targetIdx] ?? 0);
+    
+    // If they didn't spend enough SOL, ignore it
+    if (solDelta < MIN_BUY_SOL) return;
 
-      executeBuy(b.mint);
+    // 2. Find which token balance INCREASED (Router-Agnostic Check)
+    const preBalances = tx.meta.preTokenBalances ?? [];
+    const postBalances = tx.meta.postTokenBalances ?? [];
+
+    for (const post of postBalances) {
+      if (post.owner !== TARGET_WALLET.toString()) continue;
+      if (post.mint === SOL_MINT) continue;
+
+      // Find the previous balance for this specific token
+      const pre = preBalances.find(p => p.owner === post.owner && p.mint === post.mint);
+      const preAmount = pre ? Number(pre.uiTokenAmount.uiAmount) : 0;
+      const postAmount = Number(post.uiTokenAmount.uiAmount);
+
+      // If they have MORE of this token now than before the transaction, it is a BUY.
+      if (postAmount > preAmount) {
+        console.log("🔥 DETECTED router-agnostic buy:", post.mint);
+        executeBuy(post.mint);
+      }
     }
-  } catch (e: any) {}
+  } catch (e: any) {
+    console.log("Detection error:", e.message);
+  }
 }
-
 /* ================= KEEP-ALIVE SERVER ================= */
 
 const app = express();
