@@ -6,8 +6,8 @@ import {
   PublicKey,
   SystemProgram,
   Transaction,
-  type Finality,
 } from "@solana/web3.js";
+import { Program, AnchorProvider, BorshEventCoder } from "@coral-xyz/anchor";
 import fetch from "node-fetch";
 import bs58 from "bs58";
 import https from "https";
@@ -15,14 +15,20 @@ import express from "express";
 
 /* ================= CONFIG ================= */
 
-const RPC_URL = process.env.RPC_URL!;
+function requireEnv(name: string): string {
+  const val = process.env[name];
+  if (!val) throw new Error(`Missing required env var: ${name}`);
+  return val;
+}
+
+const RPC_URL = requireEnv("RPC_URL");
 const connection = new Connection(RPC_URL, {
-  commitment: "processed",
+  commitment: "confirmed", // Upgraded to confirmed for fallback safety
   wsEndpoint: RPC_URL.replace("https", "wss"),
 });
 
-const wallet = Keypair.fromSecretKey(bs58.decode(process.env.PRIVATE_KEY!));
-const TARGET_WALLET = new PublicKey(process.env.TARGET_WALLET!);
+const wallet = Keypair.fromSecretKey(bs58.decode(requireEnv("PRIVATE_KEY")));
+const TARGET_WALLET = new PublicKey(requireEnv("TARGET_WALLET"));
 
 const BUY_AMOUNT = Number(process.env.BUY_AMOUNT_SOL) * 1e9;
 const BASE_PRIORITY_FEE = Number(process.env.PRIORITY_FEE_LAMPORTS ?? 500_000);
@@ -49,6 +55,51 @@ const RAYDIUM_V4_PROGRAM = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
 const JUPITER_PROGRAM = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4";
 const SWAP_PROGRAMS = new Set([PUMPFUN_PROGRAM, PUMPSWAP_PROGRAM, RAYDIUM_V4_PROGRAM, JUPITER_PROGRAM]);
 
+/* ================= PUMP.FUN 0ms EVENT DECODER ================= */
+
+const PUMPFUN_PROGRAM_ID = new PublicKey(PUMPFUN_PROGRAM);
+let pumpEventCoder: BorshEventCoder | null = null;
+
+async function initPumpDecoder() {
+  // Mock provider for IDL fetching (read-only)
+  const provider = new AnchorProvider(connection, {} as any, {});
+  try {
+    const idl = await Program.fetchIdl(PUMPFUN_PROGRAM_ID, provider);
+    if (!idl) {
+      console.log("⚠️ Could not fetch Pump.fun IDL — falling back to getTransaction path only.");
+      return;
+    }
+    pumpEventCoder = new BorshEventCoder(idl as any);
+    console.log("✅ 0ms Pump.fun Event Decoder Online");
+  } catch (e: any) {
+    console.log("⚠️ Failed to initialize Pump IDL:", e.message);
+  }
+}
+
+function tryFastDecode(logs: string[]): { mint: string; isBuy: boolean; solAmount: number; user: string } | null {
+  if (!pumpEventCoder) return null;
+  for (const log of logs) {
+    if (!log.startsWith("Program data: ")) continue;
+    try {
+      const decoded = pumpEventCoder.decode(log.slice("Program data: ".length));
+      if (decoded?.name === "TradeEvent") {
+        const d: any = decoded.data;
+        return {
+          mint: d.mint?.toString(),
+          isBuy: d.isBuy,
+          solAmount: Number(d.solAmount),
+          user: d.user?.toString(),
+        };
+      }
+    } catch {
+      // Not a TradeEvent log, ignore and continue
+    }
+  }
+  return null;
+}
+
+/* ================= TRANSACTION PARSING (FALLBACK) ================= */
+
 function getResolvedAccountKeys(tx: any): PublicKey[] {
   const staticKeys: PublicKey[] = tx.transaction?.message?.staticAccountKeys ?? [];
   const loaded = tx.meta?.loadedAddresses;
@@ -72,7 +123,7 @@ function getTargetSolDelta(tx: any): number | null {
 /* ================= JITO ================= */
 
 const JITO_BLOCK_ENGINE_URL = "https://mainnet.block-engine.jito.wtf/api/v1/bundles";
-const JITO_TIP_ACCOUNTS = [
+const JITO_TIP_ACCOUNTS: string[] = [
   "9n3d1K5YD2vECAbRFhFFGYNNjiXtHXJWn9F31t89vsAV",
   "aTtUk2DHgLhKZRDjePq6eiHRKC1XXFMBiSUfQ2JNDbN",
   "B1mrQSpdeMU9gCvkJ6VsXVVoYjRGkNA7TtjMyqxrhecH",
@@ -85,7 +136,9 @@ const JITO_TIP_ACCOUNTS = [
 const JITO_TIP_LAMPORTS = Number(process.env.JITO_TIP_LAMPORTS ?? 2_000_000);
 
 function randomTipAccount(): PublicKey {
-  return new PublicKey(JITO_TIP_ACCOUNTS[Math.floor(Math.random() * JITO_TIP_ACCOUNTS.length)]);
+  const idx = Math.floor(Math.random() * JITO_TIP_ACCOUNTS.length);
+  const addr = JITO_TIP_ACCOUNTS[idx] ?? JITO_TIP_ACCOUNTS[0];
+  return new PublicKey(addr as string);
 }
 
 /* ================= NETWORK ================= */
@@ -139,7 +192,10 @@ async function buildSwapTx(quoteResponse: any) {
       dynamicComputeUnitLimit: true,
     }),
   });
-  if (!data || data.error || !data.swapTransaction) return null;
+  if (!data || data.error || !data.swapTransaction) {
+    console.log("Swap build error:", data?.error ?? "unknown");
+    return null;
+  }
   return data.swapTransaction;
 }
 
@@ -148,7 +204,7 @@ async function sendSwapViaJito(txBase64: string): Promise<string | null> {
     const swapTx = VersionedTransaction.deserialize(Buffer.from(txBase64, "base64"));
     swapTx.sign([wallet]);
 
-    const { blockhash } = await connection.getLatestBlockhash("processed");
+    const { blockhash } = await connection.getLatestBlockhash("confirmed");
     const tipTx = new Transaction({ feePayer: wallet.publicKey, recentBlockhash: blockhash }).add(
       SystemProgram.transfer({
         fromPubkey: wallet.publicKey,
@@ -165,8 +221,16 @@ async function sendSwapViaJito(txBase64: string): Promise<string | null> {
       body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "sendBundle", params: [bundle] }),
     });
 
-    return res?.result ?? null;
-  } catch { return null; }
+    if (!res?.result) {
+      console.log("Jito bundle rejected:", res?.error ?? "unknown");
+      return null;
+    }
+    console.log("📦 Bundle submitted:", res.result);
+    return res.result;
+  } catch (e: any) {
+    console.log("Jito send error:", e.message);
+    return null;
+  }
 }
 
 /* ================= BALANCE ================= */
@@ -176,8 +240,10 @@ async function getTokenBalance(mint: string): Promise<number> {
     const accs = await connection.getParsedTokenAccountsByOwner(wallet.publicKey, {
       mint: new PublicKey(mint),
     });
-    return Number(accs.value[0]?.account.data.parsed.info.tokenAmount.amount ?? 0);
-  } catch { return 0; }
+    return Number(accs.value[0]?.account?.data?.parsed?.info?.tokenAmount?.amount ?? 0);
+  } catch {
+    return 0;
+  }
 }
 
 async function waitForBalance(mint: string, attempts = 6, delayMs = 500): Promise<number> {
@@ -189,7 +255,18 @@ async function waitForBalance(mint: string, attempts = 6, delayMs = 500): Promis
   return 0;
 }
 
-/* ================= EXECUTION ================= */
+/* ================= FILTER ================= */
+
+function passesFilters(quote: any) {
+  const impact = Number(quote.priceImpactPct ?? 0);
+  if (impact > 0.15) {
+    console.log("❌ Skipped — price impact too high:", impact);
+    return false;
+  }
+  return Number(quote.outAmount) > 0;
+}
+
+/* ================= BUY ================= */
 
 async function executeBuy(mint: string) {
   if (positions.has(mint) || inFlight.has(mint)) return;
@@ -197,7 +274,7 @@ async function executeBuy(mint: string) {
 
   try {
     const quote = await getQuote(SOL_MINT, mint, BUY_AMOUNT);
-    if (!quote || Number(quote.priceImpactPct) > 0.15) return;
+    if (!quote || !passesFilters(quote)) return;
 
     const tx = await buildSwapTx(quote);
     if (!tx) return;
@@ -205,8 +282,13 @@ async function executeBuy(mint: string) {
     const sig = await sendSwapViaJito(tx);
     if (!sig) return;
 
+    console.log("🚀 BUY bundle sent:", mint, sig);
+
     const actual = await waitForBalance(mint);
-    if (actual <= 0) return;
+    if (actual <= 0) {
+      console.log("⚠️ Could not confirm balance for", mint, "— position NOT tracked. Check manually.");
+      return;
+    }
 
     positions.set(mint, {
       mint,
@@ -222,6 +304,8 @@ async function executeBuy(mint: string) {
   }
 }
 
+/* ================= SELL ================= */
+
 async function executeSell(mint: string, amount: number, reason: string) {
   const pos = positions.get(mint);
   if (!pos) return;
@@ -234,6 +318,8 @@ async function executeSell(mint: string, amount: number, reason: string) {
 
   const sig = await sendSwapViaJito(tx);
   if (!sig) return;
+
+  console.log(`✅ SELL (${reason}):`, mint, sig);
 
   const soldFraction = amount / pos.remainingAmount;
   pos.remainingAmount -= amount;
@@ -250,26 +336,49 @@ async function monitor() {
 
     getQuote(mint, SOL_MINT, pos.remainingAmount).then((quote) => {
       if (!quote) return;
+
       const value = Number(quote.outAmount);
       const pnl = (value - pos.costBasisLamports) / pos.costBasisLamports;
 
-      if (pnl <= SL_PCT || Date.now() - pos.entryTime > MAX_HOLD_MS) {
-        executeSell(mint, pos.remainingAmount, "Panic/Time Exit");
+      if (pnl <= SL_PCT) {
+        executeSell(mint, pos.remainingAmount, `SL ${(pnl * 100).toFixed(0)}%`);
+        return;
+      }
+      if (Date.now() - pos.entryTime > MAX_HOLD_MS) {
+        executeSell(mint, pos.remainingAmount, "MAX_TIME");
         return;
       }
       if (value > pos.costBasisLamports) {
         if (value > pos.highestValue) pos.highestValue = value;
         const drawdown = (value - pos.highestValue) / pos.highestValue;
         if (pos.highestValue > pos.costBasisLamports && drawdown < TRAIL_DRAWDOWN) {
-          executeSell(mint, pos.remainingAmount, "Trailing Stop");
+          executeSell(mint, pos.remainingAmount, "TRAILING_STOP");
+          return;
+        }
+      }
+
+      for (let i = 0; i < TP_TIERS.length; i++) {
+        if (pos.tiersHit[i]) continue;
+        const tier = TP_TIERS[i];
+        if (!tier) continue;
+        if (pnl >= tier.tp) {
+          const sellAmount = Math.min(
+            Math.floor(pos.originalAmount * tier.sellFraction),
+            pos.remainingAmount
+          );
+          if (sellAmount > 0) {
+            executeSell(mint, sellAmount, `TP${i + 1} +${(tier.tp * 100).toFixed(0)}%`);
+            pos.tiersHit[i] = true;
+          }
         }
       }
     });
   }
 }
+
 setInterval(monitor, 1500);
 
-/* ================= DETECTION ================= */
+/* ================= DETECTION (FAST PATH + FALLBACK) ================= */
 
 async function handleTx(signature: string) {
   if (seenSignatures.has(signature)) return;
@@ -277,7 +386,7 @@ async function handleTx(signature: string) {
 
   try {
     const tx = await connection.getTransaction(signature, {
-      commitment: "processed" as Finality,
+      commitment: "confirmed",
       maxSupportedTransactionVersion: 0,
     });
     if (!tx?.meta) return;
@@ -285,19 +394,57 @@ async function handleTx(signature: string) {
     if (!isRealSwap(tx)) return;
 
     const solDelta = getTargetSolDelta(tx);
-    if (solDelta !== null && solDelta < MIN_BUY_SOL) return;
+    if (solDelta !== null && solDelta < MIN_BUY_SOL) {
+      console.log("⏭️ Skipped — below SOL threshold:", solDelta / 1e9);
+      return;
+    }
 
     for (const b of tx.meta.postTokenBalances ?? []) {
-      if (b.owner === TARGET_WALLET.toString() && b.mint !== SOL_MINT) {
-        executeBuy(b.mint);
-      }
+      if (b.owner !== TARGET_WALLET.toString()) continue;
+      if (b.mint === SOL_MINT) continue;
+
+      console.log("🔥 DETECTED real swap buy (Fallback Path):", b.mint);
+      executeBuy(b.mint);
     }
-  } catch {}
+  } catch (e: any) {
+    console.log("Detection error:", e.message);
+  }
 }
 
-/* ================= KEEP-ALIVE SERVER ================= */
-const app = express();
-app.get("/", (req, res) => res.send("Engine Active"));
-app.listen(process.env.PORT || 3000);
+/* ================= STARTUP LOGIC ================= */
 
-connection.onLogs(TARGET_WALLET, (log) => handleTx(log.signature), "processed");
+const app = express();
+app.get("/", (_req, res) => res.send("Engine Active"));
+const PORT = process.env.PORT || 3000;
+
+async function startEngine() {
+  console.log("🚀 Initializing Copy-Trade V11 Engine...");
+  
+  // 1. Boot up the 0ms Pump.fun IDL decoder first
+  await initPumpDecoder();
+
+  // 2. Start the Keep-Alive Web Server
+  app.listen(PORT, () => console.log(`🌐 Keep-alive server on port ${PORT}`));
+  console.log("🎯 Target Locked:", TARGET_WALLET.toString());
+
+  // 3. Attach the hyper-fast WebSocket listener
+  connection.onLogs(
+    TARGET_WALLET,
+    (log) => {
+      // THE FAST PATH: Instant Borsh Decoding
+      const fast = tryFastDecode(log.logs);
+      if (fast && fast.user === TARGET_WALLET.toString() && fast.isBuy && fast.solAmount >= MIN_BUY_SOL) {
+        console.log("⚡ FAST-PATH DETECTED BUY:", fast.mint);
+        executeBuy(fast.mint);
+        return; // Skip the slower fallback path entirely
+      }
+      
+      // THE FALLBACK PATH: If it's not a Pump.fun trade (e.g., Raydium), or IDL failed
+      handleTx(log.signature);
+    },
+    "processed"
+  );
+}
+
+// Ignite the engine
+startEngine();
