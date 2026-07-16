@@ -499,19 +499,41 @@ async function start() {
   await loadPositions();
   await initPumpDecoder();
 
-  connection.onLogs(
-    TARGET_WALLET,
-    (log) => {
-      const fast = tryFastDecode(log.logs);
-      if (fast && fast.user === TARGET_WALLET.toString() && fast.isBuy && fast.solAmount >= MIN_BUY_SOL) {
-        console.log("⚡ FAST-PATH detected buy:", fast.mint);
-        executeBuy(fast.mint);
-        return;
-      }
-      handleTx(log.signature);
-    },
-    "processed"
-  );
+  let subId: number = 0;
+
+  function subscribeToWallet() {
+    // Cleanly remove any existing listener to prevent duplicate events or memory leaks
+    if (subId) {
+      connection.removeOnLogsListener(subId).catch(() => {});
+    }
+    
+    console.log("🔌 (Re)connecting WebSocket to listen for trades...");
+    
+    subId = connection.onLogs(
+      TARGET_WALLET,
+      (log) => {
+        // THE LIE DETECTOR: This will print every single time the wallet breathes.
+        console.log(`👀 Raw activity heard: https://solscan.io/tx/${log.signature}`);
+        
+        const fast = tryFastDecode(log.logs);
+        if (fast && fast.user === TARGET_WALLET.toString() && fast.isBuy && fast.solAmount >= MIN_BUY_SOL) {
+          console.log("⚡ FAST-PATH detected buy:", fast.mint);
+          executeBuy(fast.mint);
+          return;
+        }
+        
+        // Fallback path
+        handleTx(log.signature);
+      },
+      "processed"
+    );
+  }
+
+  // Start the first connection
+  subscribeToWallet();
+
+  // Force-refresh the WebSocket every 5 minutes (300,000 ms) to prevent silent drops
+  setInterval(subscribeToWallet, 5 * 60 * 1000);
 
   console.log("✅ Bot fully running");
   await sendTelegramAlert(`🟢 <b>V11 Engine Online</b>\nSniper deployed and actively watching target wallet:\n<code>${TARGET_WALLET.toString()}</code>`);
