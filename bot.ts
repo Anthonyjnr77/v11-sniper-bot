@@ -71,6 +71,18 @@ async function sendTelegramAlert(message: string) {
   }
 }
 
+/* ================= CRASH ALERTS ================= */
+
+process.on("uncaughtException", async (err) => {
+  console.log("💥 UNCAUGHT EXCEPTION:", err.message);
+  await sendTelegramAlert(`💥 <b>BOT CRASHED</b>\n${err.message}\nRender should auto-restart it.`);
+});
+
+process.on("unhandledRejection", async (reason: any) => {
+  console.log("💥 UNHANDLED REJECTION:", reason);
+  await sendTelegramAlert(`💥 <b>BOT ERROR</b>\n${String(reason).slice(0, 200)}`);
+});
+
 /* ================= PUMP.FUN FAST-PATH DECODER ================= */
 
 const PUMPFUN_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
@@ -490,7 +502,7 @@ async function monitor() {
 
 setInterval(monitor, 1500);
 
-/* ================= DETECTION (Router-Agnostic, with full rejection logging) ================= */
+/* ================= DETECTION (Router-Agnostic, with retry + full logging) ================= */
 
 function getResolvedAccountKeys(tx: any): PublicKey[] {
   const staticKeys: PublicKey[] = tx.transaction?.message?.staticAccountKeys ?? [];
@@ -498,6 +510,18 @@ function getResolvedAccountKeys(tx: any): PublicKey[] {
   const writable: PublicKey[] = loaded?.writable ?? [];
   const readonly: PublicKey[] = loaded?.readonly ?? [];
   return [...staticKeys, ...writable, ...readonly];
+}
+
+async function getTransactionWithRetry(signature: string, attempts = 6, delayMs = 400) {
+  for (let i = 0; i < attempts; i++) {
+    const tx = await connection.getTransaction(signature, {
+      commitment: "confirmed",
+      maxSupportedTransactionVersion: 0,
+    });
+    if (tx?.meta) return tx;
+    await new Promise((r) => setTimeout(r, delayMs));
+  }
+  return null;
 }
 
 async function handleTx(signature: string) {
@@ -508,12 +532,9 @@ async function handleTx(signature: string) {
   seenSignatures.add(signature);
 
   try {
-    const tx = await connection.getTransaction(signature, {
-      commitment: "confirmed",
-      maxSupportedTransactionVersion: 0,
-    });
+    const tx = await getTransactionWithRetry(signature);
     if (!tx?.meta) {
-      console.log("❌ No tx/meta returned for", signature);
+      console.log("❌ Still no tx/meta after retries for", signature, "— genuine miss");
       return;
     }
 
@@ -619,16 +640,5 @@ async function start() {
   console.log("✅ Bot fully running");
   await sendTelegramAlert(`🟢 <b>V11 Engine Online</b>\nSniper deployed and actively watching target wallet:\n<code>${TARGET_WALLET.toString()}</code>`);
 }
-/* ================= CRASH ALERTS ================= */
-
-process.on("uncaughtException", async (err) => {
-  console.log("💥 UNCAUGHT EXCEPTION:", err.message);
-  await sendTelegramAlert(`💥 <b>BOT CRASHED</b>\n${err.message}\nRender should auto-restart it.`);
-});
-
-process.on("unhandledRejection", async (reason: any) => {
-  console.log("💥 UNHANDLED REJECTION:", reason);
-  await sendTelegramAlert(`💥 <b>BOT ERROR</b>\n${String(reason).slice(0, 200)}`);
-});
 
 start();
