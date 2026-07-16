@@ -619,5 +619,16 @@ async function start() {
   console.log("✅ Bot fully running");
   await sendTelegramAlert(`🟢 <b>V11 Engine Online</b>\nSniper deployed and actively watching target wallet:\n<code>${TARGET_WALLET.toString()}</code>`);
 }
+/* ================= CRASH ALERTS ================= */
+
+process.on("uncaughtException", async (err) => {
+  console.log("💥 UNCAUGHT EXCEPTION:", err.message);
+  await sendTelegramAlert(`💥 <b>BOT CRASHED</b>\n${err.message}\nRender should auto-restart it.`);
+});
+
+process.on("unhandledRejection", async (reason: any) => {
+  console.log("💥 UNHANDLED REJECTION:", reason);
+  await sendTelegramAlert(`💥 <b>BOT ERROR</b>\n${String(reason).slice(0, 200)}`);
+});
 
 start();
