@@ -23,7 +23,7 @@ function requireEnv(name: string): string {
 
 const RPC_URL = requireEnv("RPC_URL");
 const connection = new Connection(RPC_URL, {
-  commitment: "confirmed", // Upgraded to confirmed for fallback safety
+  commitment: "processed",
   wsEndpoint: RPC_URL.replace("https", "wss"),
 });
 
@@ -55,51 +55,6 @@ const RAYDIUM_V4_PROGRAM = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
 const JUPITER_PROGRAM = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4";
 const SWAP_PROGRAMS = new Set([PUMPFUN_PROGRAM, PUMPSWAP_PROGRAM, RAYDIUM_V4_PROGRAM, JUPITER_PROGRAM]);
 
-/* ================= PUMP.FUN 0ms EVENT DECODER ================= */
-
-const PUMPFUN_PROGRAM_ID = new PublicKey(PUMPFUN_PROGRAM);
-let pumpEventCoder: BorshEventCoder | null = null;
-
-async function initPumpDecoder() {
-  // Mock provider for IDL fetching (read-only)
-  const provider = new AnchorProvider(connection, {} as any, {});
-  try {
-    const idl = await Program.fetchIdl(PUMPFUN_PROGRAM_ID, provider);
-    if (!idl) {
-      console.log("⚠️ Could not fetch Pump.fun IDL — falling back to getTransaction path only.");
-      return;
-    }
-    pumpEventCoder = new BorshEventCoder(idl as any);
-    console.log("✅ 0ms Pump.fun Event Decoder Online");
-  } catch (e: any) {
-    console.log("⚠️ Failed to initialize Pump IDL:", e.message);
-  }
-}
-
-function tryFastDecode(logs: string[]): { mint: string; isBuy: boolean; solAmount: number; user: string } | null {
-  if (!pumpEventCoder) return null;
-  for (const log of logs) {
-    if (!log.startsWith("Program data: ")) continue;
-    try {
-      const decoded = pumpEventCoder.decode(log.slice("Program data: ".length));
-      if (decoded?.name === "TradeEvent") {
-        const d: any = decoded.data;
-        return {
-          mint: d.mint?.toString(),
-          isBuy: d.isBuy,
-          solAmount: Number(d.solAmount),
-          user: d.user?.toString(),
-        };
-      }
-    } catch {
-      // Not a TradeEvent log, ignore and continue
-    }
-  }
-  return null;
-}
-
-/* ================= TRANSACTION PARSING (FALLBACK) ================= */
-
 function getResolvedAccountKeys(tx: any): PublicKey[] {
   const staticKeys: PublicKey[] = tx.transaction?.message?.staticAccountKeys ?? [];
   const loaded = tx.meta?.loadedAddresses;
@@ -118,6 +73,50 @@ function getTargetSolDelta(tx: any): number | null {
   const idx = keys.findIndex((k) => k.toString() === TARGET_WALLET.toString());
   if (idx === -1 || !tx.meta?.preBalances || !tx.meta?.postBalances) return null;
   return tx.meta.preBalances[idx] - tx.meta.postBalances[idx];
+}
+
+/* ================= PUMP.FUN FAST-PATH DECODER ================= */
+
+let pumpEventCoder: BorshEventCoder | null = null;
+
+async function initPumpDecoder() {
+  try {
+    const provider = new AnchorProvider(connection, {} as any, {});
+    const idl = await Program.fetchIdl(new PublicKey(PUMPFUN_PROGRAM), provider);
+    if (!idl) {
+      console.log("⚠️ Could not fetch Pump.fun IDL — fast path disabled, using getTransaction fallback only.");
+      return;
+    }
+    pumpEventCoder = new BorshEventCoder(idl as any);
+    console.log("✅ Pump.fun fast-path decoder ready");
+  } catch (e: any) {
+    console.log("⚠️ Pump.fun decoder init failed:", e.message, "— fallback path only.");
+  }
+}
+
+function tryFastDecode(logs: string[]): { mint: string; isBuy: boolean; solAmount: number; user: string } | null {
+  if (!pumpEventCoder) return null;
+  for (const log of logs) {
+    if (!log.startsWith("Program data: ")) continue;
+    try {
+      const decoded = pumpEventCoder.decode(log.slice("Program data: ".length));
+      if (decoded?.name === "TradeEvent") {
+        const d: any = decoded.data;
+        const mint = d.mint?.toString();
+        const user = d.user?.toString();
+        if (!mint || !user) return null;
+        return {
+          mint,
+          isBuy: Boolean(d.isBuy),
+          solAmount: Number(d.solAmount ?? 0),
+          user,
+        };
+      }
+    } catch {
+      // not a TradeEvent line, ignore
+    }
+  }
+  return null;
 }
 
 /* ================= JITO ================= */
@@ -151,6 +150,45 @@ async function fetchJson(url: string, options: any = {}) {
 
 function getPriorityFee() {
   return Math.floor(BASE_PRIORITY_FEE * (1 + Math.random()));
+}
+
+/* ================= PERSISTENCE (Upstash Redis) ================= */
+
+const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL;
+const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
+
+async function persistPositions() {
+  if (!UPSTASH_URL || !UPSTASH_TOKEN) return;
+  try {
+    const serialized = JSON.stringify(Array.from(positions.entries()));
+    await fetch(`${UPSTASH_URL}/set/positions`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` },
+      body: serialized,
+    });
+  } catch (e: any) {
+    console.log("Persist error:", e.message);
+  }
+}
+
+async function loadPositions() {
+  if (!UPSTASH_URL || !UPSTASH_TOKEN) {
+    console.log("⚠️ No Upstash configured — positions will NOT survive a restart.");
+    return;
+  }
+  try {
+    const res = await fetch(`${UPSTASH_URL}/get/positions`, {
+      headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` },
+    });
+    const data: any = await res.json();
+    if (data?.result) {
+      const entries = JSON.parse(data.result);
+      for (const [mint, pos] of entries) positions.set(mint, pos);
+      console.log(`✅ Restored ${entries.length} position(s) from before restart`);
+    }
+  } catch (e: any) {
+    console.log("Load error:", e.message);
+  }
 }
 
 /* ================= STATE ================= */
@@ -199,38 +237,54 @@ async function buildSwapTx(quoteResponse: any) {
   return data.swapTransaction;
 }
 
-async function sendSwapViaJito(txBase64: string): Promise<string | null> {
-  try {
-    const swapTx = VersionedTransaction.deserialize(Buffer.from(txBase64, "base64"));
-    swapTx.sign([wallet]);
+/* ================= DUAL-PATH SUBMISSION ================= */
 
-    const { blockhash } = await connection.getLatestBlockhash("confirmed");
-    const tipTx = new Transaction({ feePayer: wallet.publicKey, recentBlockhash: blockhash }).add(
-      SystemProgram.transfer({
-        fromPubkey: wallet.publicKey,
-        toPubkey: randomTipAccount(),
-        lamports: JITO_TIP_LAMPORTS,
-      })
-    );
-    tipTx.sign(wallet);
+async function sendSwapDual(txBase64: string): Promise<string | null> {
+  const swapTx = VersionedTransaction.deserialize(Buffer.from(txBase64, "base64"));
+  swapTx.sign([wallet]);
+  const rawBytes = swapTx.serialize();
 
-    const bundle = [bs58.encode(swapTx.serialize()), bs58.encode(tipTx.serialize())];
-    const res = await fetchJson(JITO_BLOCK_ENGINE_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "sendBundle", params: [bundle] }),
-    });
+  const jitoAttempt = (async () => {
+    try {
+      const { blockhash } = await connection.getLatestBlockhash("processed");
+      const tipTx = new Transaction({ feePayer: wallet.publicKey, recentBlockhash: blockhash }).add(
+        SystemProgram.transfer({
+          fromPubkey: wallet.publicKey,
+          toPubkey: randomTipAccount(),
+          lamports: JITO_TIP_LAMPORTS,
+        })
+      );
+      tipTx.sign(wallet);
 
-    if (!res?.result) {
-      console.log("Jito bundle rejected:", res?.error ?? "unknown");
+      const bundle = [bs58.encode(rawBytes), bs58.encode(tipTx.serialize())];
+      const res = await fetchJson(JITO_BLOCK_ENGINE_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "sendBundle", params: [bundle] }),
+      });
+      return res?.result ? `jito:${res.result}` : null;
+    } catch {
       return null;
     }
-    console.log("📦 Bundle submitted:", res.result);
-    return res.result;
-  } catch (e: any) {
-    console.log("Jito send error:", e.message);
-    return null;
+  })();
+
+  const rpcAttempt = (async () => {
+    try {
+      const sig = await connection.sendRawTransaction(rawBytes, { skipPreflight: true, maxRetries: 3 });
+      return `rpc:${sig}`;
+    } catch {
+      return null;
+    }
+  })();
+
+  const results = await Promise.allSettled([jitoAttempt, rpcAttempt]);
+  for (const r of results) {
+    if (r.status === "fulfilled" && r.value) {
+      console.log("✅ Landed via:", r.value);
+      return r.value;
+    }
   }
+  return null;
 }
 
 /* ================= BALANCE ================= */
@@ -279,10 +333,10 @@ async function executeBuy(mint: string) {
     const tx = await buildSwapTx(quote);
     if (!tx) return;
 
-    const sig = await sendSwapViaJito(tx);
+    const sig = await sendSwapDual(tx);
     if (!sig) return;
 
-    console.log("🚀 BUY bundle sent:", mint, sig);
+    console.log("🚀 BUY sent:", mint, sig, "at", Date.now());
 
     const actual = await waitForBalance(mint);
     if (actual <= 0) {
@@ -299,6 +353,7 @@ async function executeBuy(mint: string) {
       highestValue: 0,
       tiersHit: TP_TIERS.map(() => false),
     });
+    await persistPositions();
   } finally {
     inFlight.delete(mint);
   }
@@ -316,7 +371,7 @@ async function executeSell(mint: string, amount: number, reason: string) {
   const tx = await buildSwapTx(quote);
   if (!tx) return;
 
-  const sig = await sendSwapViaJito(tx);
+  const sig = await sendSwapDual(tx);
   if (!sig) return;
 
   console.log(`✅ SELL (${reason}):`, mint, sig);
@@ -326,6 +381,7 @@ async function executeSell(mint: string, amount: number, reason: string) {
   pos.costBasisLamports -= pos.costBasisLamports * soldFraction;
 
   if (pos.remainingAmount <= 0) positions.delete(mint);
+  await persistPositions();
 }
 
 /* ================= MONITOR ================= */
@@ -378,7 +434,7 @@ async function monitor() {
 
 setInterval(monitor, 1500);
 
-/* ================= DETECTION (FAST PATH + FALLBACK) ================= */
+/* ================= DETECTION (slow-path fallback) ================= */
 
 async function handleTx(signature: string) {
   if (seenSignatures.has(signature)) return;
@@ -403,7 +459,7 @@ async function handleTx(signature: string) {
       if (b.owner !== TARGET_WALLET.toString()) continue;
       if (b.mint === SOL_MINT) continue;
 
-      console.log("🔥 DETECTED real swap buy (Fallback Path):", b.mint);
+      console.log("🔥 DETECTED (slow path) real swap buy:", b.mint);
       executeBuy(b.mint);
     }
   } catch (e: any) {
@@ -411,40 +467,36 @@ async function handleTx(signature: string) {
   }
 }
 
-/* ================= STARTUP LOGIC ================= */
+/* ================= KEEP-ALIVE SERVER ================= */
 
 const app = express();
 app.get("/", (_req, res) => res.send("Engine Active"));
 const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Keep-alive server on port ${PORT}`));
 
-async function startEngine() {
-  console.log("🚀 Initializing Copy-Trade V11 Engine...");
-  
-  // 1. Boot up the 0ms Pump.fun IDL decoder first
+/* ================= START ================= */
+
+async function start() {
+  console.log("🚀 Copy-trade bot starting. Target:", TARGET_WALLET.toString());
+  await loadPositions();
   await initPumpDecoder();
 
-  // 2. Start the Keep-Alive Web Server
-  app.listen(PORT, () => console.log(`🌐 Keep-alive server on port ${PORT}`));
-  console.log("🎯 Target Locked:", TARGET_WALLET.toString());
-
-  // 3. Attach the hyper-fast WebSocket listener
   connection.onLogs(
     TARGET_WALLET,
     (log) => {
-      // THE FAST PATH: Instant Borsh Decoding
       const fast = tryFastDecode(log.logs);
       if (fast && fast.user === TARGET_WALLET.toString() && fast.isBuy && fast.solAmount >= MIN_BUY_SOL) {
-        console.log("⚡ FAST-PATH DETECTED BUY:", fast.mint);
+        console.log("⚡ FAST-PATH detected buy:", fast.mint, "at", Date.now());
         executeBuy(fast.mint);
-        return; // Skip the slower fallback path entirely
+        return;
       }
-      
-      // THE FALLBACK PATH: If it's not a Pump.fun trade (e.g., Raydium), or IDL failed
+      // fallback path for anything the fast decoder didn't confidently catch
       handleTx(log.signature);
     },
     "processed"
   );
+
+  console.log("✅ Bot fully running");
 }
 
-// Ignite the engine
-startEngine();
+start();
