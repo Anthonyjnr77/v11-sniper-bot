@@ -71,11 +71,9 @@ async function sendTelegramAlert(message: string) {
   }
 }
 
-/* ================= KNOWN SWAP PROGRAMS (kept for reference / optional use) ================= */
+/* ================= PUMP.FUN FAST-PATH DECODER ================= */
 
 const PUMPFUN_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
-
-/* ================= PUMP.FUN FAST-PATH DECODER ================= */
 
 let pumpEventCoder: BorshEventCoder | null = null;
 
@@ -150,6 +148,27 @@ async function fetchJson(url: string, options: any = {}) {
 
 function getPriorityFee() {
   return Math.floor(BASE_PRIORITY_FEE * (1 + Math.random()));
+}
+
+/* ================= PRICE / MARKET CAP ================= */
+
+async function fetchPriceAndMarketCap(mint: string): Promise<{
+  tokenPriceUSD: number | null;
+  marketCapUSD: number | null;
+}> {
+  try {
+    const priceRes = await fetchJson(`https://api.jup.ag/price/v3?ids=${mint}`);
+    const tokenPriceUSD = priceRes?.[mint]?.usdPrice ?? null;
+
+    const supplyInfo = await connection.getTokenSupply(new PublicKey(mint));
+    const supply = supplyInfo?.value?.uiAmount ?? null;
+
+    const marketCapUSD = tokenPriceUSD && supply ? tokenPriceUSD * supply : null;
+    return { tokenPriceUSD, marketCapUSD };
+  } catch (e: any) {
+    console.log("Price/MC fetch failed:", e.message);
+    return { tokenPriceUSD: null, marketCapUSD: null };
+  }
 }
 
 /* ================= PERSISTENCE (Upstash Redis) ================= */
@@ -356,8 +375,24 @@ async function executeBuy(mint: string) {
 
     await persistPositions();
 
+    const { tokenPriceUSD, marketCapUSD } = await fetchPriceAndMarketCap(mint);
+
+    const priceStr = tokenPriceUSD !== null ? `$${tokenPriceUSD.toFixed(8)}` : "unknown";
+    const mcStr = marketCapUSD !== null
+      ? marketCapUSD >= 1000
+        ? `$${(marketCapUSD / 1000).toFixed(1)}K`
+        : `$${marketCapUSD.toFixed(0)}`
+      : "unknown";
+
     const cleanSig = sig.split(":")[1] || sig;
-    await sendTelegramAlert(`🚀 <b>BUY EXECUTED</b>\nMint: <code>${mint}</code>\nAmount: ${(BUY_AMOUNT / 1e9).toFixed(3)} SOL\n<a href="https://solscan.io/tx/${cleanSig}">View on Solscan</a>`);
+    await sendTelegramAlert(
+      `🚀 <b>BUY EXECUTED</b>\n` +
+      `Mint: <code>${mint}</code>\n` +
+      `Amount: ${(BUY_AMOUNT / 1e9).toFixed(3)} SOL\n` +
+      `Price: ${priceStr}\n` +
+      `Market Cap: ${mcStr}\n` +
+      `<a href="https://solscan.io/tx/${cleanSig}">View on Solscan</a>`
+    );
   } finally {
     inFlight.delete(mint);
   }
@@ -387,8 +422,22 @@ async function executeSell(mint: string, amount: number, reason: string) {
   if (pos.remainingAmount <= 0) positions.delete(mint);
   await persistPositions();
 
+  const { tokenPriceUSD, marketCapUSD } = await fetchPriceAndMarketCap(mint);
+  const priceStr = tokenPriceUSD !== null ? `$${tokenPriceUSD.toFixed(8)}` : "unknown";
+  const mcStr = marketCapUSD !== null
+    ? marketCapUSD >= 1000
+      ? `$${(marketCapUSD / 1000).toFixed(1)}K`
+      : `$${marketCapUSD.toFixed(0)}`
+    : "unknown";
+
   const cleanSig = sig.split(":")[1] || sig;
-  await sendTelegramAlert(`✅ <b>SELL EXECUTED</b> (${reason})\nMint: <code>${mint}</code>\n<a href="https://solscan.io/tx/${cleanSig}">View on Solscan</a>`);
+  await sendTelegramAlert(
+    `✅ <b>SELL EXECUTED</b> (${reason})\n` +
+    `Mint: <code>${mint}</code>\n` +
+    `Price: ${priceStr}\n` +
+    `Market Cap: ${mcStr}\n` +
+    `<a href="https://solscan.io/tx/${cleanSig}">View on Solscan</a>`
+  );
 }
 
 /* ================= MONITOR ================= */
@@ -464,7 +513,7 @@ async function handleTx(signature: string) {
       maxSupportedTransactionVersion: 0,
     });
     if (!tx?.meta) {
-      console.log("❌ No tx/meta returned for", signature, "— RPC may not have it yet or it failed");
+      console.log("❌ No tx/meta returned for", signature);
       return;
     }
 
@@ -556,8 +605,6 @@ async function start() {
     );
     console.log("✅ New subscription active:", subId);
 
-    // Non-destructive: keep the old listener alive for a few seconds after the
-    // new one attaches, so there's never a gap with zero active listeners.
     if (oldSubId !== null) {
       setTimeout(() => {
         connection.removeOnLogsListener(oldSubId).catch(() => {});
