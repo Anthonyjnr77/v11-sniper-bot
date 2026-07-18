@@ -154,8 +154,16 @@ function randomTipAccount(): PublicKey {
 
 const agent = new https.Agent({ keepAlive: true });
 
-async function fetchJson(url: string, options: any = {}) {
-  return fetch(url, { agent, ...options }).then((r: any) => r.json());
+// FIXED: retries on transient network failures (e.g. the FetchError seen in production)
+async function fetchJson(url: string, options: any = {}, retries = 2): Promise<any> {
+  for (let i = 0; i <= retries; i++) {
+    try {
+      return await fetch(url, { agent, ...options }).then((r: any) => r.json());
+    } catch (e: any) {
+      if (i === retries) throw e;
+      await new Promise((r) => setTimeout(r, 300));
+    }
+  }
 }
 
 function getPriorityFee() {
