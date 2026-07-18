@@ -37,7 +37,6 @@ const MIN_BUY_SOL = Number(process.env.MIN_BUY_SOL ?? 0.01) * 1e9;
 
 const SOL_MINT = "So11111111111111111111111111111111111111112";
 
-// FIXED: migrated off deprecated quote-api.jup.ag/v6 (deprecated Oct 1) to api.jup.ag with API key
 const JUP_BASE = "https://api.jup.ag/swap/v1";
 const JUP_API_KEY = process.env.JUP_API_KEY;
 
@@ -197,6 +196,11 @@ async function fetchPriceAndMarketCap(mint: string): Promise<{
     console.log("Price/MC fetch failed:", e.message);
     return { tokenPriceUSD: null, marketCapUSD: null };
   }
+}
+
+function fmtMC(mc: number | null): string {
+  if (mc === null) return "unknown";
+  return mc >= 1000 ? `$${(mc / 1000).toFixed(1)}K` : `$${mc.toFixed(0)}`;
 }
 
 /* ================= PERSISTENCE (Upstash Redis) ================= */
@@ -359,7 +363,10 @@ function passesFilters(quote: any) {
 
 /* ================= BUY ================= */
 
-async function executeBuy(mint: string) {
+async function executeBuy(
+  mint: string,
+  targetSnapshotPromise?: Promise<{ tokenPriceUSD: number | null; marketCapUSD: number | null }>
+) {
   if (positions.has(mint) || inFlight.has(mint)) return;
   inFlight.add(mint);
 
@@ -403,22 +410,18 @@ async function executeBuy(mint: string) {
 
     await persistPositions();
 
-    const { tokenPriceUSD, marketCapUSD } = await fetchPriceAndMarketCap(mint);
-
-    const priceStr = tokenPriceUSD !== null ? `$${tokenPriceUSD.toFixed(8)}` : "unknown";
-    const mcStr = marketCapUSD !== null
-      ? marketCapUSD >= 1000
-        ? `$${(marketCapUSD / 1000).toFixed(1)}K`
-        : `$${marketCapUSD.toFixed(0)}`
-      : "unknown";
+    const [mySnapshot, targetSnapshot] = await Promise.all([
+      fetchPriceAndMarketCap(mint),
+      targetSnapshotPromise ?? Promise.resolve({ tokenPriceUSD: null, marketCapUSD: null }),
+    ]);
 
     const cleanSig = sig.split(":")[1] || sig;
     await sendTelegramAlert(
       `🚀 <b>BUY EXECUTED</b>\n` +
       `Mint: <code>${mint}</code>\n` +
       `Amount: ${(BUY_AMOUNT / 1e9).toFixed(3)} SOL\n` +
-      `Price: ${priceStr}\n` +
-      `Market Cap: ${mcStr}\n` +
+      `<b>The Man's entry MC:</b> ${fmtMC(targetSnapshot.marketCapUSD)}\n` +
+      `<b>Your entry MC:</b> ${fmtMC(mySnapshot.marketCapUSD)}\n` +
       `<a href="https://solscan.io/tx/${cleanSig}">View on Solscan</a>`
     );
   } finally {
@@ -450,20 +453,13 @@ async function executeSell(mint: string, amount: number, reason: string) {
   if (pos.remainingAmount <= 0) positions.delete(mint);
   await persistPositions();
 
-  const { tokenPriceUSD, marketCapUSD } = await fetchPriceAndMarketCap(mint);
-  const priceStr = tokenPriceUSD !== null ? `$${tokenPriceUSD.toFixed(8)}` : "unknown";
-  const mcStr = marketCapUSD !== null
-    ? marketCapUSD >= 1000
-      ? `$${(marketCapUSD / 1000).toFixed(1)}K`
-      : `$${marketCapUSD.toFixed(0)}`
-    : "unknown";
+  const { marketCapUSD } = await fetchPriceAndMarketCap(mint);
 
   const cleanSig = sig.split(":")[1] || sig;
   await sendTelegramAlert(
     `✅ <b>SELL EXECUTED</b> (${reason})\n` +
     `Mint: <code>${mint}</code>\n` +
-    `Price: ${priceStr}\n` +
-    `Market Cap: ${mcStr}\n` +
+    `Market Cap: ${fmtMC(marketCapUSD)}\n` +
     `<a href="https://solscan.io/tx/${cleanSig}">View on Solscan</a>`
   );
 }
@@ -518,7 +514,7 @@ async function monitor() {
 
 setInterval(monitor, 1500);
 
-/* ================= DETECTION (Router-Agnostic, with retry + full logging) ================= */
+/* ================= DETECTION (Router-Agnostic fallback, with retry + full logging) ================= */
 
 function getResolvedAccountKeys(tx: any): PublicKey[] {
   const staticKeys: PublicKey[] = tx.transaction?.message?.staticAccountKeys ?? [];
@@ -582,7 +578,8 @@ async function handleTx(signature: string) {
       if (postAmount > preAmount) {
         foundAnyIncrease = true;
         console.log("🔥 DETECTED router-agnostic buy:", post.mint, signature);
-        executeBuy(post.mint);
+        const targetSnapshotPromise = fetchPriceAndMarketCap(post.mint);
+        executeBuy(post.mint, targetSnapshotPromise);
       }
     }
 
@@ -619,23 +616,32 @@ async function start() {
       (log) => {
         console.log(`👀 Raw activity heard: https://solscan.io/tx/${log.signature}`);
 
+        // FIXED: fast-path is authoritative. If it decodes a TradeEvent at all,
+        // we trust that answer completely and NEVER fall through to the slower
+        // handleTx path for the same event — even when it's a sell, a mismatch,
+        // or below threshold. Previously a decoded SELL would fall through and
+        // could get misread as a buy by the fallback logic on the same tx.
         const fast = tryFastDecode(log.logs);
         if (fast) {
           if (fast.user !== TARGET_WALLET.toString()) {
-            console.log("⏭️ Fast-path: decoded event but user mismatch");
-          } else if (!fast.isBuy) {
-            console.log("⏭️ Fast-path: decoded event but isBuy=false (sell/other)");
-          } else if (fast.solAmount < MIN_BUY_SOL) {
-            console.log(`⏭️ Fast-path: solAmount ${(fast.solAmount / 1e9).toFixed(4)} below threshold`);
-          } else {
-            console.log("⚡ FAST-PATH detected buy:", fast.mint);
-            executeBuy(fast.mint);
+            console.log("⏭️ Fast-path: decoded event but user mismatch — ignoring, no fallback");
             return;
           }
-        } else {
-          console.log("↪️ Fast-path found no TradeEvent — falling back to getTransaction");
+          if (!fast.isBuy) {
+            console.log("⏭️ Fast-path: confirmed SELL by target wallet — ignoring, no fallback");
+            return;
+          }
+          if (fast.solAmount < MIN_BUY_SOL) {
+            console.log(`⏭️ Fast-path: solAmount ${(fast.solAmount / 1e9).toFixed(4)} below threshold — ignoring, no fallback`);
+            return;
+          }
+          console.log("⚡ FAST-PATH detected buy:", fast.mint);
+          const targetSnapshotPromise = fetchPriceAndMarketCap(fast.mint);
+          executeBuy(fast.mint, targetSnapshotPromise);
+          return;
         }
 
+        console.log("↪️ Fast-path found no TradeEvent — falling back to getTransaction");
         handleTx(log.signature);
       },
       "processed"
