@@ -7,6 +7,7 @@ import {
   SystemProgram,
   Transaction,
 } from "@solana/web3.js";
+import type { Logs } from "@solana/web3.js";
 import { Program, AnchorProvider, BorshEventCoder } from "@coral-xyz/anchor";
 import fetch from "node-fetch";
 import bs58 from "bs58";
@@ -22,10 +23,46 @@ function requireEnv(name: string): string {
 }
 
 const RPC_URL = requireEnv("RPC_URL");
-const connection = new Connection(RPC_URL, {
-  commitment: "processed",
-  wsEndpoint: RPC_URL.replace("https", "wss"),
-});
+
+// Shared keep-alive agent — reused for RPC + Jupiter + Telegram so TLS
+// handshakes are paid once per host, not on every call. Cold handshakes from
+// Render cost ~100-300ms each, twice per trade (quote + swap), so this alone
+// is a few hundred ms off every buy.
+const agent = new https.Agent({ keepAlive: true, maxSockets: 64 });
+
+function makeConnection(url: string): Connection {
+  return new Connection(url, {
+    commitment: "processed",
+    wsEndpoint: url.replace("https", "wss"),
+    httpAgent: agent,
+  });
+}
+
+const connection = makeConnection(RPC_URL);
+
+// --- Detection fan-out ---
+// N parallel websocket subscriptions racing each other; first channel to
+// deliver a signature wins, the rest are deduped. Helius free tier allows 5
+// simultaneous websocket connections, so WS_FANOUT=2 on the primary RPC plus
+// the public RPC as an extra channel is safely within limits. This cuts both
+// average detection latency (min-of-N) and the silent-miss rate (all channels
+// must drop the same event for it to be missed by the websocket layer at all —
+// and the polling backstop still catches it then).
+const WS_FANOUT = Math.max(1, Number(process.env.WS_FANOUT ?? 2));
+const EXTRA_WS_URLS = (process.env.EXTRA_WS_URLS ?? "https://api.mainnet-beta.solana.com")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+const detectionConnections: Connection[] = [connection];
+for (let i = 1; i < WS_FANOUT; i++) detectionConnections.push(makeConnection(RPC_URL));
+for (const url of EXTRA_WS_URLS) detectionConnections.push(makeConnection(url));
+
+// Rebroadcasts go through a separate RPC (public by default) because Helius
+// free caps sendTransaction at 1/sec — rebroadcasting through it would get
+// rate-limited or eat the credit budget.
+const BROADCAST_RPC_URL = process.env.BROADCAST_RPC_URL ?? "https://api.mainnet-beta.solana.com";
+const broadcastConnection = makeConnection(BROADCAST_RPC_URL);
 
 const wallet = Keypair.fromSecretKey(bs58.decode(requireEnv("PRIVATE_KEY")));
 const TARGET_WALLET = new PublicKey(requireEnv("TARGET_WALLET"));
@@ -35,6 +72,19 @@ const BASE_PRIORITY_FEE = Number(process.env.PRIORITY_FEE_LAMPORTS ?? 500_000);
 const SLIPPAGE_BPS = Number(process.env.SLIPPAGE_BPS ?? 1500);
 const MIN_BUY_SOL = Number(process.env.MIN_BUY_SOL ?? 0.01) * 1e9;
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS ?? 5000);
+
+// Price impact is now split from slippage: slippage stays loose (15%) as a
+// fill-safety ceiling, while MAX_PRICE_IMPACT can be tightened independently
+// (0.05-0.08 recommended) to refuse trades that are *expected* to cost too
+// much against the pool.
+const MAX_PRICE_IMPACT = Number(process.env.MAX_PRICE_IMPACT ?? 0.15);
+
+// Fresh Pump.fun tokens only route through the bonding curve anyway, so
+// letting Jupiter search multi-hop routes is wasted time on their side.
+const ONLY_DIRECT_ROUTES = (process.env.ONLY_DIRECT_ROUTES ?? "true") === "true";
+
+// PumpPortal third detection channel (see PUMPPORTAL section below).
+const PUMPPORTAL_ENABLED = (process.env.PUMPPORTAL ?? "true") === "true";
 
 const SOL_MINT = "So11111111111111111111111111111111111111112";
 
@@ -60,6 +110,7 @@ async function sendTelegramAlert(message: string) {
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
   try {
     await fetch(url, {
+      agent,
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -134,7 +185,13 @@ function tryFastDecode(logs: string[]): { mint: string; isBuy: boolean; solAmoun
 
 /* ================= JITO ================= */
 
-const JITO_BLOCK_ENGINE_URL = "https://mainnet.block-engine.jito.wtf/api/v1/bundles";
+// Regional block engines are meaningfully faster when your server is near one.
+// If your Render service is in Frankfurt, set:
+//   JITO_URL=https://frankfurt.mainnet.block-engine.jito.wtf/api/v1/bundles
+// Other regions: amsterdam. / ny. / tokyo. / slc. (same URL pattern).
+const JITO_BLOCK_ENGINE_URL =
+  process.env.JITO_URL ?? "https://mainnet.block-engine.jito.wtf/api/v1/bundles";
+
 const JITO_TIP_ACCOUNTS: string[] = [
   "9n3d1K5YD2vECAbRFhFFGYNNjiXtHXJWn9F31t89vsAV",
   "aTtUk2DHgLhKZRDjePq6eiHRKC1XXFMBiSUfQ2JNDbN",
@@ -155,8 +212,6 @@ function randomTipAccount(): PublicKey {
 
 /* ================= NETWORK ================= */
 
-const agent = new https.Agent({ keepAlive: true });
-
 async function fetchJson(url: string, options: any = {}, retries = 2): Promise<any> {
   for (let i = 0; i <= retries; i++) {
     try {
@@ -174,6 +229,31 @@ function getPriorityFee() {
 
 function jupHeaders(extra: Record<string, string> = {}) {
   return JUP_API_KEY ? { "x-api-key": JUP_API_KEY, ...extra } : extra;
+}
+
+/* ================= BLOCKHASH CACHE ================= */
+// Keeps a recent blockhash warm in the background so the Jito tip transaction
+// never spends a hot-path RPC round trip fetching one at buy time. A blockhash
+// stays valid ~60s; we refresh every 25s and never use one older than 40s.
+
+let cachedBlockhash: string | null = null;
+let cachedBlockhashAt = 0;
+
+async function refreshBlockhash() {
+  try {
+    const { blockhash } = await connection.getLatestBlockhash("processed");
+    cachedBlockhash = blockhash;
+    cachedBlockhashAt = Date.now();
+  } catch {
+    // keep the old one; getBlockhashFast falls back to a live fetch if too stale
+  }
+}
+
+async function getBlockhashFast(): Promise<string> {
+  if (cachedBlockhash && Date.now() - cachedBlockhashAt < 40_000) return cachedBlockhash;
+  await refreshBlockhash();
+  if (cachedBlockhash && Date.now() - cachedBlockhashAt < 40_000) return cachedBlockhash;
+  return (await connection.getLatestBlockhash("processed")).blockhash;
 }
 
 /* ================= PRICE / MARKET CAP ================= */
@@ -214,6 +294,7 @@ async function persistPositions() {
   try {
     const serialized = JSON.stringify(Array.from(positions.entries()));
     await fetch(`${UPSTASH_URL}/set/positions`, {
+      agent,
       method: "POST",
       headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` },
       body: serialized,
@@ -227,6 +308,7 @@ async function loadPositions() {
   if (!UPSTASH_URL || !UPSTASH_TOKEN) return;
   try {
     const res = await fetch(`${UPSTASH_URL}/get/positions`, {
+      agent,
       headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` },
     });
     const data: any = await res.json();
@@ -256,12 +338,32 @@ const positions = new Map<string, Position>();
 const inFlight = new Set<string>();
 const seenSignatures = new Set<string>();
 
+// Single dedupe gate shared by ALL detection channels (websocket fan-out,
+// PumpPortal, polling backstop). Marks the signature as processed and returns
+// true if it was ALREADY seen — whichever channel calls this first wins the
+// race, every other channel drops the event here. Also trims the set so it
+// can't grow unboundedly across a long uptime.
+function alreadySeen(sig: string): boolean {
+  if (seenSignatures.has(sig)) return true;
+  seenSignatures.add(sig);
+  if (seenSignatures.size > 5000) {
+    const iter = seenSignatures.values();
+    for (let i = 0; i < 1000; i++) {
+      const v = iter.next().value;
+      if (v === undefined) break;
+      seenSignatures.delete(v);
+    }
+  }
+  return false;
+}
+
 /* ================= JUPITER ================= */
 
 async function getQuote(inputMint: string, outputMint: string, amount: number) {
-  const url = `${JUP_BASE}/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${Math.floor(
+  let url = `${JUP_BASE}/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${Math.floor(
     amount
   )}&slippageBps=${SLIPPAGE_BPS}`;
+  if (ONLY_DIRECT_ROUTES) url += "&onlyDirectRoutes=true";
   const data = await fetchJson(url, { headers: jupHeaders() });
   if (!data || data.error || !data.outAmount) return null;
   return data;
@@ -276,7 +378,10 @@ async function buildSwapTx(quoteResponse: any) {
       userPublicKey: wallet.publicKey.toString(),
       wrapAndUnwrapSol: true,
       prioritizationFeeLamports: getPriorityFee(),
-      dynamicComputeUnitLimit: true,
+      // false = Jupiter skips the simulation round trip it uses to size the
+      // compute budget. Costs nothing at our position size (the Jito tip does
+      // the priority work), saves real time on every build.
+      dynamicComputeUnitLimit: false,
     }),
   });
   if (!data || data.error || !data.swapTransaction) return null;
@@ -285,6 +390,28 @@ async function buildSwapTx(quoteResponse: any) {
 
 /* ================= DUAL-PATH SUBMISSION ================= */
 
+// Re-fires the same signed tx a few times through the broadcast RPC so a
+// dropped first submission doesn't kill the trade. The network rejects
+// duplicate signatures, so if the tx already landed these are harmless no-ops.
+function scheduleRebroadcasts(rawBytes: Uint8Array) {
+  let sends = 0;
+  const timer = setInterval(async () => {
+    sends++;
+    if (sends > 4) {
+      clearInterval(timer);
+      return;
+    }
+    try {
+      await broadcastConnection.sendRawTransaction(rawBytes, {
+        skipPreflight: true,
+        maxRetries: 0,
+      });
+    } catch {
+      // "already processed" / rate limit — either way, ignore
+    }
+  }, 500);
+}
+
 async function sendSwapDual(txBase64: string): Promise<string | null> {
   const swapTx = VersionedTransaction.deserialize(Buffer.from(txBase64, "base64"));
   swapTx.sign([wallet]);
@@ -292,7 +419,8 @@ async function sendSwapDual(txBase64: string): Promise<string | null> {
 
   const jitoAttempt = (async () => {
     try {
-      const { blockhash } = await connection.getLatestBlockhash("processed");
+      // Cached blockhash — no hot-path RPC round trip here anymore.
+      const blockhash = await getBlockhashFast();
       const tipTx = new Transaction({ feePayer: wallet.publicKey, recentBlockhash: blockhash }).add(
         SystemProgram.transfer({
           fromPubkey: wallet.publicKey,
@@ -322,6 +450,9 @@ async function sendSwapDual(txBase64: string): Promise<string | null> {
       return null;
     }
   })();
+
+  // Safety net: re-fire the same signed tx a few times in the background.
+  scheduleRebroadcasts(rawBytes);
 
   const results = await Promise.allSettled([jitoAttempt, rpcAttempt]);
   for (const r of results) {
@@ -359,7 +490,7 @@ async function waitForBalance(mint: string, attempts = 6, delayMs = 500): Promis
 
 function passesFilters(quote: any) {
   const impact = Number(quote.priceImpactPct ?? 0);
-  return impact <= 0.15 && Number(quote.outAmount) > 0;
+  return impact <= MAX_PRICE_IMPACT && Number(quote.outAmount) > 0;
 }
 
 /* ================= BUY ================= */
@@ -537,13 +668,11 @@ async function getTransactionWithRetry(signature: string, attempts = 6, delayMs 
   return null;
 }
 
+// NOTE: dedupe now happens in the callers (onWalletLog / poller / PumpPortal)
+// via alreadySeen(), so every detection channel shares one gate. handleTx no
+// longer checks — by the time it's called, this signature has already won the
+// race and been marked as seen.
 async function handleTx(signature: string) {
-  if (seenSignatures.has(signature)) {
-    console.log("↩️ Duplicate signature, skipping:", signature);
-    return;
-  }
-  seenSignatures.add(signature);
-
   try {
     const tx = await getTransactionWithRetry(signature);
     if (!tx?.meta) {
@@ -592,18 +721,143 @@ async function handleTx(signature: string) {
   }
 }
 
+/* ================= WEBSOCKET FAN-OUT ================= */
+// One shared handler for every websocket channel. The alreadySeen() gate at
+// the top is what makes the fan-out safe: whichever subscription delivers the
+// event first processes it, every later delivery of the same signature exits
+// immediately. Fast-path stays authoritative exactly as before — a decoded
+// TradeEvent is trusted completely and never falls through to the fallback.
+
+function onWalletLog(log: Logs) {
+  if (alreadySeen(log.signature)) return; // another channel got here first
+
+  console.log(`👀 Raw activity heard: https://solscan.io/tx/${log.signature}`);
+
+  const fast = tryFastDecode(log.logs);
+  if (fast) {
+    if (fast.user !== TARGET_WALLET.toString()) {
+      console.log("⏭️ Fast-path: decoded event but user mismatch — ignoring, no fallback");
+      return;
+    }
+    if (!fast.isBuy) {
+      console.log("⏭️ Fast-path: confirmed SELL by target wallet — ignoring, no fallback");
+      return;
+    }
+    if (fast.solAmount < MIN_BUY_SOL) {
+      console.log(`⏭️ Fast-path: solAmount ${(fast.solAmount / 1e9).toFixed(4)} below threshold — ignoring, no fallback`);
+      return;
+    }
+    console.log("⚡ FAST-PATH detected buy:", fast.mint);
+    const targetSnapshotPromise = fetchPriceAndMarketCap(fast.mint);
+    executeBuy(fast.mint, targetSnapshotPromise);
+    return;
+  }
+
+  console.log("↪️ Fast-path found no TradeEvent — falling back to getTransaction");
+  handleTx(log.signature);
+}
+
+const subIds: (number | null)[] = detectionConnections.map(() => null);
+
+// Non-destructive refresh across ALL channels: new subscription opens first,
+// old one is removed 3s later, so there's never a listening gap.
+function refreshSubscriptions() {
+  detectionConnections.forEach((conn, i) => {
+    const oldSubId = subIds[i] ?? null;
+    subIds[i] = conn.onLogs(TARGET_WALLET, onWalletLog, "processed");
+    if (oldSubId !== null) {
+      setTimeout(() => {
+        conn.removeOnLogsListener(oldSubId).catch(() => {});
+      }, 3000);
+    }
+  });
+  console.log(`✅ ${detectionConnections.length} detection subscription(s) refreshed`);
+}
+
+/* ================= PUMPPORTAL CHANNEL ================= */
+// Third, independent detection channel: PumpPortal's realtime feed streams
+// Pump.fun trades for a specific wallet directly (wss://pumpportal.fun/api/data,
+// subscribeAccountTrade). It arrives pre-decoded — mint, buy/sell, SOL amount —
+// so a buy detected here goes straight to executeBuy with zero RPC calls.
+// Uses the same alreadySeen() gate, so it races the websockets safely.
+// Requires Node 22+ (native WebSocket). On older Node it logs a warning and
+// the bot runs exactly as before on the other channels.
+
+const PUMPPORTAL_WS = "wss://pumpportal.fun/api/data";
+
+function startPumpPortal() {
+  const WS: any = (globalThis as any).WebSocket;
+  if (!WS) {
+    console.log("⚠️ PumpPortal channel disabled — needs Node 22+ (no native WebSocket)");
+    return;
+  }
+
+  const connect = () => {
+    let ws: any;
+    try {
+      ws = new WS(PUMPPORTAL_WS);
+    } catch {
+      setTimeout(connect, 5000);
+      return;
+    }
+
+    ws.onopen = () => {
+      console.log("✅ PumpPortal channel connected");
+      ws.send(JSON.stringify({ method: "subscribeAccountTrade", keys: [TARGET_WALLET.toString()] }));
+    };
+
+    ws.onmessage = (ev: any) => {
+      try {
+        const raw = typeof ev.data === "string" ? ev.data : ev.data.toString();
+        const msg = JSON.parse(raw);
+        if (!msg?.signature || !msg?.mint) return; // subscription acks etc.
+        if (msg.traderPublicKey !== TARGET_WALLET.toString()) return;
+        if (alreadySeen(msg.signature)) return; // a websocket channel won the race
+        if (msg.txType !== "buy") return;
+
+        // PumpPortal reports solAmount in SOL (decimal), not lamports.
+        const lamports = Number(msg.solAmount ?? 0) * 1e9;
+        if (lamports < MIN_BUY_SOL) {
+          console.log(`⏭️ PumpPortal: buy below threshold (${Number(msg.solAmount).toFixed(4)} SOL) — ignoring`);
+          return;
+        }
+
+        console.log("⚡ PUMPPORTAL detected buy:", msg.mint);
+        const targetSnapshotPromise = fetchPriceAndMarketCap(msg.mint);
+        executeBuy(msg.mint, targetSnapshotPromise);
+      } catch {
+        // non-JSON frame, ignore
+      }
+    };
+
+    ws.onclose = () => {
+      console.log("⚠️ PumpPortal channel closed — reconnecting in 3s");
+      setTimeout(connect, 3000);
+    };
+
+    ws.onerror = () => {
+      try {
+        ws.close();
+      } catch {}
+    };
+  };
+
+  connect();
+}
+
 /* ================= POLLING RECONCILIATION LOOP (correctness backstop) ================= */
-// This is the actual fix for silent websocket misses. onLogs is best-effort with
-// no delivery guarantee by design — this queries the committed ledger directly,
-// so it cannot drop an event the way a websocket stream can. The websocket stays
-// as the fast path; this guarantees nothing is ever permanently missed.
+// This is the actual fix for silent websocket misses. onLogs is best-effort
+// with no delivery guarantee by design — this queries the committed ledger
+// directly, so it cannot drop an event the way a websocket stream can. The
+// websockets + PumpPortal are the fast paths; this guarantees nothing is ever
+// permanently missed.
 
 let lastPolledSignature: string | null = null;
 
 async function initPollingCursor() {
   try {
     const sigs = await connection.getSignaturesForAddress(TARGET_WALLET, { limit: 1 }, "confirmed");
-    if (sigs.length > 0) {
+    if (sigs.length > 0 && sigs[0]) {
       lastPolledSignature = sigs[0].signature;
       console.log("✅ Polling cursor initialized at:", lastPolledSignature);
     }
@@ -625,13 +879,12 @@ async function pollForMissedTrades() {
 
     for (const sigInfo of ordered) {
       if (sigInfo.err) continue; // skip failed on-chain transactions
-      if (!seenSignatures.has(sigInfo.signature)) {
-        console.log("🔎 POLL found unprocessed signature (websocket likely missed it):", sigInfo.signature);
-        await handleTx(sigInfo.signature);
-      }
+      if (alreadySeen(sigInfo.signature)) continue; // a fast channel already handled it
+      console.log("🔎 POLL found unprocessed signature (all fast channels missed it):", sigInfo.signature);
+      await handleTx(sigInfo.signature);
     }
 
-    lastPolledSignature = sigs[0].signature;
+    lastPolledSignature = sigs[0]?.signature ?? lastPolledSignature;
   } catch (e: any) {
     console.log("Polling error:", e.message);
   }
@@ -648,62 +901,28 @@ app.listen(PORT, () => console.log(`Keep-alive server on port ${PORT}`));
 
 async function start() {
   console.log("🚀 Copy-trade bot starting. Target:", TARGET_WALLET.toString());
-  await loadPositions();
-  await initPumpDecoder();
-  await initPollingCursor();
 
-  let subId: number | null = null;
+  // Independent init steps run in parallel — faster cold start after a
+  // Render restart, which shrinks the redeploy blind window.
+  await Promise.all([loadPositions(), initPumpDecoder(), initPollingCursor(), refreshBlockhash()]);
 
-  function subscribeToWallet() {
-    const oldSubId = subId;
-
-    console.log("🔌 Opening new WebSocket subscription...");
-    subId = connection.onLogs(
-      TARGET_WALLET,
-      (log) => {
-        console.log(`👀 Raw activity heard: https://solscan.io/tx/${log.signature}`);
-
-        const fast = tryFastDecode(log.logs);
-        if (fast) {
-          if (fast.user !== TARGET_WALLET.toString()) {
-            console.log("⏭️ Fast-path: decoded event but user mismatch — ignoring, no fallback");
-            return;
-          }
-          if (!fast.isBuy) {
-            console.log("⏭️ Fast-path: confirmed SELL by target wallet — ignoring, no fallback");
-            return;
-          }
-          if (fast.solAmount < MIN_BUY_SOL) {
-            console.log(`⏭️ Fast-path: solAmount ${(fast.solAmount / 1e9).toFixed(4)} below threshold — ignoring, no fallback`);
-            return;
-          }
-          console.log("⚡ FAST-PATH detected buy:", fast.mint);
-          const targetSnapshotPromise = fetchPriceAndMarketCap(fast.mint);
-          executeBuy(fast.mint, targetSnapshotPromise);
-          return;
-        }
-
-        console.log("↪️ Fast-path found no TradeEvent — falling back to getTransaction");
-        handleTx(log.signature);
-      },
-      "processed"
-    );
-    console.log("✅ New subscription active:", subId);
-
-    if (oldSubId !== null) {
-      setTimeout(() => {
-        connection.removeOnLogsListener(oldSubId).catch(() => {});
-        console.log("🗑️ Old subscription removed:", oldSubId);
-      }, 3000);
-    }
-  }
-
-  subscribeToWallet();
-  setInterval(subscribeToWallet, 60 * 1000);
+  refreshSubscriptions();
+  setInterval(refreshSubscriptions, 60 * 1000);
   setInterval(pollForMissedTrades, POLL_INTERVAL_MS);
+  setInterval(refreshBlockhash, 25_000);
 
-  console.log("✅ Bot fully running (websocket + polling backstop active)");
-  await sendTelegramAlert(`🟢 <b>V11 Engine Online</b>\nSniper deployed and actively watching target wallet:\n<code>${TARGET_WALLET.toString()}</code>`);
+  // Keeps the TLS connection to Jupiter warm so the first quote after an idle
+  // stretch doesn't pay a fresh DNS + TCP + TLS handshake on the hot path.
+  setInterval(() => {
+    fetch("https://api.jup.ag/", { agent } as any).catch(() => {});
+  }, 45_000);
+
+  if (PUMPPORTAL_ENABLED) startPumpPortal();
+
+  console.log("✅ Bot fully running (websocket fan-out + PumpPortal + polling backstop active)");
+  await sendTelegramAlert(
+    `🟢 <b>V12 Engine Online</b>\nSniper deployed and actively watching target wallet:\n<code>${TARGET_WALLET.toString()}</code>\nChannels: ${detectionConnections.length} websocket(s)${PUMPPORTAL_ENABLED ? " + PumpPortal" : ""} + polling backstop`
+  );
 }
 
 start();
