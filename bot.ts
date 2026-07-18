@@ -669,8 +669,7 @@ async function start() {
   }
 
   subscribeToWallet();
-  setInterval(subscribeToWallet, 5 * 60 * 1000);
-  setInterval(heartbeatCheck, 30 * 1000);
+setInterval(subscribeToWallet, 60 * 1000); // shrunk from 5 min to cap the blind window
 
   console.log("✅ Bot fully running");
   await sendTelegramAlert(`🟢 <b>V11 Engine Online</b>\nSniper deployed and actively watching target wallet:\n<code>${TARGET_WALLET.toString()}</code>`);
