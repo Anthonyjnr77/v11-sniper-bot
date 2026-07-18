@@ -36,7 +36,10 @@ const SLIPPAGE_BPS = Number(process.env.SLIPPAGE_BPS ?? 1500);
 const MIN_BUY_SOL = Number(process.env.MIN_BUY_SOL ?? 0.01) * 1e9;
 
 const SOL_MINT = "So11111111111111111111111111111111111111112";
-const JUP_BASE = "https://quote-api.jup.ag/v6";
+
+// FIXED: migrated off deprecated quote-api.jup.ag/v6 (deprecated Oct 1) to api.jup.ag with API key
+const JUP_BASE = "https://api.jup.ag/swap/v1";
+const JUP_API_KEY = process.env.JUP_API_KEY;
 
 const TP_TIERS = [
   { tp: 7.0, sellFraction: 0.5 },
@@ -154,7 +157,6 @@ function randomTipAccount(): PublicKey {
 
 const agent = new https.Agent({ keepAlive: true });
 
-// FIXED: retries on transient network failures (e.g. the FetchError seen in production)
 async function fetchJson(url: string, options: any = {}, retries = 2): Promise<any> {
   for (let i = 0; i <= retries; i++) {
     try {
@@ -170,6 +172,10 @@ function getPriorityFee() {
   return Math.floor(BASE_PRIORITY_FEE * (1 + Math.random()));
 }
 
+function jupHeaders(extra: Record<string, string> = {}) {
+  return JUP_API_KEY ? { "x-api-key": JUP_API_KEY, ...extra } : extra;
+}
+
 /* ================= PRICE / MARKET CAP ================= */
 
 async function fetchPriceAndMarketCap(mint: string): Promise<{
@@ -177,7 +183,9 @@ async function fetchPriceAndMarketCap(mint: string): Promise<{
   marketCapUSD: number | null;
 }> {
   try {
-    const priceRes = await fetchJson(`https://api.jup.ag/price/v3?ids=${mint}`);
+    const priceRes = await fetchJson(`https://api.jup.ag/price/v3?ids=${mint}`, {
+      headers: jupHeaders(),
+    });
     const tokenPriceUSD = priceRes?.[mint]?.usdPrice ?? null;
 
     const supplyInfo = await connection.getTokenSupply(new PublicKey(mint));
@@ -249,7 +257,7 @@ async function getQuote(inputMint: string, outputMint: string, amount: number) {
   const url = `${JUP_BASE}/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${Math.floor(
     amount
   )}&slippageBps=${SLIPPAGE_BPS}`;
-  const data = await fetchJson(url);
+  const data = await fetchJson(url, { headers: jupHeaders() });
   if (!data || data.error || !data.outAmount) return null;
   return data;
 }
@@ -257,7 +265,7 @@ async function getQuote(inputMint: string, outputMint: string, amount: number) {
 async function buildSwapTx(quoteResponse: any) {
   const data = await fetchJson(`${JUP_BASE}/swap`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: jupHeaders({ "Content-Type": "application/json" }),
     body: JSON.stringify({
       quoteResponse,
       userPublicKey: wallet.publicKey.toString(),
