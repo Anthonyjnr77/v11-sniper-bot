@@ -616,11 +616,6 @@ async function start() {
       (log) => {
         console.log(`👀 Raw activity heard: https://solscan.io/tx/${log.signature}`);
 
-        // FIXED: fast-path is authoritative. If it decodes a TradeEvent at all,
-        // we trust that answer completely and NEVER fall through to the slower
-        // handleTx path for the same event — even when it's a sell, a mismatch,
-        // or below threshold. Previously a decoded SELL would fall through and
-        // could get misread as a buy by the fallback logic on the same tx.
         const fast = tryFastDecode(log.logs);
         if (fast) {
           if (fast.user !== TARGET_WALLET.toString()) {
@@ -656,8 +651,26 @@ async function start() {
     }
   }
 
+  // NEW: active heartbeat — detects a silently dead websocket connection
+  // (common on cloud hosts where the underlying TCP connection can die without
+  // a proper close signal) and forces an immediate reconnect, instead of
+  // waiting up to 5 minutes for the scheduled refresh to fix it.
+  async function heartbeatCheck() {
+    try {
+      await Promise.race([
+        connection.getSlot("processed"),
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error("heartbeat timeout")), 5000)),
+      ]);
+      // connection is alive, nothing to do
+    } catch (e: any) {
+      console.log("💔 Heartbeat failed — connection may be dead, forcing reconnect:", e.message);
+      subscribeToWallet();
+    }
+  }
+
   subscribeToWallet();
   setInterval(subscribeToWallet, 5 * 60 * 1000);
+  setInterval(heartbeatCheck, 30 * 1000);
 
   console.log("✅ Bot fully running");
   await sendTelegramAlert(`🟢 <b>V11 Engine Online</b>\nSniper deployed and actively watching target wallet:\n<code>${TARGET_WALLET.toString()}</code>`);
