@@ -34,6 +34,7 @@ const BUY_AMOUNT = Number(process.env.BUY_AMOUNT_SOL) * 1e9;
 const BASE_PRIORITY_FEE = Number(process.env.PRIORITY_FEE_LAMPORTS ?? 500_000);
 const SLIPPAGE_BPS = Number(process.env.SLIPPAGE_BPS ?? 1500);
 const MIN_BUY_SOL = Number(process.env.MIN_BUY_SOL ?? 0.01) * 1e9;
+const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS ?? 5000);
 
 const SOL_MINT = "So11111111111111111111111111111111111111112";
 
@@ -591,6 +592,51 @@ async function handleTx(signature: string) {
   }
 }
 
+/* ================= POLLING RECONCILIATION LOOP (correctness backstop) ================= */
+// This is the actual fix for silent websocket misses. onLogs is best-effort with
+// no delivery guarantee by design — this queries the committed ledger directly,
+// so it cannot drop an event the way a websocket stream can. The websocket stays
+// as the fast path; this guarantees nothing is ever permanently missed.
+
+let lastPolledSignature: string | null = null;
+
+async function initPollingCursor() {
+  try {
+    const sigs = await connection.getSignaturesForAddress(TARGET_WALLET, { limit: 1 }, "confirmed");
+    if (sigs.length > 0) {
+      lastPolledSignature = sigs[0].signature;
+      console.log("✅ Polling cursor initialized at:", lastPolledSignature);
+    }
+  } catch (e: any) {
+    console.log("⚠️ Could not initialize polling cursor:", e.message);
+  }
+}
+
+async function pollForMissedTrades() {
+  try {
+    const options: any = { limit: 25 };
+    if (lastPolledSignature) options.until = lastPolledSignature;
+
+    const sigs = await connection.getSignaturesForAddress(TARGET_WALLET, options, "confirmed");
+    if (sigs.length === 0) return;
+
+    // sigs come back newest-first; process oldest-first for correct chronological order
+    const ordered = [...sigs].reverse();
+
+    for (const sigInfo of ordered) {
+      if (sigInfo.err) continue; // skip failed on-chain transactions
+      if (!seenSignatures.has(sigInfo.signature)) {
+        console.log("🔎 POLL found unprocessed signature (websocket likely missed it):", sigInfo.signature);
+        await handleTx(sigInfo.signature);
+      }
+    }
+
+    lastPolledSignature = sigs[0].signature;
+  } catch (e: any) {
+    console.log("Polling error:", e.message);
+  }
+}
+
 /* ================= KEEP-ALIVE SERVER ================= */
 
 const app = express();
@@ -604,6 +650,7 @@ async function start() {
   console.log("🚀 Copy-trade bot starting. Target:", TARGET_WALLET.toString());
   await loadPositions();
   await initPumpDecoder();
+  await initPollingCursor();
 
   let subId: number | null = null;
 
@@ -651,27 +698,11 @@ async function start() {
     }
   }
 
-  // NEW: active heartbeat — detects a silently dead websocket connection
-  // (common on cloud hosts where the underlying TCP connection can die without
-  // a proper close signal) and forces an immediate reconnect, instead of
-  // waiting up to 5 minutes for the scheduled refresh to fix it.
-  async function heartbeatCheck() {
-    try {
-      await Promise.race([
-        connection.getSlot("processed"),
-        new Promise<never>((_, reject) => setTimeout(() => reject(new Error("heartbeat timeout")), 5000)),
-      ]);
-      // connection is alive, nothing to do
-    } catch (e: any) {
-      console.log("💔 Heartbeat failed — connection may be dead, forcing reconnect:", e.message);
-      subscribeToWallet();
-    }
-  }
-
   subscribeToWallet();
-setInterval(subscribeToWallet, 60 * 1000); // shrunk from 5 min to cap the blind window
+  setInterval(subscribeToWallet, 60 * 1000);
+  setInterval(pollForMissedTrades, POLL_INTERVAL_MS);
 
-  console.log("✅ Bot fully running");
+  console.log("✅ Bot fully running (websocket + polling backstop active)");
   await sendTelegramAlert(`🟢 <b>V11 Engine Online</b>\nSniper deployed and actively watching target wallet:\n<code>${TARGET_WALLET.toString()}</code>`);
 }
 
