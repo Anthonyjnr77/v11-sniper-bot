@@ -34,17 +34,24 @@ function makeConnection(url: string): Connection {
   });
 }
 
+// Primary connection: HTTP RPC calls only (quotes support, getTransaction,
+// balances, blockhash). Detection websockets are owned by the rotation logic
+// below and are deliberately SEPARATE connections.
 const connection = makeConnection(RPC_URL);
 
-const WS_FANOUT = Math.max(1, Number(process.env.WS_FANOUT ?? 2));
+// Detection channel URLs. WS_FANOUT copies of the primary RPC + any extras.
+// NOTE: Helius free tier allows 5 simultaneous websocket connections, and
+// rotation briefly overlaps old + new sockets — keep WS_FANOUT at 2 or less
+// so 2 old + 2 new = 4 stays under the cap during the handoff.
+const WS_FANOUT = Math.max(1, Math.min(2, Number(process.env.WS_FANOUT ?? 2)));
 const EXTRA_WS_URLS = (process.env.EXTRA_WS_URLS ?? "https://api.mainnet-beta.solana.com")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
 
-const detectionConnections: Connection[] = [connection];
-for (let i = 1; i < WS_FANOUT; i++) detectionConnections.push(makeConnection(RPC_URL));
-for (const url of EXTRA_WS_URLS) detectionConnections.push(makeConnection(url));
+const DETECTION_URLS: string[] = [];
+for (let i = 0; i < WS_FANOUT; i++) DETECTION_URLS.push(RPC_URL);
+DETECTION_URLS.push(...EXTRA_WS_URLS);
 
 const BROADCAST_RPC_URL = process.env.BROADCAST_RPC_URL ?? "https://api.mainnet-beta.solana.com";
 const broadcastConnection = makeConnection(BROADCAST_RPC_URL);
@@ -175,6 +182,9 @@ function tryFastDecode(logs: string[]): { mint: string; isBuy: boolean; solAmoun
 const JITO_BLOCK_ENGINE_URL =
   process.env.JITO_URL ?? "https://mainnet.block-engine.jito.wtf/api/v1/bundles";
 
+// FIXED: the last tip account had been truncated to an invalid address
+// ("ARTtviJkLLt6cHGQDixKlgnT8mL"), which threw whenever it was randomly
+// selected — silently killing the Jito path on ~1 in 8 buys.
 const JITO_TIP_ACCOUNTS: string[] = [
   "9n3d1K5YD2vECAbRFhFFGYNNjiXtHXJWn9F31t89vsAV",
   "aTtUk2DHgLhKZRDjePq6eiHRKC1XXFMBiSUfQ2JNDbN",
@@ -183,7 +193,7 @@ const JITO_TIP_ACCOUNTS: string[] = [
   "4xgEmT58RwTNsF5xm2RMYCnR1EVukdK8a1i2qFjnJFu3",
   "EoW3SUQap7ZeynXQ2QJ847aerhxbPVr843uMeTfc9dxM",
   "E2eSqe33tuhAHKTrwky5uEjaVqnb2T9ns6nHHUrN8588",
-  "ARTtviJkLLt6cHGQDixKlgnT8mL",
+  "ARTtviJkLLt6cHGQDydfo1Wyk6M4VGZdKZ2ZhdnJL336",
 ];
 const JITO_TIP_LAMPORTS = Number(process.env.JITO_TIP_LAMPORTS ?? 2_000_000);
 
@@ -223,7 +233,7 @@ function jupHeaders(extra: Record<string, string> = {}) {
   return JUP_API_KEY ? { "x-api-key": JUP_API_KEY, ...extra } : extra;
 }
 
-/* ================= BLOCKHASH CACHE (unchanged — proper age check kept) ================= */
+/* ================= BLOCKHASH CACHE ================= */
 
 let cachedBlockhash: string | null = null;
 let cachedBlockhashAt = 0;
@@ -250,9 +260,13 @@ async function getBlockhashFast(): Promise<string> {
 let lastLowBalanceAlertAt = 0;
 const LOW_BALANCE_ALERT_COOLDOWN_MS = 30 * 60 * 1000;
 
+// Cached so executeBuy can refuse doomed trades without a hot-path RPC call.
+let lastKnownBalanceLamports: number | null = null;
+
 async function checkWalletBalance() {
   try {
     const lamports = await connection.getBalance(wallet.publicKey, "confirmed");
+    lastKnownBalanceLamports = lamports;
     const sol = lamports / 1e9;
     if (sol < MIN_WALLET_BALANCE_SOL) {
       const now = Date.now();
@@ -405,6 +419,10 @@ function alreadySeen(sig: string): boolean {
   return false;
 }
 
+// Live channel health, surfaced via /status so you can check from Telegram
+// without opening Render logs.
+let pumpPortalConnected = false;
+
 /* ================= EMERGENCY STOP VIA TELEGRAM ================= */
 
 let botPaused = false;
@@ -432,8 +450,16 @@ async function pollTelegramCommands() {
         console.log("▶️ Bot RESUMED via Telegram command");
         await sendTelegramAlert("▶️ <b>Bot resumed.</b> New buys re-enabled.");
       } else if (text === "/status") {
+        const balanceStr = lastKnownBalanceLamports !== null
+          ? `${(lastKnownBalanceLamports / 1e9).toFixed(4)} SOL`
+          : "unknown";
         await sendTelegramAlert(
-          `📊 <b>Status</b>\nPaused: ${botPaused ? "YES" : "no"}\nOpen positions: ${positions.size}`
+          `📊 <b>Status</b>\n` +
+          `Paused: ${botPaused ? "YES" : "no"}\n` +
+          `Open positions: ${positions.size}\n` +
+          `Wallet: ${balanceStr}\n` +
+          `WS channels: ${DETECTION_URLS.length}\n` +
+          `PumpPortal: ${pumpPortalConnected ? "✅ connected" : "❌ NOT connected"}`
         );
       }
     }
@@ -444,14 +470,33 @@ async function pollTelegramCommands() {
 
 /* ================= JUPITER ================= */
 
-async function getQuote(inputMint: string, outputMint: string, amount: number) {
-  let url = `${JUP_BASE}/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${Math.floor(
-    amount
-  )}&slippageBps=${SLIPPAGE_BPS}`;
-  if (ONLY_DIRECT_ROUTES) url += "&onlyDirectRoutes=true";
-  const data = await fetchJson(url, { headers: jupHeaders() });
-  if (!data || data.error || !data.outAmount) return null;
-  return data;
+// Quote retry matters here: the target buys tokens that are SECONDS old, and
+// Jupiter sometimes needs a moment to index a brand-new mint — a single failed
+// quote attempt used to abort the whole buy. Retries every 400ms; the first
+// two attempts use direct routes (fastest), later attempts drop the
+// restriction in case a direct route isn't available yet.
+// Monitor calls pass attempts=1 so dead positions don't spam retries every 1.5s.
+async function getQuote(inputMint: string, outputMint: string, amount: number, attempts = 4) {
+  let lastError: string | null = null;
+  for (let i = 0; i < attempts; i++) {
+    const useDirect = ONLY_DIRECT_ROUTES && i < 2;
+    let url = `${JUP_BASE}/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${Math.floor(
+      amount
+    )}&slippageBps=${SLIPPAGE_BPS}`;
+    if (useDirect) url += "&onlyDirectRoutes=true";
+    try {
+      const data = await fetchJson(url, { headers: jupHeaders() });
+      if (data && !data.error && data.outAmount) return data;
+      lastError = data?.error ? String(data.error) : "empty quote response";
+    } catch (e: any) {
+      lastError = e.message;
+    }
+    if (i < attempts - 1) await new Promise((r) => setTimeout(r, 400));
+  }
+  if (lastError && attempts > 1) {
+    console.log("❌ Quote failed after retries:", String(lastError).slice(0, 140));
+  }
+  return null;
 }
 
 async function buildSwapTx(quoteResponse: any) {
@@ -565,16 +610,20 @@ async function waitForBalance(mint: string, attempts = 6, delayMs = 500): Promis
 
 /* ================= FILTER ================= */
 
+// Logs WHY a quote was rejected so "bad/failed quote" is no longer ambiguous
+// between "no route existed" and "impact filter refused it".
 function passesFilters(quote: any) {
   const impact = Number(quote.priceImpactPct ?? 0);
-  return impact <= MAX_PRICE_IMPACT && Number(quote.outAmount) > 0;
+  if (impact > MAX_PRICE_IMPACT) {
+    console.log(
+      `❌ Quote rejected — price impact ${(impact * 100).toFixed(1)}% above ${(MAX_PRICE_IMPACT * 100).toFixed(0)}% cap`
+    );
+    return false;
+  }
+  return Number(quote.outAmount) > 0;
 }
 
 /* ================= BUY ================= */
-// Real, safe optimization: price/MC fetches run CONCURRENTLY with balance
-// confirmation (they don't depend on it), instead of after it. Position
-// creation, journal entry, and the Telegram alert still all wait for
-// waitForBalance() to succeed — nothing is marked "bought" until it's real.
 
 async function executeBuy(
   mint: string,
@@ -584,6 +633,19 @@ async function executeBuy(
     console.log("⏸️ Buy skipped — bot is paused:", mint);
     return;
   }
+
+  // Affordability guard: refuse trades the wallet can't fund (buy + Jito tip
+  // + fee headroom) using the cached balance — no hot-path RPC call. Prevents
+  // burning tips/fees on sends that would fail on-chain anyway.
+  const requiredLamports = BUY_AMOUNT + JITO_TIP_LAMPORTS + 3_000_000;
+  if (lastKnownBalanceLamports !== null && lastKnownBalanceLamports < requiredLamports) {
+    console.log(
+      `⏸️ Buy skipped — wallet ${(lastKnownBalanceLamports / 1e9).toFixed(4)} SOL below required ~${(requiredLamports / 1e9).toFixed(4)} SOL:`,
+      mint
+    );
+    return;
+  }
+
   if (positions.has(mint) || inFlight.has(mint)) return;
   inFlight.add(mint);
 
@@ -608,8 +670,6 @@ async function executeBuy(
 
     console.log("🚀 BUY sent:", mint, sig);
 
-    // Kick off both independent lookups now, in parallel with the balance
-    // wait below — neither depends on your actual holdings.
     const myMcPromise = fetchPriceAndMarketCap(mint);
     const targetMcPromise = targetSnapshotPromise ?? Promise.resolve({ tokenPriceUSD: null, marketCapUSD: null });
 
@@ -668,7 +728,7 @@ async function executeSell(mint: string, amount: number, reason: string) {
   const pos = positions.get(mint);
   if (!pos) return;
 
-  const quote = await getQuote(mint, SOL_MINT, amount);
+  const quote = await getQuote(mint, SOL_MINT, amount, 3);
   if (!quote) return;
 
   const tx = await buildSwapTx(quote);
@@ -722,7 +782,7 @@ async function monitor() {
 
     const elapsedSeconds = (Date.now() - pos.entryTime) / 1000;
 
-    getQuote(mint, SOL_MINT, pos.remainingAmount).then((quote) => {
+    getQuote(mint, SOL_MINT, pos.remainingAmount, 1).then((quote) => {
       if (!quote) return;
 
       const value = Number(quote.outAmount);
@@ -855,7 +915,18 @@ async function handleTx(signature: string) {
   }
 }
 
-/* ================= WEBSOCKET FAN-OUT ================= */
+/* ================= WEBSOCKET ROTATION (real re-subscribe) ================= */
+// THE FIX for the silent-miss problem: web3.js silently DEDUPLICATES identical
+// subscriptions on the same connection. Calling onLogs() again with the same
+// wallet + commitment doesn't open a new server-side subscription — it just
+// reference-counts the existing one, and removing the "old" id decrements the
+// count. The previous "non-destructive refresh" therefore never actually
+// re-subscribed: if the server-side stream had gone stale, it STAYED stale,
+// which is why refreshes never fixed missed trades.
+//
+// This rotation opens a genuinely NEW websocket connection each cycle,
+// subscribes on it, and only tears the old one down 3 seconds later — a real
+// re-subscribe with no listening gap.
 
 function onWalletLog(log: Logs) {
   if (alreadySeen(log.signature)) return;
@@ -886,19 +957,49 @@ function onWalletLog(log: Logs) {
   handleTx(log.signature);
 }
 
-const subIds: (number | null)[] = detectionConnections.map(() => null);
+interface DetectionChannel {
+  conn: Connection;
+  subId: number;
+}
 
-function refreshSubscriptions() {
-  detectionConnections.forEach((conn, i) => {
-    const oldSubId = subIds[i] ?? null;
-    subIds[i] = conn.onLogs(TARGET_WALLET, onWalletLog, "processed");
-    if (oldSubId !== null) {
-      setTimeout(() => {
-        conn.removeOnLogsListener(oldSubId).catch(() => {});
-      }, 3000);
+let activeChannels: DetectionChannel[] = [];
+
+function rotateSubscriptions() {
+  const fresh: DetectionChannel[] = [];
+  for (const url of DETECTION_URLS) {
+    try {
+      const conn = makeConnection(url);
+      const subId = conn.onLogs(TARGET_WALLET, onWalletLog, "processed");
+      fresh.push({ conn, subId });
+    } catch (e: any) {
+      console.log("⚠️ Failed to open detection channel:", e.message);
     }
-  });
-  console.log(`✅ ${detectionConnections.length} detection subscription(s) refreshed`);
+  }
+
+  if (fresh.length === 0) {
+    console.log("⚠️ Rotation produced no channels — keeping the old ones alive");
+    return;
+  }
+
+  const old = activeChannels;
+  activeChannels = fresh;
+
+  // Overlap handoff: old channels keep listening for 3s after the new ones
+  // are live, then unsubscribe and hard-close their sockets.
+  if (old.length > 0) {
+    setTimeout(() => {
+      for (const ch of old) {
+        ch.conn.removeOnLogsListener(ch.subId).catch(() => {});
+        setTimeout(() => {
+          try {
+            (ch.conn as any)._rpcWebSocket?.close();
+          } catch {}
+        }, 2000);
+      }
+    }, 3000);
+  }
+
+  console.log(`✅ ${fresh.length} detection channel(s) rotated onto fresh websockets`);
 }
 
 /* ================= PUMPPORTAL CHANNEL ================= */
@@ -908,14 +1009,27 @@ const PUMPPORTAL_WS = PUMPPORTAL_API_KEY
   ? `wss://pumpportal.fun/api/data?api-key=${PUMPPORTAL_API_KEY}`
   : "wss://pumpportal.fun/api/data";
 
-function startPumpPortal() {
-  const WS: any = (globalThis as any).WebSocket;
-  if (!WS) {
-    console.log("⚠️ PumpPortal channel disabled — needs Node 22+ (no native WebSocket)");
-    return;
+// Node 22+ has WebSocket built in; on older Node we fall back to the `ws`
+// package if installed (npm i ws). If neither exists you get a LOUD Telegram
+// alert instead of one startup log line that scrolls away unseen.
+async function resolveWebSocketCtor(): Promise<any> {
+  if ((globalThis as any).WebSocket) return (globalThis as any).WebSocket;
+  try {
+    const mod: any = await import("ws");
+    return mod.default ?? mod.WebSocket ?? null;
+  } catch {
+    return null;
   }
-  if (!PUMPPORTAL_API_KEY) {
-    console.log("⚠️ PUMPPORTAL_API_KEY not set — connecting without a key");
+}
+
+async function startPumpPortal() {
+  const WS = await resolveWebSocketCtor();
+  if (!WS) {
+    console.log("⚠️ PumpPortal channel DISABLED — no WebSocket support. Set NODE_VERSION=22 on Render, or run: npm i ws");
+    await sendTelegramAlert(
+      "⚠️ <b>PumpPortal channel is OFF</b>\nThis Node version has no WebSocket support. Set NODE_VERSION=22 in Render environment settings (or npm i ws) — this is your fastest detection channel."
+    );
+    return;
   }
 
   const connect = () => {
@@ -928,6 +1042,7 @@ function startPumpPortal() {
     }
 
     ws.onopen = () => {
+      pumpPortalConnected = true;
       console.log("✅ PumpPortal channel connected");
       ws.send(JSON.stringify({ method: "subscribeAccountTrade", keys: [TARGET_WALLET.toString()] }));
     };
@@ -942,6 +1057,7 @@ function startPumpPortal() {
         if (alreadySeen(msg.signature)) return;
         if (msg.txType !== "buy") return;
 
+        // PumpPortal reports solAmount in SOL (decimal), not lamports.
         const lamports = Number(msg.solAmount ?? 0) * 1e9;
         if (lamports < MIN_BUY_SOL) {
           console.log(`⏭️ PumpPortal: buy below threshold (${Number(msg.solAmount).toFixed(4)} SOL) — ignoring`);
@@ -957,6 +1073,7 @@ function startPumpPortal() {
     };
 
     ws.onclose = () => {
+      pumpPortalConnected = false;
       console.log("⚠️ PumpPortal channel closed — reconnecting in 3s");
       setTimeout(connect, 3000);
     };
@@ -1018,6 +1135,7 @@ app.get("/health", (_req, res) => res.json({
   status: "ok",
   positions: positions.size,
   paused: botPaused,
+  pumpPortal: pumpPortalConnected,
   uptime: process.uptime(),
 }));
 
@@ -1033,8 +1151,8 @@ async function start() {
 
   await Promise.all([loadPositions(), initPumpDecoder(), initPollingCursor(), refreshBlockhash()]);
 
-  refreshSubscriptions();
-  setInterval(refreshSubscriptions, 60 * 1000);
+  rotateSubscriptions();
+  setInterval(rotateSubscriptions, 60 * 1000);
   setInterval(pollForMissedTrades, POLL_INTERVAL_MS);
   setInterval(refreshBlockhash, 25_000);
   setInterval(checkWalletBalance, 60 * 1000);
@@ -1044,15 +1162,15 @@ async function start() {
     fetch("https://api.jup.ag/", { agent } as any).catch(() => {});
   }, 45_000);
 
-  if (PUMPPORTAL_ENABLED) startPumpPortal();
+  if (PUMPPORTAL_ENABLED) await startPumpPortal();
 
   await checkWalletBalance();
 
-  console.log("✅ Bot fully running (balance-confirmed alerts, parallel MC lookups)");
+  console.log("✅ Bot fully running (rotating websockets + PumpPortal + polling backstop)");
   await sendTelegramAlert(
-    `🟢 <b>V15 Engine Online</b>\nSniper deployed and watching target:\n<code>${TARGET_WALLET.toString()}</code>\n` +
+    `🟢 <b>V16 Engine Online</b>\nSniper deployed and watching target:\n<code>${TARGET_WALLET.toString()}</code>\n` +
     `Exit: TP 700/1100/1500% | Time safety net: 15/25/40s (if <300% PnL)\n` +
-    `Channels: ${detectionConnections.length} WS + PumpPortal + polling\n` +
+    `Channels: ${DETECTION_URLS.length} rotating WS + ${PUMPPORTAL_ENABLED ? "PumpPortal" : "no PumpPortal"} + polling\n` +
     `Commands: /pause /resume /status`
   );
 }
