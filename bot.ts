@@ -94,19 +94,19 @@ const SL_PCT = -0.35;
 const TRAIL_DRAWDOWN = -0.2;
 const MAX_HOLD_MS = 5 * 60 * 1000;
 
-// Prevent Render output limit crashes by filtering noisy logs
+// Prevent Render output limit crashes - suppress ONLY repetitive non-diagnostic noise.
+// Keep ALL detection-related lines (raw activity, skipped, fast-path) because they
+// are the primary signal for diagnosing silent misses.
 const originalLog = console.log;
 console.log = (...args: any[]) => {
   const msg = args.join(' ');
   
-  // Skip these noisy/repetitive messages entirely
-  if (msg.includes('👀 Raw activity heard')) return;
-  if (msg.includes('⏭️ Skipped')) return;
-  if (msg.includes('Fast-path found no TradeEvent')) return;
-  if (msg.includes('detection channel(s) rotated')) return;  // Every 60s
-  if (msg.includes('Polling cursor')) return;
+  // These are truly repetitive and contain zero diagnostic value:
+  if (msg.includes('detection channel(s) rotated onto fresh websockets')) return;
+  if (msg.includes('Polling cursor initialized at:')) return;
+  if (msg.includes('Keep-alive server on port')) return;
   
-  // Keep important logs (buys, sells, errors)
+  // Everything else stays — especially raw activity, skipped lines, and fast-path results
   originalLog(...args);
 };
 
@@ -198,9 +198,6 @@ function tryFastDecode(logs: string[]): { mint: string; isBuy: boolean; solAmoun
 const JITO_BLOCK_ENGINE_URL =
   process.env.JITO_URL ?? "https://mainnet.block-engine.jito.wtf/api/v1/bundles";
 
-// FIXED: the last tip account had been truncated to an invalid address
-// ("ARTtviJkLLt6cHGQDixKlgnT8mL"), which threw whenever it was randomly
-// selected — silently killing the Jito path on ~1 in 8 buys.
 const JITO_TIP_ACCOUNTS: string[] = [
   "9n3d1K5YD2vECAbRFhFFGYNNjiXtHXJWn9F31t89vsAV",
   "aTtUk2DHgLhKZRDjePq6eiHRKC1XXFMBiSUfQ2JNDbN",
@@ -276,7 +273,6 @@ async function getBlockhashFast(): Promise<string> {
 let lastLowBalanceAlertAt = 0;
 const LOW_BALANCE_ALERT_COOLDOWN_MS = 30 * 60 * 1000;
 
-// Cached so executeBuy can refuse doomed trades without a hot-path RPC call.
 let lastKnownBalanceLamports: number | null = null;
 
 async function checkWalletBalance() {
@@ -435,8 +431,6 @@ function alreadySeen(sig: string): boolean {
   return false;
 }
 
-// Live channel health, surfaced via /status so you can check from Telegram
-// without opening Render logs.
 let pumpPortalConnected = false;
 
 /* ================= EMERGENCY STOP VIA TELEGRAM ================= */
@@ -486,12 +480,6 @@ async function pollTelegramCommands() {
 
 /* ================= JUPITER ================= */
 
-// Quote retry matters here: the target buys tokens that are SECONDS old, and
-// Jupiter sometimes needs a moment to index a brand-new mint — a single failed
-// quote attempt used to abort the whole buy. Retries every 400ms; the first
-// two attempts use direct routes (fastest), later attempts drop the
-// restriction in case a direct route isn't available yet.
-// Monitor calls pass attempts=1 so dead positions don't spam retries every 1.5s.
 async function getQuote(inputMint: string, outputMint: string, amount: number, attempts = 4) {
   let lastError: string | null = null;
   for (let i = 0; i < attempts; i++) {
@@ -626,8 +614,6 @@ async function waitForBalance(mint: string, attempts = 6, delayMs = 500): Promis
 
 /* ================= FILTER ================= */
 
-// Logs WHY a quote was rejected so "bad/failed quote" is no longer ambiguous
-// between "no route existed" and "impact filter refused it".
 function passesFilters(quote: any) {
   const impact = Number(quote.priceImpactPct ?? 0);
   if (impact > MAX_PRICE_IMPACT) {
@@ -650,9 +636,6 @@ async function executeBuy(
     return;
   }
 
-  // Affordability guard: refuse trades the wallet can't fund (buy + Jito tip
-  // + fee headroom) using the cached balance — no hot-path RPC call. Prevents
-  // burning tips/fees on sends that would fail on-chain anyway.
   const requiredLamports = BUY_AMOUNT + JITO_TIP_LAMPORTS + 3_000_000;
   if (lastKnownBalanceLamports !== null && lastKnownBalanceLamports < requiredLamports) {
     console.log(
@@ -897,10 +880,7 @@ async function handleTx(signature: string) {
       return;
     }
 
-    // TARGET EXIT MIRROR — must run BEFORE the buy-threshold skip, because a
-    // token transfer barely moves SOL. If the target's balance of a token WE
-    // HOLD went down (moved to a disposable seller wallet, or sold directly),
-    // the play is over — dump the whole position immediately.
+    // TARGET EXIT MIRROR
     const preTok = tx.meta.preTokenBalances ?? [];
     const postTok = tx.meta.postTokenBalances ?? [];
     for (const pre of preTok) {
@@ -952,18 +932,7 @@ async function handleTx(signature: string) {
   }
 }
 
-/* ================= WEBSOCKET ROTATION (real re-subscribe) ================= */
-// THE FIX for the silent-miss problem: web3.js silently DEDUPLICATES identical
-// subscriptions on the same connection. Calling onLogs() again with the same
-// wallet + commitment doesn't open a new server-side subscription — it just
-// reference-counts the existing one, and removing the "old" id decrements the
-// count. The previous "non-destructive refresh" therefore never actually
-// re-subscribed: if the server-side stream had gone stale, it STAYED stale,
-// which is why refreshes never fixed missed trades.
-//
-// This rotation opens a genuinely NEW websocket connection each cycle,
-// subscribes on it, and only tears the old one down 3 seconds later — a real
-// re-subscribe with no listening gap.
+/* ================= WEBSOCKET ROTATION ================= */
 
 function onWalletLog(log: Logs) {
   if (alreadySeen(log.signature)) return;
@@ -1027,8 +996,6 @@ function rotateSubscriptions() {
   const old = activeChannels;
   activeChannels = fresh;
 
-  // Overlap handoff: old channels keep listening for 3s after the new ones
-  // are live, then unsubscribe and hard-close their sockets.
   if (old.length > 0) {
     setTimeout(() => {
       for (const ch of old) {
@@ -1052,9 +1019,6 @@ const PUMPPORTAL_WS = PUMPPORTAL_API_KEY
   ? `wss://pumpportal.fun/api/data?api-key=${PUMPPORTAL_API_KEY}`
   : "wss://pumpportal.fun/api/data";
 
-// Node 22+ has WebSocket built in; on older Node we fall back to the `ws`
-// package if installed (npm i ws). If neither exists you get a LOUD Telegram
-// alert instead of one startup log line that scrolls away unseen.
 async function resolveWebSocketCtor(): Promise<any> {
   if ((globalThis as any).WebSocket) return (globalThis as any).WebSocket;
   try {
@@ -1109,7 +1073,6 @@ async function startPumpPortal() {
         }
         if (msg.txType !== "buy") return;
 
-        // PumpPortal reports solAmount in SOL (decimal), not lamports.
         const lamports = Number(msg.solAmount ?? 0) * 1e9;
         if (lamports < MIN_BUY_SOL) {
           console.log(`⏭️ PumpPortal: buy below threshold (${Number(msg.solAmount).toFixed(4)} SOL) — ignoring`);
