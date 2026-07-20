@@ -894,9 +894,12 @@ async function handleTx(signature: string) {
     const solDelta = (tx.meta.preBalances?.[targetIdx] ?? 0) - (tx.meta.postBalances?.[targetIdx] ?? 0);
     console.log(`💰 handleTx: SOL delta = ${(solDelta / 1e9).toFixed(4)} SOL`);
 
+    // We used to skip here if the SOL delta was below threshold, but this was unreliable
+    // because the RPC sometimes doesn't include the actual SOL change in pre/post balances.
+    // Instead, we always proceed to check for token balance increases or Pump.fun instructions.
     if (solDelta < MIN_BUY_SOL) {
-      console.log(`⏭️ handleTx: SKIPPED — SOL delta below threshold`);
-      return;
+      console.log(`⚠️ handleTx: SOL delta below threshold — checking token/instruction anyway`);
+      // fall through to the token and Pump.fun checks below
     }
 
     // Standard token balance check
