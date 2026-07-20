@@ -40,9 +40,6 @@ function makeConnection(url: string): Connection {
 const connection = makeConnection(RPC_URL);
 
 // Detection channel URLs. WS_FANOUT copies of the primary RPC + any extras.
-// NOTE: Helius free tier allows 5 simultaneous websocket connections, and
-// rotation briefly overlaps old + new sockets — keep WS_FANOUT at 2 or less
-// so 2 old + 2 new = 4 stays under the cap during the handoff.
 const WS_FANOUT = Math.max(1, Math.min(2, Number(process.env.WS_FANOUT ?? 2)));
 const EXTRA_WS_URLS = (process.env.EXTRA_WS_URLS ?? "https://api.mainnet-beta.solana.com")
   .split(",")
@@ -95,18 +92,12 @@ const TRAIL_DRAWDOWN = -0.2;
 const MAX_HOLD_MS = 5 * 60 * 1000;
 
 // Prevent Render output limit crashes - suppress ONLY repetitive non-diagnostic noise.
-// Keep ALL detection-related lines (raw activity, skipped, fast-path) because they
-// are the primary signal for diagnosing silent misses.
 const originalLog = console.log;
 console.log = (...args: any[]) => {
   const msg = args.join(' ');
-  
-  // These are truly repetitive and contain zero diagnostic value:
   if (msg.includes('detection channel(s) rotated onto fresh websockets')) return;
   if (msg.includes('Polling cursor initialized at:')) return;
   if (msg.includes('Keep-alive server on port')) return;
-  
-  // Everything else stays — especially raw activity, skipped lines, and fast-path results
   originalLog(...args);
 };
 
@@ -149,14 +140,14 @@ process.on("unhandledRejection", async (reason: any) => {
 
 /* ================= PUMP.FUN FAST-PATH DECODER ================= */
 
-const PUMPFUN_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
+const PUMPFUN_PROGRAM = new PublicKey("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
 
 let pumpEventCoder: BorshEventCoder | null = null;
 
 async function initPumpDecoder() {
   try {
     const provider = new AnchorProvider(connection, {} as any, {});
-    const idl = await Program.fetchIdl(new PublicKey(PUMPFUN_PROGRAM), provider);
+    const idl = await Program.fetchIdl(PUMPFUN_PROGRAM, provider);
     if (!idl) {
       console.log("⚠️ Could not fetch Pump.fun IDL — fast path disabled.");
       return;
@@ -866,21 +857,23 @@ async function getTransactionWithRetry(signature: string, attempts = 6, delayMs 
 }
 
 async function handleTx(signature: string) {
+  console.log("🔍 handleTx START for:", signature);
   try {
     const tx = await getTransactionWithRetry(signature);
     if (!tx?.meta) {
-      console.log("❌ Still no tx/meta after retries for", signature, "— genuine miss");
+      console.log("❌ handleTx: no tx/meta after retries for", signature);
       return;
     }
+    console.log("✅ handleTx: tx fetched");
 
     const keys = getResolvedAccountKeys(tx);
     const targetIdx = keys.findIndex((k) => k.toString() === TARGET_WALLET.toString());
     if (targetIdx === -1) {
-      console.log("❌ Target wallet not found in account keys for", signature);
+      console.log("❌ handleTx: target wallet not found in keys");
       return;
     }
 
-    // TARGET EXIT MIRROR
+    // --- TARGET EXIT MIRROR ---
     const preTok = tx.meta.preTokenBalances ?? [];
     const postTok = tx.meta.postTokenBalances ?? [];
     for (const pre of preTok) {
@@ -892,44 +885,72 @@ async function handleTx(signature: string) {
       if (postAmount < preAmount) {
         const held = positions.get(pre.mint);
         if (held && held.remainingAmount > 0) {
-          console.log("🚨 TARGET EXITED (transfer/sell) — dumping position:", pre.mint);
+          console.log("🚨 TARGET EXITED — dumping:", pre.mint);
           executeSell(pre.mint, held.remainingAmount, "TARGET_EXITED");
         }
       }
     }
 
     const solDelta = (tx.meta.preBalances?.[targetIdx] ?? 0) - (tx.meta.postBalances?.[targetIdx] ?? 0);
+    console.log(`💰 handleTx: SOL delta = ${(solDelta / 1e9).toFixed(4)} SOL`);
+
     if (solDelta < MIN_BUY_SOL) {
-      console.log(`⏭️ Skipped — SOL delta ${(solDelta / 1e9).toFixed(4)} below threshold`, signature);
+      console.log(`⏭️ handleTx: SKIPPED — SOL delta below threshold`);
       return;
     }
 
+    // Standard token balance check
     const preBalances = tx.meta.preTokenBalances ?? [];
     const postBalances = tx.meta.postTokenBalances ?? [];
-
     let foundAnyIncrease = false;
     for (const post of postBalances) {
       if (post.owner !== TARGET_WALLET.toString()) continue;
       if (post.mint === SOL_MINT) continue;
-
       const pre = preBalances.find((p) => p.owner === post.owner && p.mint === post.mint);
       const preAmount = pre ? Number(pre.uiTokenAmount.uiAmount) : 0;
       const postAmount = Number(post.uiTokenAmount.uiAmount);
-
+      console.log(`📊 Token ${post.mint}: pre=${preAmount}, post=${postAmount}`);
       if (postAmount > preAmount) {
         foundAnyIncrease = true;
-        console.log("🔥 DETECTED router-agnostic buy:", post.mint, signature);
-        const targetSnapshotPromise = fetchPriceAndMarketCap(post.mint);
-        executeBuy(post.mint, targetSnapshotPromise);
+        console.log("🔥 handleTx: DETECTED buy:", post.mint);
+        executeBuy(post.mint, fetchPriceAndMarketCap(post.mint));
       }
     }
 
+    // PUMP.FUN FALLBACK: if target spent SOL but no token increase appeared
     if (!foundAnyIncrease) {
-      console.log("❌ SOL decreased but no token balance increase found for target wallet —", signature);
+      console.log("🔎 handleTx: no token balance increase — checking Pump.fun instructions...");
+      const message = tx.transaction.message as any;
+      const resolvedKeys = keys;
+      const ixs = "instructions" in message
+        ? message.instructions
+        : message.compiledInstructions.map((ix: any) => ({
+            programId: resolvedKeys[ix.programIdIndex],
+            accounts: ix.accounts.map((idx: number) => resolvedKeys[idx]),
+            data: ix.data,
+          }));
+      for (const ix of ixs) {
+        if (!ix.programId.equals(PUMPFUN_PROGRAM)) continue;
+        // Pump.fun buy: accounts[2] is the mint
+        if (ix.accounts && ix.accounts.length >= 3) {
+          const mintKey = ix.accounts[2];
+          if (!mintKey) continue;
+          const mint = mintKey.toString();
+          console.log("🟢 Pump.fun mint found:", mint);
+          if (positions.has(mint) || inFlight.has(mint)) {
+            console.log("⏭️ Already processing/holding this mint, skipping");
+            return;
+          }
+          executeBuy(mint, fetchPriceAndMarketCap(mint));
+          return;
+        }
+      }
+      console.log("❌ handleTx: SOL decreased but no token increase AND no Pump.fun mint found");
     }
   } catch (e: any) {
-    console.log("Detection error:", e.message, signature);
+    console.log("💥 handleTx CRASHED:", e.message, e.stack);
   }
+  console.log("🔍 handleTx END for:", signature);
 }
 
 /* ================= WEBSOCKET ROTATION ================= */
