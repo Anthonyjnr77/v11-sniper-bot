@@ -881,6 +881,27 @@ async function handleTx(signature: string) {
       return;
     }
 
+    // TARGET EXIT MIRROR — must run BEFORE the buy-threshold skip, because a
+    // token transfer barely moves SOL. If the target's balance of a token WE
+    // HOLD went down (moved to a disposable seller wallet, or sold directly),
+    // the play is over — dump the whole position immediately.
+    const preTok = tx.meta.preTokenBalances ?? [];
+    const postTok = tx.meta.postTokenBalances ?? [];
+    for (const pre of preTok) {
+      if (pre.owner !== TARGET_WALLET.toString()) continue;
+      if (!positions.has(pre.mint)) continue;
+      const post = postTok.find((p) => p.owner === pre.owner && p.mint === pre.mint);
+      const preAmount = Number(pre.uiTokenAmount.uiAmount ?? 0);
+      const postAmount = post ? Number(post.uiTokenAmount.uiAmount ?? 0) : 0;
+      if (postAmount < preAmount) {
+        const held = positions.get(pre.mint);
+        if (held && held.remainingAmount > 0) {
+          console.log("🚨 TARGET EXITED (transfer/sell) — dumping position:", pre.mint);
+          executeSell(pre.mint, held.remainingAmount, "TARGET_EXITED");
+        }
+      }
+    }
+
     const solDelta = (tx.meta.preBalances?.[targetIdx] ?? 0) - (tx.meta.postBalances?.[targetIdx] ?? 0);
     if (solDelta < MIN_BUY_SOL) {
       console.log(`⏭️ Skipped — SOL delta ${(solDelta / 1e9).toFixed(4)} below threshold`, signature);
@@ -940,7 +961,13 @@ function onWalletLog(log: Logs) {
       return;
     }
     if (!fast.isBuy) {
-      console.log("⏭️ Fast-path: confirmed SELL by target wallet — ignoring, no fallback");
+      const held = positions.get(fast.mint);
+      if (held && held.remainingAmount > 0) {
+        console.log("🚨 Fast-path: target SOLD a token we hold — dumping:", fast.mint);
+        executeSell(fast.mint, held.remainingAmount, "TARGET_EXITED");
+      } else {
+        console.log("⏭️ Fast-path: target sell, not holding it — ignoring, no fallback");
+      }
       return;
     }
     if (fast.solAmount < MIN_BUY_SOL) {
@@ -1055,6 +1082,15 @@ async function startPumpPortal() {
         if (!msg?.signature || !msg?.mint) return;
         if (msg.traderPublicKey !== TARGET_WALLET.toString()) return;
         if (alreadySeen(msg.signature)) return;
+
+        if (msg.txType === "sell") {
+          const held = positions.get(msg.mint);
+          if (held && held.remainingAmount > 0) {
+            console.log("🚨 PumpPortal: target SOLD a token we hold — dumping:", msg.mint);
+            executeSell(msg.mint, held.remainingAmount, "TARGET_EXITED");
+          }
+          return;
+        }
         if (msg.txType !== "buy") return;
 
         // PumpPortal reports solAmount in SOL (decimal), not lamports.
@@ -1168,8 +1204,8 @@ async function start() {
 
   console.log("✅ Bot fully running (rotating websockets + PumpPortal + polling backstop)");
   await sendTelegramAlert(
-    `🟢 <b>V16 Engine Online</b>\nSniper deployed and watching target:\n<code>${TARGET_WALLET.toString()}</code>\n` +
-    `Exit: TP 700/1100/1500% | Time safety net: 15/25/40s (if <300% PnL)\n` +
+    `🟢 <b>V17 Engine Online</b>\nSniper deployed and watching target:\n<code>${TARGET_WALLET.toString()}</code>\n` +
+    `Exit: TARGET-EXIT mirror + TP 700/1100/1500% + time net 15/25/40s\n` +
     `Channels: ${DETECTION_URLS.length} rotating WS + ${PUMPPORTAL_ENABLED ? "PumpPortal" : "no PumpPortal"} + polling\n` +
     `Commands: /pause /resume /status`
   );
