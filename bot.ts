@@ -94,6 +94,22 @@ const SL_PCT = -0.35;
 const TRAIL_DRAWDOWN = -0.2;
 const MAX_HOLD_MS = 5 * 60 * 1000;
 
+// Prevent Render output limit crashes by filtering noisy logs
+const originalLog = console.log;
+console.log = (...args: any[]) => {
+  const msg = args.join(' ');
+  
+  // Skip these noisy/repetitive messages entirely
+  if (msg.includes('👀 Raw activity heard')) return;
+  if (msg.includes('⏭️ Skipped')) return;
+  if (msg.includes('Fast-path found no TradeEvent')) return;
+  if (msg.includes('detection channel(s) rotated')) return;  // Every 60s
+  if (msg.includes('Polling cursor')) return;
+  
+  // Keep important logs (buys, sells, errors)
+  originalLog(...args);
+};
+
 /* ================= TELEGRAM ALERTS ================= */
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
