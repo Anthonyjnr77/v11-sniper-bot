@@ -418,33 +418,6 @@ function alreadySeen(sig: string): boolean {
   return false;
 }
 
-// Signatures that were heard but whose transaction could not be fetched yet.
-// The old flow marked them "seen" forever after one failed fetch — a heard
-// trade could silently become a permanently missed trade. Failures are now
-// retried every 3s, and if a signature still cannot be resolved after 5
-// rounds you get a LOUD alert instead of silence.
-const retryQueue = new Map<string, number>();
-
-function queueForRetry(sig: string) {
-  if (!retryQueue.has(sig)) retryQueue.set(sig, 0);
-}
-
-async function drainRetryQueue() {
-  for (const [sig, attempts] of retryQueue.entries()) {
-    if (attempts >= 5) {
-      retryQueue.delete(sig);
-      console.log("🛑 Giving up on signature after 5 retry rounds:", sig);
-      sendTelegramAlert(
-        `🛑 <b>POSSIBLE MISSED TRADE</b>\nHeard a target transaction but could not fetch it after repeated retries:\n<code>${sig}</code>`
-      );
-      continue;
-    }
-    retryQueue.set(sig, attempts + 1);
-    const processed = await handleTx(sig);
-    if (processed) retryQueue.delete(sig);
-  }
-}
-
 let pumpPortalConnected = false;
 
 /* ================= EMERGENCY STOP VIA TELEGRAM ================= */
@@ -868,38 +841,62 @@ function getResolvedAccountKeys(tx: any): PublicKey[] {
 }
 
 async function getTransactionWithRetry(signature: string, attempts = 8, delayMs = 500) {
+  const rpcs = [connection, broadcastConnection];
   for (let i = 0; i < attempts; i++) {
-    // Alternate between the primary and broadcast RPC so one provider being
-    // rate-limited or lagging cannot starve the fetch on its own.
-    const conn = i % 2 === 0 ? connection : broadcastConnection;
+    const conn = rpcs[i % rpcs.length]!;
     try {
       const tx = await conn.getTransaction(signature, {
         commitment: "confirmed",
         maxSupportedTransactionVersion: 0,
       });
       if (tx?.meta) return tx;
-    } catch {
-      // 429 / transient — the other connection gets the next attempt
-    }
-    await new Promise((r) => setTimeout(r, delayMs));
+    } catch {}
+    if (i < attempts - 1) await new Promise((r) => setTimeout(r, delayMs));
   }
   return null;
 }
 
-async function handleTx(signature: string): Promise<boolean> {
-  try {
-    const tx = await getTransactionWithRetry(signature);
-    if (!tx?.meta) {
-      console.log("⏳ handleTx: tx not fetchable yet — will retry:", signature);
-      return false; // caller queues this signature for retry
-    }
+const retryQueue = new Map<string, { attempts: number; timer: NodeJS.Timeout }>();
 
-    const keys = getResolvedAccountKeys(tx);
-    const targetIdx = keys.findIndex((k) => k.toString() === TARGET_WALLET.toString());
-    if (targetIdx === -1) {
-      console.log("❌ handleTx: target wallet not found in keys");
-      return true; // definitively not relevant — no retry needed
+function queueForRetry(signature: string) {
+  if (retryQueue.has(signature)) return;
+  const timer = setTimeout(() => processRetry(signature), 3000);
+  retryQueue.set(signature, { attempts: 1, timer });
+}
+
+async function processRetry(signature: string) {
+  const entry = retryQueue.get(signature);
+  if (!entry) return;
+  retryQueue.delete(signature);
+
+  console.log(`🔄 Retry #${entry.attempts} for ${signature}`);
+  try {
+    const tx = await getTransactionWithRetry(signature, 4, 500);
+    if (tx?.meta) {
+      const processed = await handleTxInternal(tx, signature);
+      if (processed) {
+        alreadySeen(signature);
+        return;
+      }
     }
+  } catch {}
+
+  if (entry.attempts < 5) {
+    const timer = setTimeout(() => processRetry(signature), 3000);
+    retryQueue.set(signature, { attempts: entry.attempts + 1, timer });
+  } else {
+    console.log(`❌ PERMANENTLY MISSED TRADE: ${signature}`);
+    await sendTelegramAlert(
+      `🚨 <b>POSSIBLE MISSED TRADE</b>\nSignature: <code>${signature}</code>\nUnable to fetch after 5 retries. Check Solscan manually.`
+    );
+  }
+}
+
+async function handleTxInternal(tx: any, signature: string): Promise<boolean> {
+  try {
+    const keys = getResolvedAccountKeys(tx);
+    const targetIdx = keys.findIndex((k) => k.equals(TARGET_WALLET));
+    if (targetIdx === -1) return false;
 
     // --- TARGET EXIT MIRROR ---
     const preTok = tx.meta.preTokenBalances ?? [];
@@ -907,7 +904,7 @@ async function handleTx(signature: string): Promise<boolean> {
     for (const pre of preTok) {
       if (pre.owner !== TARGET_WALLET.toString()) continue;
       if (!positions.has(pre.mint)) continue;
-      const post = postTok.find((p) => p.owner === pre.owner && p.mint === pre.mint);
+      const post = postTok.find((p: any) => p.owner === pre.owner && p.mint === pre.mint);
       const preAmount = Number(pre.uiTokenAmount.uiAmount ?? 0);
       const postAmount = post ? Number(post.uiTokenAmount.uiAmount ?? 0) : 0;
       if (postAmount < preAmount) {
@@ -915,88 +912,103 @@ async function handleTx(signature: string): Promise<boolean> {
         if (held && held.remainingAmount > 0) {
           console.log("🚨 TARGET EXITED — dumping:", pre.mint);
           executeSell(pre.mint, held.remainingAmount, "TARGET_EXITED");
+          return true;
         }
       }
     }
 
-    const solDelta = (tx.meta.preBalances?.[targetIdx] ?? 0) - (tx.meta.postBalances?.[targetIdx] ?? 0);
-
-    // Below the buy threshold: transfers, fees, ATA churn. The exit mirror
-    // above has already run, so there is nothing left to copy in this tx.
-    if (solDelta < MIN_BUY_SOL) {
-      console.log(`⏭️ handleTx: SOL delta ${(solDelta / 1e9).toFixed(4)} SOL below threshold — not a buy`);
-      return true;
-    }
-
+    // Standard token balance increase
     const preBalances = tx.meta.preTokenBalances ?? [];
     const postBalances = tx.meta.postTokenBalances ?? [];
-    let foundAnyIncrease = false;
+    let foundAny = false;
     for (const post of postBalances) {
       if (post.owner !== TARGET_WALLET.toString()) continue;
       if (post.mint === SOL_MINT) continue;
-      const pre = preBalances.find((p) => p.owner === post.owner && p.mint === post.mint);
+      const pre = preBalances.find((p: any) => p.owner === post.owner && p.mint === post.mint);
       const preAmount = pre ? Number(pre.uiTokenAmount.uiAmount) : 0;
       const postAmount = Number(post.uiTokenAmount.uiAmount);
-      console.log(`📊 Token ${post.mint}: pre=${preAmount}, post=${postAmount}`);
       if (postAmount > preAmount) {
-        foundAnyIncrease = true;
-        console.log("🔥 handleTx: DETECTED buy:", post.mint);
+        foundAny = true;
+        console.log("🔥 DETECTED buy:", post.mint);
         executeBuy(post.mint, fetchPriceAndMarketCap(post.mint));
+        return true;
       }
     }
 
-    // The old "Pump.fun instruction fallback" is deliberately removed. A real
-    // buy always shows up as a token balance increase for the target in the
-    // same transaction (the scan above covers every router). A tx with SOL out
-    // but no tokens in is a SOL transfer — and guessing a mint out of
-    // instruction account lists risks buying a token the target is SELLING.
-    if (!foundAnyIncrease) {
-      console.log("⏭️ handleTx: SOL out but no tokens in — SOL transfer, not a buy:", signature);
+    if (!foundAny) {
+      console.log("ℹ️ No token increase for target — not a buy we can copy.");
+      return false;
     }
-    return true;
+    return false;
   } catch (e: any) {
-    console.log("💥 handleTx CRASHED:", e.message);
-    return false; // transient — retry
+    console.log("handleTxInternal error:", e.message);
+    return false;
+  }
+}
+
+// handleTx no longer calls alreadySeen() until after successful processing
+async function handleTx(signature: string) {
+  if (seenSignatures.has(signature)) return;
+  try {
+    const tx = await getTransactionWithRetry(signature, 8, 500);
+    if (!tx?.meta) {
+      console.log("❌ Could not fetch tx for", signature, "— queueing for retry");
+      queueForRetry(signature);
+      return;
+    }
+    const processed = await handleTxInternal(tx, signature);
+    if (processed) {
+      alreadySeen(signature);
+    } else {
+      alreadySeen(signature);  // non-trade or unrelated, mark as seen to avoid loops
+    }
+  } catch (e: any) {
+    console.log("handleTx error:", e.message);
+    queueForRetry(signature);
   }
 }
 
 /* ================= WEBSOCKET ROTATION ================= */
 
 function onWalletLog(log: Logs) {
-  if (alreadySeen(log.signature)) return;
+  const signature = log.signature;
+  if (seenSignatures.has(signature)) return;
 
-  console.log(`👀 Raw activity heard: https://solscan.io/tx/${log.signature}`);
+  console.log(`👀 Activity: https://solscan.io/tx/${signature}`);
 
+  // 1. IDL fast-path decoder
   const fast = tryFastDecode(log.logs);
-  if (fast) {
-    if (fast.user !== TARGET_WALLET.toString()) {
-      console.log("⏭️ Fast-path: decoded event but user mismatch — ignoring, no fallback");
+  if (fast && fast.user === TARGET_WALLET.toString() && fast.isBuy && fast.solAmount >= MIN_BUY_SOL) {
+    console.log(`⚡ IDL FAST-PATH BUY: ${fast.mint}`);
+    alreadySeen(signature);
+    executeBuy(fast.mint, fetchPriceAndMarketCap(fast.mint));
+    return;
+  }
+  if (fast && fast.user === TARGET_WALLET.toString() && !fast.isBuy) {
+    const held = positions.get(fast.mint);
+    if (held && held.remainingAmount > 0) {
+      console.log("🚨 Fast-path: target SOLD a token we hold — dumping:", fast.mint);
+      alreadySeen(signature);
+      executeSell(fast.mint, held.remainingAmount, "TARGET_EXITED");
       return;
     }
-    if (!fast.isBuy) {
-      const held = positions.get(fast.mint);
-      if (held && held.remainingAmount > 0) {
-        console.log("🚨 Fast-path: target SOLD a token we hold — dumping:", fast.mint);
-        executeSell(fast.mint, held.remainingAmount, "TARGET_EXITED");
-      } else {
-        console.log("⏭️ Fast-path: target sell, not holding it — ignoring, no fallback");
-      }
-      return;
-    }
-    if (fast.solAmount < MIN_BUY_SOL) {
-      console.log(`⏭️ Fast-path: solAmount ${(fast.solAmount / 1e9).toFixed(4)} below threshold — ignoring, no fallback`);
-      return;
-    }
-    console.log("⚡ FAST-PATH detected buy:", fast.mint);
-    const targetSnapshotPromise = fetchPriceAndMarketCap(fast.mint);
-    executeBuy(fast.mint, targetSnapshotPromise);
+  }
+
+  // 2. INSTANT REGEX EXTRACTION (sub‑millisecond)
+  const logText = log.logs.join('\n');
+  const mintMatch = logText.match(/mint["']?\s*:\s*["']?([1-9A-HJ-NP-Za-km-z]{32,44})/i);
+  if (mintMatch && mintMatch[1]) {
+    const mint: string = mintMatch[1];  // capture group is defined at this point
+    if (positions.has(mint) || inFlight.has(mint)) return;
+    console.log(`⚡ INSTANT REGEX BUY: ${mint}`);
+    alreadySeen(signature);
+    executeBuy(mint, fetchPriceAndMarketCap(mint));
     return;
   }
 
-  console.log("↪️ Fast-path found no TradeEvent — falling back to getTransaction");
-  handleTx(log.signature).then((processed) => {
-    if (!processed) queueForRetry(log.signature);
-  });
+  // 3. Fallback to transaction fetch (rare)
+  console.log("↪️ No mint in logs — falling back to getTransaction");
+  handleTx(signature);
 }
 
 interface DetectionChannel {
@@ -1088,12 +1100,11 @@ async function startPumpPortal() {
       try {
         const raw = typeof ev.data === "string" ? ev.data : ev.data.toString();
         const msg = JSON.parse(raw);
-
-        if (!msg?.signature || !msg?.mint) {
-          const info = msg?.message ?? msg?.errors ?? msg?.error;
-          if (info) console.log("📡 PumpPortal:", JSON.stringify(info).slice(0, 200));
+        if (!msg?.signature || !msg?.mint || !msg.traderPublicKey) {
+          console.log("📡 PumpPortal:", raw.slice(0, 200));
           return;
         }
+
         if (msg.traderPublicKey !== TARGET_WALLET.toString()) return;
         if (alreadySeen(msg.signature)) return;
 
@@ -1114,10 +1125,9 @@ async function startPumpPortal() {
         }
 
         console.log("⚡ PUMPPORTAL detected buy:", msg.mint);
-        const targetSnapshotPromise = fetchPriceAndMarketCap(msg.mint);
-        executeBuy(msg.mint, targetSnapshotPromise);
+        executeBuy(msg.mint, fetchPriceAndMarketCap(msg.mint));
       } catch {
-        // non-JSON frame, ignore
+        // non‑JSON frame, ignore
       }
     };
 
@@ -1165,10 +1175,9 @@ async function pollForMissedTrades() {
 
     for (const sigInfo of ordered) {
       if (sigInfo.err) continue;
-      if (alreadySeen(sigInfo.signature)) continue;
+      if (seenSignatures.has(sigInfo.signature)) continue;
       console.log("🔎 POLL found unprocessed signature:", sigInfo.signature);
-      const processed = await handleTx(sigInfo.signature);
-      if (!processed) queueForRetry(sigInfo.signature);
+      handleTx(sigInfo.signature);
     }
 
     lastPolledSignature = sigs[0]?.signature ?? lastPolledSignature;
@@ -1204,7 +1213,6 @@ async function start() {
   rotateSubscriptions();
   setInterval(rotateSubscriptions, 60 * 1000);
   setInterval(pollForMissedTrades, POLL_INTERVAL_MS);
-  setInterval(drainRetryQueue, 3000);
   setInterval(refreshBlockhash, 25_000);
   setInterval(checkWalletBalance, 60 * 1000);
   setInterval(pollTelegramCommands, 3000);
@@ -1217,9 +1225,9 @@ async function start() {
 
   await checkWalletBalance();
 
-  console.log("✅ Bot fully running (rotating websockets + PumpPortal + polling backstop)");
+  console.log("✅ Bot fully running (rotating WS + PumpPortal + polling)");
   await sendTelegramAlert(
-    `🟢 <b>V19 Engine Online</b>\nSniper deployed and watching target:\n<code>${TARGET_WALLET.toString()}</code>\n` +
+    `🟢 <b>V19 Engine Online</b>\nTarget: <code>${TARGET_WALLET.toString()}</code>\n` +
     `Exit: TARGET-EXIT mirror + TP 700/1100/1500% + time net 15/25/40s\n` +
     `Channels: ${DETECTION_URLS.length} rotating WS + ${PUMPPORTAL_ENABLED ? "PumpPortal" : "no PumpPortal"} + polling\n` +
     `Commands: /pause /resume /status`
