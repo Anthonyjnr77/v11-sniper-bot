@@ -418,6 +418,33 @@ function alreadySeen(sig: string): boolean {
   return false;
 }
 
+// Signatures that were heard but whose transaction could not be fetched yet.
+// The old flow marked them "seen" forever after one failed fetch — a heard
+// trade could silently become a permanently missed trade. Failures are now
+// retried every 3s, and if a signature still cannot be resolved after 5
+// rounds you get a LOUD alert instead of silence.
+const retryQueue = new Map<string, number>();
+
+function queueForRetry(sig: string) {
+  if (!retryQueue.has(sig)) retryQueue.set(sig, 0);
+}
+
+async function drainRetryQueue() {
+  for (const [sig, attempts] of retryQueue.entries()) {
+    if (attempts >= 5) {
+      retryQueue.delete(sig);
+      console.log("🛑 Giving up on signature after 5 retry rounds:", sig);
+      sendTelegramAlert(
+        `🛑 <b>POSSIBLE MISSED TRADE</b>\nHeard a target transaction but could not fetch it after repeated retries:\n<code>${sig}</code>`
+      );
+      continue;
+    }
+    retryQueue.set(sig, attempts + 1);
+    const processed = await handleTx(sig);
+    if (processed) retryQueue.delete(sig);
+  }
+}
+
 let pumpPortalConnected = false;
 
 /* ================= EMERGENCY STOP VIA TELEGRAM ================= */
@@ -840,33 +867,38 @@ function getResolvedAccountKeys(tx: any): PublicKey[] {
   return [...staticKeys, ...writable, ...readonly];
 }
 
-async function getTransactionWithRetry(signature: string, attempts = 6, delayMs = 400) {
+async function getTransactionWithRetry(signature: string, attempts = 8, delayMs = 500) {
   for (let i = 0; i < attempts; i++) {
-    const tx = await connection.getTransaction(signature, {
-      commitment: "confirmed",
-      maxSupportedTransactionVersion: 0,
-    });
-    if (tx?.meta) return tx;
+    // Alternate between the primary and broadcast RPC so one provider being
+    // rate-limited or lagging cannot starve the fetch on its own.
+    const conn = i % 2 === 0 ? connection : broadcastConnection;
+    try {
+      const tx = await conn.getTransaction(signature, {
+        commitment: "confirmed",
+        maxSupportedTransactionVersion: 0,
+      });
+      if (tx?.meta) return tx;
+    } catch {
+      // 429 / transient — the other connection gets the next attempt
+    }
     await new Promise((r) => setTimeout(r, delayMs));
   }
   return null;
 }
 
-async function handleTx(signature: string) {
-  console.log("🔍 handleTx START for:", signature);
+async function handleTx(signature: string): Promise<boolean> {
   try {
     const tx = await getTransactionWithRetry(signature);
     if (!tx?.meta) {
-      console.log("❌ handleTx: no tx/meta after retries for", signature);
-      return;
+      console.log("⏳ handleTx: tx not fetchable yet — will retry:", signature);
+      return false; // caller queues this signature for retry
     }
-    console.log("✅ handleTx: tx fetched");
 
     const keys = getResolvedAccountKeys(tx);
     const targetIdx = keys.findIndex((k) => k.toString() === TARGET_WALLET.toString());
     if (targetIdx === -1) {
       console.log("❌ handleTx: target wallet not found in keys");
-      return;
+      return true; // definitively not relevant — no retry needed
     }
 
     // --- TARGET EXIT MIRROR ---
@@ -888,10 +920,12 @@ async function handleTx(signature: string) {
     }
 
     const solDelta = (tx.meta.preBalances?.[targetIdx] ?? 0) - (tx.meta.postBalances?.[targetIdx] ?? 0);
-    console.log(`💰 handleTx: SOL delta = ${(solDelta / 1e9).toFixed(4)} SOL`);
 
+    // Below the buy threshold: transfers, fees, ATA churn. The exit mirror
+    // above has already run, so there is nothing left to copy in this tx.
     if (solDelta < MIN_BUY_SOL) {
-      console.log(`⚠️ handleTx: SOL delta below threshold — checking token/instruction anyway`);
+      console.log(`⏭️ handleTx: SOL delta ${(solDelta / 1e9).toFixed(4)} SOL below threshold — not a buy`);
+      return true;
     }
 
     const preBalances = tx.meta.preTokenBalances ?? [];
@@ -911,43 +945,19 @@ async function handleTx(signature: string) {
       }
     }
 
-    // PUMP.FUN FALLBACK: if target spent SOL but no token increase appeared
+    // The old "Pump.fun instruction fallback" is deliberately removed. A real
+    // buy always shows up as a token balance increase for the target in the
+    // same transaction (the scan above covers every router). A tx with SOL out
+    // but no tokens in is a SOL transfer — and guessing a mint out of
+    // instruction account lists risks buying a token the target is SELLING.
     if (!foundAnyIncrease) {
-      console.log("🔎 handleTx: no token balance increase — checking Pump.fun instructions...");
-      const message = tx.transaction.message as any;
-      const resolvedKeys = keys;
-      const ixs = "instructions" in message
-        ? message.instructions
-        : message.compiledInstructions.map((ix: any) => ({
-            programId: resolvedKeys[ix.programIdIndex],
-            // FIXED: CompiledInstruction uses accountKeyIndexes, not accounts —
-            // the old field name doesn't exist on this object, which is what
-            // was crashing handleTx with "Cannot read properties of undefined
-            // (reading 'map')" on every fallback trade.
-            accounts: (ix.accountKeyIndexes ?? []).map((idx: number) => resolvedKeys[idx]),
-            data: ix.data,
-          }));
-      for (const ix of ixs) {
-        if (!ix.programId || !ix.programId.equals(PUMPFUN_PROGRAM)) continue;
-        if (ix.accounts && ix.accounts.length >= 3) {
-          const mintKey = ix.accounts[2];
-          if (!mintKey) continue;
-          const mint = mintKey.toString();
-          console.log("🟢 Pump.fun mint found:", mint);
-          if (positions.has(mint) || inFlight.has(mint)) {
-            console.log("⏭️ Already processing/holding this mint, skipping");
-            return;
-          }
-          executeBuy(mint, fetchPriceAndMarketCap(mint));
-          return;
-        }
-      }
-      console.log("❌ handleTx: SOL decreased but no token increase AND no Pump.fun mint found");
+      console.log("⏭️ handleTx: SOL out but no tokens in — SOL transfer, not a buy:", signature);
     }
+    return true;
   } catch (e: any) {
-    console.log("💥 handleTx CRASHED:", e.message, e.stack);
+    console.log("💥 handleTx CRASHED:", e.message);
+    return false; // transient — retry
   }
-  console.log("🔍 handleTx END for:", signature);
 }
 
 /* ================= WEBSOCKET ROTATION ================= */
@@ -984,7 +994,9 @@ function onWalletLog(log: Logs) {
   }
 
   console.log("↪️ Fast-path found no TradeEvent — falling back to getTransaction");
-  handleTx(log.signature);
+  handleTx(log.signature).then((processed) => {
+    if (!processed) queueForRetry(log.signature);
+  });
 }
 
 interface DetectionChannel {
@@ -1077,7 +1089,11 @@ async function startPumpPortal() {
         const raw = typeof ev.data === "string" ? ev.data : ev.data.toString();
         const msg = JSON.parse(raw);
 
-        if (!msg?.signature || !msg?.mint) return;
+        if (!msg?.signature || !msg?.mint) {
+          const info = msg?.message ?? msg?.errors ?? msg?.error;
+          if (info) console.log("📡 PumpPortal:", JSON.stringify(info).slice(0, 200));
+          return;
+        }
         if (msg.traderPublicKey !== TARGET_WALLET.toString()) return;
         if (alreadySeen(msg.signature)) return;
 
@@ -1151,7 +1167,8 @@ async function pollForMissedTrades() {
       if (sigInfo.err) continue;
       if (alreadySeen(sigInfo.signature)) continue;
       console.log("🔎 POLL found unprocessed signature:", sigInfo.signature);
-      await handleTx(sigInfo.signature);
+      const processed = await handleTx(sigInfo.signature);
+      if (!processed) queueForRetry(sigInfo.signature);
     }
 
     lastPolledSignature = sigs[0]?.signature ?? lastPolledSignature;
@@ -1187,6 +1204,7 @@ async function start() {
   rotateSubscriptions();
   setInterval(rotateSubscriptions, 60 * 1000);
   setInterval(pollForMissedTrades, POLL_INTERVAL_MS);
+  setInterval(drainRetryQueue, 3000);
   setInterval(refreshBlockhash, 25_000);
   setInterval(checkWalletBalance, 60 * 1000);
   setInterval(pollTelegramCommands, 3000);
@@ -1201,7 +1219,7 @@ async function start() {
 
   console.log("✅ Bot fully running (rotating websockets + PumpPortal + polling backstop)");
   await sendTelegramAlert(
-    `🟢 <b>V18 Engine Online</b>\nSniper deployed and watching target:\n<code>${TARGET_WALLET.toString()}</code>\n` +
+    `🟢 <b>V19 Engine Online</b>\nSniper deployed and watching target:\n<code>${TARGET_WALLET.toString()}</code>\n` +
     `Exit: TARGET-EXIT mirror + TP 700/1100/1500% + time net 15/25/40s\n` +
     `Channels: ${DETECTION_URLS.length} rotating WS + ${PUMPPORTAL_ENABLED ? "PumpPortal" : "no PumpPortal"} + polling\n` +
     `Commands: /pause /resume /status`
