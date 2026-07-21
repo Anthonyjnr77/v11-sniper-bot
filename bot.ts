@@ -6,9 +6,12 @@ import {
   PublicKey,
   SystemProgram,
   Transaction,
+  TransactionInstruction,
+  ComputeBudgetProgram,
 } from "@solana/web3.js";
 import type { Logs } from "@solana/web3.js";
 import { Program, AnchorProvider, BorshEventCoder } from "@coral-xyz/anchor";
+import { getAssociatedTokenAddress } from "@solana/spl-token";
 import fetch from "node-fetch";
 import bs58 from "bs58";
 import https from "https";
@@ -87,6 +90,15 @@ const SL_PCT = -0.35;
 const TRAIL_DRAWDOWN = -0.2;
 const MAX_HOLD_MS = 5 * 60 * 1000;
 
+// Pump.fun program accounts (needed for direct buy)
+const PUMPFUN_PROGRAM = new PublicKey("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
+const PUMP_GLOBAL = new PublicKey("4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf");
+const PUMP_FEE_RECIPIENT = new PublicKey("CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicJhtHTAcVUN");
+const PUMP_EVENT_AUTHORITY = new PublicKey("Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1");
+const TOKEN_PROGRAM = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+const ASSOCIATED_TOKEN_PROGRAM = new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
+
+// Log filter – suppress repetitive noise, keep diagnostics
 const originalLog = console.log;
 console.log = (...args: any[]) => {
   const msg = args.join(' ');
@@ -134,8 +146,6 @@ process.on("unhandledRejection", async (reason: any) => {
 });
 
 /* ================= PUMP.FUN FAST-PATH DECODER ================= */
-
-const PUMPFUN_PROGRAM = new PublicKey("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
 
 let pumpEventCoder: BorshEventCoder | null = null;
 
@@ -236,6 +246,7 @@ function jupHeaders(extra: Record<string, string> = {}) {
 
 let cachedBlockhash: string | null = null;
 let cachedBlockhashAt = 0;
+let cachedPriorityFee = BASE_PRIORITY_FEE;
 
 async function refreshBlockhash() {
   try {
@@ -576,6 +587,120 @@ async function sendSwapDual(txBase64: string): Promise<string | null> {
   return null;
 }
 
+// Send a raw transaction (for direct Pump.fun buys) via Jito bundle + RPC race
+async function sendRawTransactionDual(rawTx: Uint8Array): Promise<string | null> {
+  const jitoAttempt = (async () => {
+    try {
+      const blockhash = await getBlockhashFast();
+      const tipTx = new Transaction({ feePayer: wallet.publicKey, recentBlockhash: blockhash }).add(
+        SystemProgram.transfer({
+          fromPubkey: wallet.publicKey,
+          toPubkey: randomTipAccount(),
+          lamports: JITO_TIP_LAMPORTS,
+        })
+      );
+      tipTx.sign(wallet);
+
+      const bundle = [bs58.encode(rawTx), bs58.encode(tipTx.serialize())];
+      const res = await fetchJson(JITO_BLOCK_ENGINE_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "sendBundle", params: [bundle] }),
+      });
+      return res?.result ? `jito:${res.result}` : null;
+    } catch {
+      return null;
+    }
+  })();
+
+  const rpcAttempt = (async () => {
+    try {
+      const sig = await connection.sendRawTransaction(rawTx, { skipPreflight: true, maxRetries: 3 });
+      return `rpc:${sig}`;
+    } catch {
+      return null;
+    }
+  })();
+
+  scheduleRebroadcasts(rawTx);
+
+  const results = await Promise.allSettled([jitoAttempt, rpcAttempt]);
+  for (const r of results) {
+    if (r.status === "fulfilled" && r.value) {
+      console.log("✅ Landed via:", r.value);
+      return r.value;
+    }
+  }
+  return null;
+}
+
+/* ================= DIRECT PUMP.FUN BUY ================= */
+
+async function buildAndSendPumpFunBuy(mint: string): Promise<string | null> {
+  try {
+    const mintPubkey = new PublicKey(mint);
+    const [bondingCurve] = PublicKey.findProgramAddressSync(
+      [Buffer.from("bonding-curve"), mintPubkey.toBuffer()],
+      PUMPFUN_PROGRAM
+    );
+    const [bondingCurveTokenAccount] = PublicKey.findProgramAddressSync(
+      [bondingCurve.toBuffer(), TOKEN_PROGRAM.toBuffer(), mintPubkey.toBuffer()],
+      ASSOCIATED_TOKEN_PROGRAM
+    );
+    const userTokenAccount = await getAssociatedTokenAddress(mintPubkey, wallet.publicKey);
+
+    // Buy discriminator
+    const discriminator = Buffer.alloc(8);
+    discriminator.writeBigUInt64LE(BigInt("16927863322537952870"), 0);
+
+    // Use maximum possible token amount so the bonding curve calculates the SOL cost,
+    // and cap the SOL spent with maxSolCost.
+    const amount = BigInt("18446744073709551615"); // max uint64
+    const maxSolCost = BigInt(BUY_AMOUNT + 1_000_000); // allow 0.001 SOL extra
+
+    const amountBuf = Buffer.alloc(8);
+    amountBuf.writeBigUInt64LE(amount, 0);
+    const maxSolBuf = Buffer.alloc(8);
+    maxSolBuf.writeBigUInt64LE(maxSolCost, 0);
+
+    const data = Buffer.concat([discriminator, amountBuf, maxSolBuf]);
+
+    const buyIx = new TransactionInstruction({
+      programId: PUMPFUN_PROGRAM,
+      keys: [
+        { pubkey: PUMP_GLOBAL, isSigner: false, isWritable: false },
+        { pubkey: PUMP_FEE_RECIPIENT, isSigner: false, isWritable: true },
+        { pubkey: mintPubkey, isSigner: false, isWritable: false },
+        { pubkey: bondingCurve, isSigner: false, isWritable: true },
+        { pubkey: bondingCurveTokenAccount, isSigner: false, isWritable: true },
+        { pubkey: userTokenAccount, isSigner: false, isWritable: true },
+        { pubkey: wallet.publicKey, isSigner: true, isWritable: true },
+        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+        { pubkey: TOKEN_PROGRAM, isSigner: false, isWritable: false },
+        { pubkey: PUMP_EVENT_AUTHORITY, isSigner: false, isWritable: false },
+        { pubkey: PUMPFUN_PROGRAM, isSigner: false, isWritable: false },
+      ],
+      data,
+    });
+
+    const tx = new Transaction().add(
+      ComputeBudgetProgram.setComputeUnitLimit({ units: 200_000 }),
+      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: cachedPriorityFee }),
+      buyIx
+    );
+    tx.feePayer = wallet.publicKey;
+    tx.recentBlockhash = cachedBlockhash || (await getBlockhashFast());
+    tx.sign(wallet);
+
+    const rawBytes = tx.serialize();
+    const sig = await sendRawTransactionDual(rawBytes);
+    return sig;
+  } catch (e: any) {
+    console.log("Direct Pump.fun build failed:", e.message);
+    return null;
+  }
+}
+
 /* ================= BALANCE ================= */
 
 async function getTokenBalance(mint: string): Promise<number> {
@@ -635,26 +760,33 @@ async function executeBuy(
   inFlight.add(mint);
 
   try {
-    const quote = await getQuote(SOL_MINT, mint, BUY_AMOUNT);
-    if (!quote || !passesFilters(quote)) {
-      console.log("❌ Buy aborted — bad/failed quote for", mint);
-      return;
+    // Try Jupiter first
+    let quote = await getQuote(SOL_MINT, mint, BUY_AMOUNT);
+    let sig: string | null = null;
+
+    if (quote && passesFilters(quote)) {
+      const tx = await buildSwapTx(quote);
+      if (tx) {
+        sig = await sendSwapDual(tx);
+        if (sig) console.log("🚀 BUY sent (Jupiter):", mint, sig);
+      }
     }
 
-    const tx = await buildSwapTx(quote);
-    if (!tx) {
-      console.log("❌ Buy aborted — swap build failed for", mint);
-      return;
-    }
-
-    const sig = await sendSwapDual(tx);
+    // If Jupiter failed, fallback to direct Pump.fun buy
     if (!sig) {
-      console.log("❌ Buy aborted — both Jito and RPC submission failed for", mint);
+      console.log("⚠️ Jupiter quote failed — trying direct Pump.fun buy for", mint);
+      sig = await buildAndSendPumpFunBuy(mint);
+      if (sig) {
+        console.log("🚀 BUY sent (direct Pump.fun):", mint, sig);
+      }
+    }
+
+    if (!sig) {
+      console.log("❌ Buy aborted — both Jupiter and direct Pump.fun failed for", mint);
       return;
     }
 
-    console.log("🚀 BUY sent:", mint, sig);
-
+    // Confirm balance
     const myMcPromise = fetchPriceAndMarketCap(mint);
     const targetMcPromise = targetSnapshotPromise ?? Promise.resolve({ tokenPriceUSD: null, marketCapUSD: null });
 
@@ -940,11 +1072,6 @@ async function handleTxInternal(tx: any, signature: string): Promise<boolean> {
   }
 }
 
-// FIXED: signature is now marked seen SYNCHRONOUSLY, before any await — this
-// closes the race where all 3 websocket fan-out channels received the same
-// event within milliseconds of each other and all proceeded into handleTx
-// simultaneously (each checking seenSignatures before any had finished
-// fetching), resulting in 3 duplicate quote/detection attempts for one trade.
 async function handleTx(signature: string) {
   if (seenSignatures.has(signature)) return;
   seenSignatures.add(signature);
@@ -987,14 +1114,6 @@ function onWalletLog(log: Logs) {
       return;
     }
   }
-
-  // REMOVED: the regex-based "instant mint extraction" block. Solana program
-  // logs don't contain mint addresses in a `mint: "..."` text format — Pump.fun's
-  // actual data is base64-encoded inside `Program data:` lines, which is exactly
-  // what tryFastDecode() above already handles properly via the Anchor decoder.
-  // This regex never matched a real trade in production (confirmed from logs)
-  // and risked a false-positive buy on an unrelated base58-looking substring
-  // if one ever appeared in a log line. Removed rather than left as dead/risky code.
 
   console.log("↪️ No fast-path match — falling back to getTransaction");
   handleTx(signature);
@@ -1213,9 +1332,9 @@ async function start() {
 
   await checkWalletBalance();
 
-  console.log("✅ Bot fully running (rotating WS + PumpPortal + polling)");
+  console.log("✅ Bot fully running (rotating WS + PumpPortal + polling + direct Pump.fun fallback)");
   await sendTelegramAlert(
-    `🟢 <b>V20 Engine Online</b>\nTarget: <code>${TARGET_WALLET.toString()}</code>\n` +
+    `🟢 <b>V21 Engine Online</b>\nTarget: <code>${TARGET_WALLET.toString()}</code>\n` +
     `Exit: TARGET-EXIT mirror + TP 700/1100/1500% + time net 15/25/40s\n` +
     `Channels: ${DETECTION_URLS.length} rotating WS + ${PUMPPORTAL_ENABLED ? "PumpPortal" : "no PumpPortal"} + polling\n` +
     `Commands: /pause /resume /status`
