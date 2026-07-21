@@ -34,12 +34,8 @@ function makeConnection(url: string): Connection {
   });
 }
 
-// Primary connection: HTTP RPC calls only (quotes support, getTransaction,
-// balances, blockhash). Detection websockets are owned by the rotation logic
-// below and are deliberately SEPARATE connections.
 const connection = makeConnection(RPC_URL);
 
-// Detection channel URLs. WS_FANOUT copies of the primary RPC + any extras.
 const WS_FANOUT = Math.max(1, Math.min(2, Number(process.env.WS_FANOUT ?? 2)));
 const EXTRA_WS_URLS = (process.env.EXTRA_WS_URLS ?? "https://api.mainnet-beta.solana.com")
   .split(",")
@@ -67,7 +63,7 @@ const MAX_PRICE_IMPACT = Number(process.env.MAX_PRICE_IMPACT ?? 0.15);
 const ONLY_DIRECT_ROUTES = (process.env.ONLY_DIRECT_ROUTES ?? "true") === "true";
 const PUMPPORTAL_ENABLED = (process.env.PUMPPORTAL ?? "true") === "true";
 
-const MIN_WALLET_BALANCE_SOL = Number(process.env.MIN_WALLET_BALANCE_SOL ?? 0.05);
+const MIN_WALLET_BALANCE_SOL = Number(process.env.MIN_WALLET_BALANCE_SOL ?? 0.02);
 
 const SOL_MINT = "So11111111111111111111111111111111111111112";
 
@@ -91,7 +87,7 @@ const SL_PCT = -0.35;
 const TRAIL_DRAWDOWN = -0.2;
 const MAX_HOLD_MS = 5 * 60 * 1000;
 
-// Prevent Render output limit crashes - suppress ONLY repetitive non-diagnostic noise.
+// Suppress ONLY genuinely repetitive non-diagnostic noise.
 const originalLog = console.log;
 console.log = (...args: any[]) => {
   const msg = args.join(' ');
@@ -894,15 +890,10 @@ async function handleTx(signature: string) {
     const solDelta = (tx.meta.preBalances?.[targetIdx] ?? 0) - (tx.meta.postBalances?.[targetIdx] ?? 0);
     console.log(`💰 handleTx: SOL delta = ${(solDelta / 1e9).toFixed(4)} SOL`);
 
-    // We used to skip here if the SOL delta was below threshold, but this was unreliable
-    // because the RPC sometimes doesn't include the actual SOL change in pre/post balances.
-    // Instead, we always proceed to check for token balance increases or Pump.fun instructions.
     if (solDelta < MIN_BUY_SOL) {
       console.log(`⚠️ handleTx: SOL delta below threshold — checking token/instruction anyway`);
-      // fall through to the token and Pump.fun checks below
     }
 
-    // Standard token balance check
     const preBalances = tx.meta.preTokenBalances ?? [];
     const postBalances = tx.meta.postTokenBalances ?? [];
     let foundAnyIncrease = false;
@@ -929,12 +920,15 @@ async function handleTx(signature: string) {
         ? message.instructions
         : message.compiledInstructions.map((ix: any) => ({
             programId: resolvedKeys[ix.programIdIndex],
-            accounts: ix.accounts.map((idx: number) => resolvedKeys[idx]),
+            // FIXED: CompiledInstruction uses accountKeyIndexes, not accounts —
+            // the old field name doesn't exist on this object, which is what
+            // was crashing handleTx with "Cannot read properties of undefined
+            // (reading 'map')" on every fallback trade.
+            accounts: (ix.accountKeyIndexes ?? []).map((idx: number) => resolvedKeys[idx]),
             data: ix.data,
           }));
       for (const ix of ixs) {
-        if (!ix.programId.equals(PUMPFUN_PROGRAM)) continue;
-        // Pump.fun buy: accounts[2] is the mint
+        if (!ix.programId || !ix.programId.equals(PUMPFUN_PROGRAM)) continue;
         if (ix.accounts && ix.accounts.length >= 3) {
           const mintKey = ix.accounts[2];
           if (!mintKey) continue;
@@ -1207,7 +1201,7 @@ async function start() {
 
   console.log("✅ Bot fully running (rotating websockets + PumpPortal + polling backstop)");
   await sendTelegramAlert(
-    `🟢 <b>V17 Engine Online</b>\nSniper deployed and watching target:\n<code>${TARGET_WALLET.toString()}</code>\n` +
+    `🟢 <b>V18 Engine Online</b>\nSniper deployed and watching target:\n<code>${TARGET_WALLET.toString()}</code>\n` +
     `Exit: TARGET-EXIT mirror + TP 700/1100/1500% + time net 15/25/40s\n` +
     `Channels: ${DETECTION_URLS.length} rotating WS + ${PUMPPORTAL_ENABLED ? "PumpPortal" : "no PumpPortal"} + polling\n` +
     `Commands: /pause /resume /status`
