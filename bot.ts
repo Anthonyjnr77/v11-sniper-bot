@@ -6,15 +6,9 @@ import {
   PublicKey,
   SystemProgram,
   Transaction,
-  TransactionInstruction,
-  ComputeBudgetProgram,
 } from "@solana/web3.js";
 import type { Logs } from "@solana/web3.js";
 import { Program, AnchorProvider, BorshEventCoder } from "@coral-xyz/anchor";
-import {
-  getAssociatedTokenAddress,
-  createAssociatedTokenAccountIdempotentInstruction,
-} from "@solana/spl-token";
 import fetch from "node-fetch";
 import bs58 from "bs58";
 import https from "https";
@@ -94,11 +88,6 @@ const TRAIL_DRAWDOWN = -0.2;
 const MAX_HOLD_MS = 5 * 60 * 1000;
 
 const PUMPFUN_PROGRAM = new PublicKey("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
-const PUMP_GLOBAL = new PublicKey("4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf");
-const PUMP_FEE_RECIPIENT = new PublicKey("CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicJhtHTAcVUN");
-const PUMP_EVENT_AUTHORITY = new PublicKey("Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1");
-const TOKEN_PROGRAM = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
-const ASSOCIATED_TOKEN_PROGRAM = new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
 
 const originalLog = console.log;
 console.log = (...args: any[]) => {
@@ -247,7 +236,6 @@ function jupHeaders(extra: Record<string, string> = {}) {
 
 let cachedBlockhash: string | null = null;
 let cachedBlockhashAt = 0;
-let cachedPriorityFee = BASE_PRIORITY_FEE;
 
 async function refreshBlockhash() {
   try {
@@ -634,142 +622,51 @@ async function sendRawTransactionDual(rawTx: Uint8Array): Promise<string | null>
   return null;
 }
 
-/* ================= BONDING CURVE MATH ================= */
-// Reads the real bonding curve reserves and calculates a token amount to
-// request, instead of the "request max uint64" trick — which very likely
-// cannot work if the program checks that the cost of the FULL requested
-// amount stays under maxSolCost (an infinite request always fails that).
+/* ================= PUMPPORTAL-BUILT TRANSACTIONS ================= */
+// PumpPortal builds the current, correct Pump.fun transaction server-side —
+// they maintain the account layouts through every Pump.fun breaking change,
+// which is exactly the burden this bot should not carry itself. The response
+// is an UNSIGNED transaction: the private key never leaves this bot. We sign
+// locally and submit through our own dual path (Jito + RPC + rebroadcasts).
+// One HTTP round trip, works on seconds-old tokens (no indexing lag).
+// Cost: 0.5% of trade size. No API key required for this endpoint.
 
-interface BondingCurveState {
-  virtualTokenReserves: bigint;
-  virtualSolReserves: bigint;
-  realTokenReserves: bigint;
-  realSolReserves: bigint;
-  tokenTotalSupply: bigint;
-  complete: boolean;
-}
-
-async function fetchBondingCurve(bondingCurve: PublicKey): Promise<BondingCurveState | null> {
+async function buildPumpPortalTx(
+  action: "buy" | "sell",
+  mint: string,
+  amount: number | string,
+  denominatedInSol: boolean
+): Promise<Uint8Array | null> {
   try {
-    const info = await connection.getAccountInfo(bondingCurve, "processed");
-    if (!info || info.data.length < 8 + 8 * 5 + 1) return null;
-    const buf = info.data;
-    let offset = 8; // skip 8-byte Anchor account discriminator
-    const virtualTokenReserves = buf.readBigUInt64LE(offset); offset += 8;
-    const virtualSolReserves = buf.readBigUInt64LE(offset); offset += 8;
-    const realTokenReserves = buf.readBigUInt64LE(offset); offset += 8;
-    const realSolReserves = buf.readBigUInt64LE(offset); offset += 8;
-    const tokenTotalSupply = buf.readBigUInt64LE(offset); offset += 8;
-    const complete = buf.readUInt8(offset) === 1;
-    return { virtualTokenReserves, virtualSolReserves, realTokenReserves, realSolReserves, tokenTotalSupply, complete };
-  } catch {
-    return null;
-  }
-}
-
-function calcTokensOutForSol(curve: BondingCurveState, solInLamports: bigint): bigint {
-  // Constant-product curve, with an approximate 1% platform fee haircut.
-  // This is an estimate, not a guaranteed-exact figure.
-  const feeBps = 100n;
-  const solInAfterFee = solInLamports - (solInLamports * feeBps) / 10000n;
-  const denominator = curve.virtualSolReserves + solInAfterFee;
-  if (denominator === 0n) return 0n;
-  return (curve.virtualTokenReserves * solInAfterFee) / denominator;
-}
-
-/* ================= DIRECT PUMP.FUN BUY ================= */
-
-async function buildAndSendPumpFunBuy(mint: string): Promise<string | null> {
-  try {
-    const mintPubkey = new PublicKey(mint);
-    const [bondingCurve] = PublicKey.findProgramAddressSync(
-      [Buffer.from("bonding-curve"), mintPubkey.toBuffer()],
-      PUMPFUN_PROGRAM
-    );
-
-    const curve = await fetchBondingCurve(bondingCurve);
-    if (!curve) {
-      console.log("⚠️ Could not read bonding curve for", mint, "— skipping direct path");
-      return null;
-    }
-    if (curve.complete) {
-      console.log("ℹ️ Bonding curve already migrated for", mint, "— direct path not applicable, use Jupiter");
-      return null;
-    }
-
-    const solInLamports = BigInt(BUY_AMOUNT);
-    const estimatedTokensOut = calcTokensOutForSol(curve, solInLamports);
-    if (estimatedTokensOut <= 0n) {
-      console.log("⚠️ Bonding curve calc returned 0 tokens for", mint, "— skipping direct path");
-      return null;
-    }
-    // Request 90% of the estimated fair amount — a safety margin so a
-    // slightly-off calculation still comfortably clears the SOL cost cap,
-    // rather than risk exceeding it.
-    const amount = (estimatedTokensOut * 90n) / 100n;
-    const maxSolCost = BigInt(BUY_AMOUNT) + 1_000_000n; // small slippage/fee buffer
-
-    const [bondingCurveTokenAccount] = PublicKey.findProgramAddressSync(
-      [bondingCurve.toBuffer(), TOKEN_PROGRAM.toBuffer(), mintPubkey.toBuffer()],
-      ASSOCIATED_TOKEN_PROGRAM
-    );
-    const userTokenAccount = await getAssociatedTokenAddress(mintPubkey, wallet.publicKey);
-
-    const discriminator = Buffer.alloc(8);
-    discriminator.writeBigUInt64LE(BigInt("16927863322537952870"), 0);
-
-    const amountBuf = Buffer.alloc(8);
-    amountBuf.writeBigUInt64LE(amount, 0);
-    const maxSolBuf = Buffer.alloc(8);
-    maxSolBuf.writeBigUInt64LE(maxSolCost, 0);
-
-    const data = Buffer.concat([discriminator, amountBuf, maxSolBuf]);
-
-    const buyIx = new TransactionInstruction({
-      programId: PUMPFUN_PROGRAM,
-      keys: [
-        { pubkey: PUMP_GLOBAL, isSigner: false, isWritable: false },
-        { pubkey: PUMP_FEE_RECIPIENT, isSigner: false, isWritable: true },
-        { pubkey: mintPubkey, isSigner: false, isWritable: false },
-        { pubkey: bondingCurve, isSigner: false, isWritable: true },
-        { pubkey: bondingCurveTokenAccount, isSigner: false, isWritable: true },
-        { pubkey: userTokenAccount, isSigner: false, isWritable: true },
-        { pubkey: wallet.publicKey, isSigner: true, isWritable: true },
-        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-        { pubkey: TOKEN_PROGRAM, isSigner: false, isWritable: false },
-        { pubkey: PUMP_EVENT_AUTHORITY, isSigner: false, isWritable: false },
-        { pubkey: PUMPFUN_PROGRAM, isSigner: false, isWritable: false },
-      ],
-      data,
+    const res: any = await fetch("https://pumpportal.fun/api/trade-local", {
+      agent,
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        publicKey: wallet.publicKey.toString(),
+        action,
+        mint,
+        amount,
+        denominatedInSol: denominatedInSol ? "true" : "false",
+        slippage: SLIPPAGE_BPS / 100,
+        priorityFee: BASE_PRIORITY_FEE / 1e9,
+        pool: "auto",
+      }),
     });
-
-    // FIXED: create the destination token account if it doesn't exist yet —
-    // this was the near-certain reason every prior attempt failed on-chain.
-    const createAtaIx = createAssociatedTokenAccountIdempotentInstruction(
-      wallet.publicKey,
-      userTokenAccount,
-      wallet.publicKey,
-      mintPubkey
-    );
-
-    const tx = new Transaction().add(
-      ComputeBudgetProgram.setComputeUnitLimit({ units: 200_000 }),
-      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: cachedPriorityFee }),
-      createAtaIx,
-      buyIx
-    );
-    tx.feePayer = wallet.publicKey;
-    tx.recentBlockhash = cachedBlockhash || (await getBlockhashFast());
-    tx.sign(wallet);
-
-    const rawBytes = tx.serialize();
-    return await sendRawTransactionDual(rawBytes);
+    if (!res.ok) {
+      const errText = await res.text().catch(() => "");
+      console.log(`⚠️ trade-local ${action} build failed:`, String(errText).slice(0, 140));
+      return null;
+    }
+    const buf = new Uint8Array(await res.arrayBuffer());
+    const tx = VersionedTransaction.deserialize(buf);
+    tx.sign([wallet]);
+    return tx.serialize();
   } catch (e: any) {
-    console.log("Direct Pump.fun build failed:", e.message);
+    console.log(`⚠️ trade-local ${action} error:`, e.message);
     return null;
   }
 }
-
 /* ================= BALANCE ================= */
 
 async function getTokenBalance(mint: string): Promise<number> {
@@ -835,13 +732,17 @@ async function executeBuy(
   try {
     let sig: string | null = null;
 
-    // 1. Try direct Pump.fun buy first (fast, no HTTP dependency)
-    sig = await buildAndSendPumpFunBuy(mint);
-    if (sig) console.log("🚀 BUY sent (direct Pump.fun):", mint, sig);
+    // 1. Primary: PumpPortal-built transaction — correct current Pump.fun
+    // layout, works on seconds-old tokens, one HTTP round trip.
+    const rawTx = await buildPumpPortalTx("buy", mint, BUY_AMOUNT / 1e9, true);
+    if (rawTx) {
+      sig = await sendRawTransactionDual(rawTx);
+      if (sig) console.log("🚀 BUY sent (PumpPortal-built):", mint, sig);
+    }
 
-    // 2. Fallback to Jupiter if direct path unavailable
+    // 2. Fallback to Jupiter if the build service is unavailable
     if (!sig) {
-      console.log("↪️ Direct Pump.fun unavailable — trying Jupiter for", mint);
+      console.log("↪️ PumpPortal build unavailable — trying Jupiter for", mint);
       const quote = await getQuote(SOL_MINT, mint, BUY_AMOUNT);
       if (quote && passesFilters(quote)) {
         const tx = await buildSwapTx(quote);
@@ -853,7 +754,7 @@ async function executeBuy(
     }
 
     if (!sig) {
-      console.log("❌ Buy aborted — both direct Pump.fun and Jupiter failed for", mint);
+      console.log("❌ Buy aborted — both PumpPortal and Jupiter failed for", mint);
       return;
     }
 
@@ -915,21 +816,33 @@ async function executeSell(mint: string, amount: number, reason: string) {
   const pos = positions.get(mint);
   if (!pos) return;
 
+  let sig: string | null = null;
+
   const quote = await getQuote(mint, SOL_MINT, amount, 3);
-  if (!quote) return;
+  if (quote) {
+    const tx = await buildSwapTx(quote);
+    if (tx) sig = await sendSwapDual(tx);
+  }
 
-  const tx = await buildSwapTx(quote);
-  if (!tx) return;
+  // Fallback for tokens Jupiter cannot quote yet (seconds old): sell via a
+  // PumpPortal-built transaction. Pump.fun tokens use 6 decimals.
+  if (!sig) {
+    console.log("↪️ Jupiter sell unavailable — trying PumpPortal build for", mint);
+    const rawTx = await buildPumpPortalTx("sell", mint, amount / 1e6, false);
+    if (rawTx) sig = await sendRawTransactionDual(rawTx);
+  }
 
-  const sig = await sendSwapDual(tx);
-  if (!sig) return;
+  if (!sig) {
+    console.log(`❌ Sell failed on both paths for ${mint} (${reason})`);
+    return;
+  }
 
   console.log(`✅ SELL (${reason}):`, mint, sig);
 
   const soldFraction = amount / pos.remainingAmount;
   const costBasisSold = pos.costBasisLamports * soldFraction;
-  const proceedsLamports = Number(quote.outAmount);
-  const pnlPercent = ((proceedsLamports - costBasisSold) / costBasisSold) * 100;
+  const proceedsLamports = quote ? Number(quote.outAmount) : 0;
+  const pnlPercent = quote ? ((proceedsLamports - costBasisSold) / costBasisSold) * 100 : 0;
 
   pos.remainingAmount -= amount;
   pos.costBasisLamports -= costBasisSold;
@@ -1401,10 +1314,10 @@ async function start() {
 
   await checkWalletBalance();
 
-  console.log("✅ Bot fully running (rotating WS + PumpPortal + polling + direct Pump.fun first)");
+  console.log("✅ Bot fully running (rotating WS + PumpPortal + polling + PumpPortal-built buys)");
   await sendTelegramAlert(
-    `🟢 <b>V22 Engine Online</b>\nTarget: <code>${TARGET_WALLET.toString()}</code>\n` +
-    `Buy path: direct Pump.fun first, Jupiter fallback\n` +
+    `🟢 <b>V23 Engine Online</b>\nTarget: <code>${TARGET_WALLET.toString()}</code>\n` +
+    `Buy path: PumpPortal-built tx first, Jupiter fallback\n` +
     `Exit: TARGET-EXIT mirror + TP 700/1100/1500% + time net 15/25/40s\n` +
     `Channels: ${DETECTION_URLS.length} rotating WS + ${PUMPPORTAL_ENABLED ? "PumpPortal" : "no PumpPortal"} + polling\n` +
     `Commands: /pause /resume /status`
