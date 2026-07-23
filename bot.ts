@@ -54,7 +54,7 @@ const TARGET_WALLET = new PublicKey(requireEnv("TARGET_WALLET"));
 
 const BUY_AMOUNT_SOL = Number(process.env.BUY_AMOUNT_SOL);
 const BUY_AMOUNT = BUY_AMOUNT_SOL * 1e9;
-const BASE_PRIORITY_FEE = Number(process.env.PRIORITY_FEE_LAMPORTS ?? 1_500_000);
+const BASE_PRIORITY_FEE = Number(process.env.PRIORITY_FEE_LAMPORTS ?? 750_000);
 const SLIPPAGE_BPS = Number(process.env.SLIPPAGE_BPS ?? 4000);
 const RETRY_SLIPPAGE_BPS = Number(process.env.RETRY_SLIPPAGE_BPS ?? 5000);
 const MIN_BUY_SOL = Number(process.env.MIN_BUY_SOL ?? 0.01) * 1e9;
@@ -198,7 +198,7 @@ const JITO_TIP_ACCOUNTS: string[] = [
   "E2eSqe33tuhAHKTrwky5uEjaVqnb2T9ns6nHHUrN8588",
   "ARTtviJkLLt6cHGQDydfo1Wyk6M4VGZdKZ2ZhdnJL336",
 ];
-const JITO_TIP_LAMPORTS = Number(process.env.JITO_TIP_LAMPORTS ?? 4_000_000);
+const JITO_TIP_LAMPORTS = Number(process.env.JITO_TIP_LAMPORTS ?? 1_000_000);
 
 function randomTipAccount(): PublicKey {
   const idx = Math.floor(Math.random() * JITO_TIP_ACCOUNTS.length);
@@ -745,10 +745,8 @@ function passesFilters(quote: any) {
 }
 
 /* ================= BUY ================= */
-// Direct Pump.fun is now tried FIRST — no Jupiter round trip for tokens still
-// on the bonding curve, which is every real trade from this target wallet.
-// Jupiter only runs as a fallback if the curve read fails or the token has
-// already migrated off the bonding curve.
+// PumpPortal-built tx first (bonding-curve pool, then auto), confirmed
+// on-chain, with one instant higher-slippage retry; Jupiter as fallback.
 
 async function executeBuy(
   mint: string,
@@ -1094,6 +1092,15 @@ async function handleTxInternal(tx: any, signature: string): Promise<boolean> {
       }
     }
 
+    // Buy threshold: the target must have actually SPENT SOL in this tx.
+    // Without this check, dust buys and tokens transferred INTO the target
+    // wallet would be copied as real buys.
+    const solDelta = (tx.meta.preBalances?.[targetIdx] ?? 0) - (tx.meta.postBalances?.[targetIdx] ?? 0);
+    if (solDelta < MIN_BUY_SOL) {
+      console.log(`⏭️ SOL delta ${(solDelta / 1e9).toFixed(4)} below threshold — not a copyable buy`);
+      return true;
+    }
+
     const preBalances = tx.meta.preTokenBalances ?? [];
     const postBalances = tx.meta.postTokenBalances ?? [];
     let foundAny = false;
@@ -1148,20 +1155,27 @@ function onWalletLog(log: Logs) {
   console.log(`👀 Activity: https://solscan.io/tx/${signature}`);
 
   const fast = tryFastDecode(log.logs);
-  if (fast && fast.user === TARGET_WALLET.toString() && fast.isBuy && fast.solAmount >= MIN_BUY_SOL) {
-    console.log(`⚡ IDL FAST-PATH BUY: ${fast.mint}`);
+  if (fast) {
+    // Fast-path is AUTHORITATIVE: a decoded TradeEvent is a definitive
+    // answer. Falling through to getTransaction on a decoded-but-rejected
+    // event silently bypassed the min-buy threshold via the fallback scan.
     seenSignatures.add(signature);
-    executeBuy(fast.mint, fetchPriceAndMarketCap(fast.mint));
-    return;
-  }
-  if (fast && fast.user === TARGET_WALLET.toString() && !fast.isBuy) {
+    if (fast.user !== TARGET_WALLET.toString()) return;
+    if (fast.isBuy) {
+      if (fast.solAmount < MIN_BUY_SOL) {
+        console.log(`⏭️ Fast-path: buy below threshold (${(fast.solAmount / 1e9).toFixed(4)} SOL) — ignoring`);
+        return;
+      }
+      console.log(`⚡ IDL FAST-PATH BUY: ${fast.mint}`);
+      executeBuy(fast.mint, fetchPriceAndMarketCap(fast.mint));
+      return;
+    }
     const held = positions.get(fast.mint);
     if (held && held.remainingAmount > 0) {
       console.log("🚨 Fast-path: target SOLD a token we hold — dumping:", fast.mint);
-      seenSignatures.add(signature);
       executeSell(fast.mint, held.remainingAmount, "TARGET_EXITED");
-      return;
     }
+    return;
   }
 
   console.log("↪️ No fast-path match — falling back to getTransaction");
@@ -1383,9 +1397,9 @@ async function start() {
 
   console.log("✅ Bot fully running (rotating WS + PumpPortal + polling + PumpPortal-built buys)");
   await sendTelegramAlert(
-    `🟢 <b>V23 Engine Online</b>\nTarget: <code>${TARGET_WALLET.toString()}</code>\n` +
+    `🟢 <b>V24 Engine Online</b>\nTarget: <code>${TARGET_WALLET.toString()}</code>\n` +
     `Buy path: PumpPortal-built tx first, Jupiter fallback\n` +
-    `Exit: TARGET-EXIT mirror + TP 700/1100/1500% + time net 15/25/40s\n` +
+    `Exit: TARGET-EXIT mirror + full exit at +300% + time net 15/25/40s\n` +
     `Channels: ${DETECTION_URLS.length} rotating WS + ${PUMPPORTAL_ENABLED ? "PumpPortal" : "no PumpPortal"} + polling\n` +
     `Commands: /pause /resume /status`
   );
