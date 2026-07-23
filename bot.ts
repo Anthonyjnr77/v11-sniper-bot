@@ -54,8 +54,9 @@ const TARGET_WALLET = new PublicKey(requireEnv("TARGET_WALLET"));
 
 const BUY_AMOUNT_SOL = Number(process.env.BUY_AMOUNT_SOL);
 const BUY_AMOUNT = BUY_AMOUNT_SOL * 1e9;
-const BASE_PRIORITY_FEE = Number(process.env.PRIORITY_FEE_LAMPORTS ?? 500_000);
-const SLIPPAGE_BPS = Number(process.env.SLIPPAGE_BPS ?? 1500);
+const BASE_PRIORITY_FEE = Number(process.env.PRIORITY_FEE_LAMPORTS ?? 1_500_000);
+const SLIPPAGE_BPS = Number(process.env.SLIPPAGE_BPS ?? 4000);
+const RETRY_SLIPPAGE_BPS = Number(process.env.RETRY_SLIPPAGE_BPS ?? 5000);
 const MIN_BUY_SOL = Number(process.env.MIN_BUY_SOL ?? 0.01) * 1e9;
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS ?? 5000);
 
@@ -70,10 +71,13 @@ const SOL_MINT = "So11111111111111111111111111111111111111112";
 const JUP_BASE = "https://api.jup.ag/swap/v1";
 const JUP_API_KEY = process.env.JUP_API_KEY;
 
+// Full exit at +300%: target dumps ~45-50k MC; from our ~11-14k post-impact
+// entry that is ~4x price (= +300% PnL). Selling 100% here means selling into
+// good liquidity BEFORE his 20 SOL exit crushes the curve. TARGET_EXITED
+// (which also catches transfers out via balance-decrease detection) and the
+// time-based tiers remain as safety nets for trades that never get there.
 const TP_TIERS = [
-  { tp: 7.0, sellFraction: 0.5 },
-  { tp: 11.0, sellFraction: 0.3 },
-  { tp: 15.0, sellFraction: 0.2 },
+  { tp: 3.0, sellFraction: 1.0 },
 ];
 
 const TIME_BASED_TP = [
@@ -194,7 +198,7 @@ const JITO_TIP_ACCOUNTS: string[] = [
   "E2eSqe33tuhAHKTrwky5uEjaVqnb2T9ns6nHHUrN8588",
   "ARTtviJkLLt6cHGQDydfo1Wyk6M4VGZdKZ2ZhdnJL336",
 ];
-const JITO_TIP_LAMPORTS = Number(process.env.JITO_TIP_LAMPORTS ?? 2_000_000);
+const JITO_TIP_LAMPORTS = Number(process.env.JITO_TIP_LAMPORTS ?? 4_000_000);
 
 function randomTipAccount(): PublicKey {
   const idx = Math.floor(Math.random() * JITO_TIP_ACCOUNTS.length);
@@ -635,7 +639,9 @@ async function buildPumpPortalTx(
   action: "buy" | "sell",
   mint: string,
   amount: number | string,
-  denominatedInSol: boolean
+  denominatedInSol: boolean,
+  slippageBps: number = SLIPPAGE_BPS,
+  pool: string = "auto"
 ): Promise<Uint8Array | null> {
   try {
     const res: any = await fetch("https://pumpportal.fun/api/trade-local", {
@@ -648,9 +654,9 @@ async function buildPumpPortalTx(
         mint,
         amount,
         denominatedInSol: denominatedInSol ? "true" : "false",
-        slippage: SLIPPAGE_BPS / 100,
+        slippage: slippageBps / 100,
         priorityFee: BASE_PRIORITY_FEE / 1e9,
-        pool: "auto",
+        pool,
       }),
     });
     if (!res.ok) {
@@ -667,6 +673,42 @@ async function buildPumpPortalTx(
     return null;
   }
 }
+
+/* ================= TX CONFIRMATION ================= */
+// "Sent" is NOT "landed": sendRawTransaction with skipPreflight returns a
+// signature even if the tx later fails on-chain, and Jito returns a bundle ID
+// whether or not the bundle is included. Poll the real tx signature so
+// slippage failures on fresh bonding curves are detected and retried instead
+// of surfacing as vague balance warnings.
+
+function txSignatureFromRaw(rawTx: Uint8Array): string {
+  const tx = VersionedTransaction.deserialize(rawTx);
+  return bs58.encode(tx.signatures[0]!);
+}
+
+async function confirmTxOnChain(
+  signature: string,
+  timeoutMs = 8000
+): Promise<"landed" | "failed" | "unknown"> {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    try {
+      const st = await connection.getSignatureStatuses([signature]);
+      const s = st?.value?.[0];
+      if (s) {
+        if (s.err) {
+          console.log("❌ Tx FAILED on-chain:", signature, JSON.stringify(s.err));
+          return "failed";
+        }
+        return "landed";
+      }
+    } catch {}
+    await new Promise((r) => setTimeout(r, 400));
+  }
+  console.log("⚠️ Tx not seen on-chain within timeout:", signature);
+  return "unknown";
+}
+
 /* ================= BALANCE ================= */
 
 async function getTokenBalance(mint: string): Promise<number> {
@@ -680,7 +722,7 @@ async function getTokenBalance(mint: string): Promise<number> {
   }
 }
 
-async function waitForBalance(mint: string, attempts = 6, delayMs = 500): Promise<number> {
+async function waitForBalance(mint: string, attempts = 10, delayMs = 1000): Promise<number> {
   for (let i = 0; i < attempts; i++) {
     const bal = await getTokenBalance(mint);
     if (bal > 0) return bal;
@@ -734,10 +776,35 @@ async function executeBuy(
 
     // 1. Primary: PumpPortal-built transaction — correct current Pump.fun
     // layout, works on seconds-old tokens, one HTTP round trip.
-    const rawTx = await buildPumpPortalTx("buy", mint, BUY_AMOUNT / 1e9, true);
+    // Bonding-curve pool is tried FIRST (target buys at ~3k MC, pre-migration);
+    // if the token already migrated the build fails and we fall back to auto.
+    let rawTx = await buildPumpPortalTx("buy", mint, BUY_AMOUNT / 1e9, true, SLIPPAGE_BPS, "pump");
+    if (!rawTx) rawTx = await buildPumpPortalTx("buy", mint, BUY_AMOUNT / 1e9, true, SLIPPAGE_BPS, "auto");
     if (rawTx) {
       sig = await sendRawTransactionDual(rawTx);
-      if (sig) console.log("🚀 BUY sent (PumpPortal-built):", mint, sig);
+      if (sig) {
+        console.log("🚀 BUY sent (PumpPortal-built):", mint, sig);
+        const status = await confirmTxOnChain(txSignatureFromRaw(rawTx));
+        if (status === "failed") {
+          // Most common on a fresh curve: slippage exceeded. Retry once
+          // immediately at higher slippage — every block matters at 3k MC.
+          console.log("⚠️ Buy failed on-chain (likely slippage) — instant retry at higher slippage:", mint);
+          sig = null;
+          rawTx = await buildPumpPortalTx("buy", mint, BUY_AMOUNT / 1e9, true, RETRY_SLIPPAGE_BPS, "pump");
+          if (!rawTx) rawTx = await buildPumpPortalTx("buy", mint, BUY_AMOUNT / 1e9, true, RETRY_SLIPPAGE_BPS, "auto");
+          if (rawTx) {
+            sig = await sendRawTransactionDual(rawTx);
+            if (sig) {
+              console.log("🚀 BUY retry sent (higher slippage):", mint, sig);
+              const retryStatus = await confirmTxOnChain(txSignatureFromRaw(rawTx));
+              if (retryStatus === "failed") {
+                console.log("❌ Buy retry also failed on-chain:", mint);
+                sig = null;
+              }
+            }
+          }
+        }
+      }
     }
 
     // 2. Fallback to Jupiter if the build service is unavailable
