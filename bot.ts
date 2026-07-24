@@ -139,6 +139,11 @@ process.on("unhandledRejection", async (reason: any) => {
 
 let pumpEventCoder: BorshEventCoder | null = null;
 
+// Anchor's IDL decoder rejects newer Pump.fun TradeEvent versions when fields
+// are appended. These leading fields have remained stable across versions.
+const PUMP_TRADE_EVENT_DISCRIMINATOR = Buffer.from([189, 219, 127, 211, 78, 230, 97, 238]);
+const PUMP_TRADE_EVENT_MIN_BYTES = 89; // discriminator + mint + amounts + isBuy + user
+
 async function initPumpDecoder() {
   try {
     const provider = new AnchorProvider(connection, {} as any, {});
@@ -157,11 +162,28 @@ async function initPumpDecoder() {
 type PumpTradeEvent = { mint: string; isBuy: boolean; solAmount: number; user: string };
 
 function tryFastDecode(logs: string[]): PumpTradeEvent | null {
-  if (!pumpEventCoder) return null;
   for (const log of logs) {
     if (!log.startsWith("Program data: ")) continue;
     try {
-      const decoded = pumpEventCoder.decode(log.slice("Program data: ".length));
+      const encoded = log.slice("Program data: ".length);
+      const raw = Buffer.from(encoded, "base64");
+
+      // Pump.fun has added fields to TradeEvent. Decode the stable prefix
+      // directly so new event versions still stay on the no-RPC fast path.
+      if (
+        raw.length >= PUMP_TRADE_EVENT_MIN_BYTES &&
+        raw.subarray(0, 8).equals(PUMP_TRADE_EVENT_DISCRIMINATOR)
+      ) {
+        return {
+          mint: new PublicKey(raw.subarray(8, 40)).toBase58(),
+          solAmount: Number(raw.readBigUInt64LE(40)),
+          isBuy: raw[56] === 1,
+          user: new PublicKey(raw.subarray(57, 89)).toBase58(),
+        };
+      }
+
+      if (!pumpEventCoder) continue;
+      const decoded = pumpEventCoder.decode(encoded);
       if (decoded?.name === "TradeEvent") {
         const d: any = decoded.data;
         const mint = d.mint?.toString();
@@ -1052,7 +1074,10 @@ async function handleTx(signature: string) {
   seenSignatures.add(signature);
 
   try {
-    const tx = await getTransactionWithRetry(signature, 8, 500);
+    // The log arrives at `processed`; transaction metadata usually becomes
+    // readable shortly afterward. Poll both free RPCs at 250 ms so we catch
+    // the first available response instead of waiting a full half-second.
+    const tx = await getTransactionWithRetry(signature, 16, 250);
     if (!tx?.meta) {
       console.log("❌ Could not fetch tx for", signature, "— queueing for retry");
       queueForRetry(signature);
