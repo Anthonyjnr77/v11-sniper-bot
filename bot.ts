@@ -6,9 +6,14 @@ import {
   PublicKey,
   SystemProgram,
   Transaction,
+  TransactionMessage,
+  ComputeBudgetProgram,
 } from "@solana/web3.js";
 import type { Logs } from "@solana/web3.js";
 import { Program, AnchorProvider, BorshEventCoder } from "@coral-xyz/anchor";
+import { getMint, TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID } from "@solana/spl-token";
+import { OnlinePumpSdk, PUMP_SDK, getBuyTokenAmountFromSolAmount } from "@pump-fun/pump-sdk";
+import BN from "bn.js";
 import fetch from "node-fetch";
 import bs58 from "bs58";
 import https from "https";
@@ -88,6 +93,8 @@ const TRAIL_DRAWDOWN = -0.2;
 const MAX_HOLD_MS = 5 * 60 * 1000;
 
 const PUMPFUN_PROGRAM = new PublicKey("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
+const pumpSdk = new OnlinePumpSdk(connection);
+const LOCAL_PUMP_COMPUTE_UNITS = 200_000;
 
 const originalLog = console.log;
 console.log = (...args: any[]) => {
@@ -586,6 +593,67 @@ async function sendRawTransactionDual(rawTx: Uint8Array): Promise<string | null>
 }
 
 /* ================= PUMPPORTAL-BUILT TRANSACTIONS ================= */
+// Build direct Pump.fun buys locally from the official SDK. This avoids the
+// PumpPortal HTTP hop and uses the current bonding-curve accounts for the mint.
+async function buildLocalPumpBuyTx(mint: string): Promise<Uint8Array | null> {
+  try {
+    const mintKey = new PublicKey(mint);
+    const [mintInfo, global, latest] = await Promise.all([
+      connection.getAccountInfo(mintKey, "processed"),
+      pumpSdk.fetchGlobal(),
+      connection.getLatestBlockhash("processed"),
+    ]);
+    if (!mintInfo) throw new Error("mint account not found");
+    const tokenProgram = mintInfo.owner;
+    if (!tokenProgram.equals(TOKEN_PROGRAM_ID) && !tokenProgram.equals(TOKEN_2022_PROGRAM_ID)) {
+      throw new Error("unsupported token program");
+    }
+
+    const [buyState, mintState, feeConfig] = await Promise.all([
+      pumpSdk.fetchBuyState(mintKey, wallet.publicKey, tokenProgram),
+      getMint(connection, mintKey, "processed", tokenProgram),
+      pumpSdk.fetchFeeConfig(),
+    ]);
+    const solAmount = new BN(BUY_AMOUNT);
+    const tokenAmount = getBuyTokenAmountFromSolAmount({
+      global,
+      feeConfig,
+      mintSupply: mintState.supply,
+      bondingCurve: buyState.bondingCurve,
+      amount: solAmount,
+      quoteMint: new PublicKey(SOL_MINT),
+    });
+    if (tokenAmount.isZero()) throw new Error("bonding curve returned zero tokens");
+
+    const instructions = await PUMP_SDK.buyInstructions({
+      global,
+      ...buyState,
+      mint: mintKey,
+      user: wallet.publicKey,
+      amount: tokenAmount,
+      solAmount,
+      slippage: SLIPPAGE_BPS / 100,
+      tokenProgram,
+    });
+    const priorityMicroLamports = Math.ceil((BASE_PRIORITY_FEE * 1_000_000) / LOCAL_PUMP_COMPUTE_UNITS);
+    const message = new TransactionMessage({
+      payerKey: wallet.publicKey,
+      recentBlockhash: latest.blockhash,
+      instructions: [
+        ComputeBudgetProgram.setComputeUnitLimit({ units: LOCAL_PUMP_COMPUTE_UNITS }),
+        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityMicroLamports }),
+        ...instructions,
+      ],
+    }).compileToV0Message();
+    const tx = new VersionedTransaction(message);
+    tx.sign([wallet]);
+    return tx.serialize();
+  } catch (e: any) {
+    console.log("↪️ Local Pump.fun build unavailable:", e.message);
+    return null;
+  }
+}
+
 // PumpPortal builds the current, correct Pump.fun transaction server-side —
 // they maintain the account layouts through every Pump.fun breaking change,
 // which is exactly the burden this bot should not carry itself. The response
@@ -705,6 +773,16 @@ function passesFilters(quote: any) {
 // Jupiter only runs as a fallback if the curve read fails or the token has
 // already migrated off the bonding curve.
 
+async function submitJupiterBuy(mint: string): Promise<string | null> {
+  const quote = await getQuote(SOL_MINT, mint, BUY_AMOUNT);
+  if (!quote || !passesFilters(quote)) return null;
+  const tx = await buildSwapTx(quote);
+  if (!tx) return null;
+  const sig = await sendSwapDual(tx);
+  if (sig) console.log("🚀 BUY submitted (Jupiter):", mint, sig);
+  return sig;
+}
+
 async function executeBuy(
   mint: string,
   targetSnapshotPromise?: Promise<{ tokenPriceUSD: number | null; marketCapUSD: number | null }>
@@ -729,25 +807,31 @@ async function executeBuy(
   try {
     let sig: string | null = null;
 
-    // 1. Primary: PumpPortal-built transaction — correct current Pump.fun
-    // layout, works on seconds-old tokens, one HTTP round trip.
-    const rawTx = await buildPumpPortalTx("buy", mint, BUY_AMOUNT / 1e9, true);
+    // 1. Primary: local official Pump SDK build. No external builder latency.
+    let rawTx = await buildLocalPumpBuyTx(mint);
     if (rawTx) {
       sig = await sendRawTransactionDual(rawTx);
-      if (sig) console.log("🚀 BUY submitted (PumpPortal-built):", mint, sig);
+      if (sig) {
+        console.log("🚀 BUY submitted (local Pump.fun):", mint, sig);
+      }
     }
 
-    // 2. Fallback to Jupiter if the build service is unavailable
+    // 2. Compatibility fallback for a route the local SDK cannot build.
     if (!sig) {
-      console.log("↪️ PumpPortal build unavailable — trying Jupiter for", mint);
-      const quote = await getQuote(SOL_MINT, mint, BUY_AMOUNT);
-      if (quote && passesFilters(quote)) {
-        const tx = await buildSwapTx(quote);
-        if (tx) {
-          sig = await sendSwapDual(tx);
-          if (sig) console.log("🚀 BUY submitted (Jupiter):", mint, sig);
+      console.log("↪️ Local Pump.fun build unavailable — trying PumpPortal for", mint);
+      rawTx = await buildPumpPortalTx("buy", mint, BUY_AMOUNT / 1e9, true);
+      if (rawTx) {
+        sig = await sendRawTransactionDual(rawTx);
+        if (sig) {
+          console.log("🚀 BUY submitted (PumpPortal-built):", mint, sig);
         }
       }
+    }
+
+    // 3. Last fallback for migrated or unsupported routes.
+    if (!sig) {
+      console.log("↪️ Pump.fun build unavailable — trying Jupiter for", mint);
+      sig = await submitJupiterBuy(mint);
     }
 
     if (!sig) {
@@ -757,16 +841,32 @@ async function executeBuy(
 
     const myMcPromise = fetchPriceAndMarketCap(mint);
     const targetMcPromise = targetSnapshotPromise ?? Promise.resolve({ tokenPriceUSD: null, marketCapUSD: null });
-    const confirmationPromise = waitForConfirmation(sig);
-    const actual = await waitForBalance(mint);
-    const confirmation = await confirmationPromise;
+    let confirmationPromise = waitForConfirmation(sig);
+    let actual = await waitForBalance(mint);
+    let confirmation = await confirmationPromise;
 
     if (confirmation === "failed") {
-      await sendTelegramAlert(
-        `❌ <b>BUY FAILED ON-CHAIN</b>\nMint: <code>${mint}</code>\n` +
-        `<a href="https://solscan.io/tx/${sig}">View transaction</a>`
-      );
-      return;
+      console.log("↪️ Primary buy failed on-chain — trying Jupiter fallback for", mint);
+      const failedPrimarySig = sig;
+      sig = await submitJupiterBuy(mint);
+      if (!sig) {
+        await sendTelegramAlert(
+          `❌ <b>BUY FAILED ON-CHAIN</b>\nMint: <code>${mint}</code>\n` +
+          `Primary transaction failed; Jupiter fallback was unavailable.\n` +
+          `<a href="https://solscan.io/tx/${failedPrimarySig}">View failed transaction</a>`
+        );
+        return;
+      }
+      confirmationPromise = waitForConfirmation(sig);
+      actual = await waitForBalance(mint);
+      confirmation = await confirmationPromise;
+      if (confirmation === "failed") {
+        await sendTelegramAlert(
+          `❌ <b>BUY FAILED ON-CHAIN</b>\nMint: <code>${mint}</code>\n` +
+          `<a href="https://solscan.io/tx/${sig}">View transaction</a>`
+        );
+        return;
+      }
     }
     if (actual <= 0) {
       const state = confirmation === "confirmed" ? "confirmed transaction, but no token balance" : "transaction still pending and no token balance";
