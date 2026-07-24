@@ -60,7 +60,8 @@ const TARGET_WALLET = new PublicKey(requireEnv("TARGET_WALLET"));
 const BUY_AMOUNT_SOL = Number(process.env.BUY_AMOUNT_SOL);
 const BUY_AMOUNT = BUY_AMOUNT_SOL * 1e9;
 const BASE_PRIORITY_FEE = Number(process.env.PRIORITY_FEE_LAMPORTS ?? 500_000);
-const SLIPPAGE_BPS = Number(process.env.SLIPPAGE_BPS ?? 1500);
+const SLIPPAGE_BPS = Number(process.env.SLIPPAGE_BPS ?? 3000);
+const RETRY_SLIPPAGE_BPS = Number(process.env.RETRY_SLIPPAGE_BPS ?? 5000);
 const MIN_BUY_SOL = Number(process.env.MIN_BUY_SOL ?? 0.01) * 1e9;
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS ?? 5000);
 
@@ -240,6 +241,10 @@ function logFeeSizingWarning() {
     `💸 Fee sizing: Jito tip + priority fee ≈ ${(totalFeeLamports / 1e9).toFixed(4)} SOL ` +
     `(~${pctOfBuy.toFixed(1)}% of ${(BUY_AMOUNT / 1e9).toFixed(4)} SOL buy)`
   );
+  console.log(
+    `🎯 Effective slippage: ${(SLIPPAGE_BPS / 100).toFixed(0)}% (retry ${(RETRY_SLIPPAGE_BPS / 100).toFixed(0)}%) — ` +
+    `if this is not 30/50, a SLIPPAGE_BPS env var on Render is overriding the code`
+  );
 }
 
 /* ================= NETWORK ================= */
@@ -337,7 +342,16 @@ async function fetchPriceAndMarketCap(mint: string): Promise<{
 
 function fmtMC(mc: number | null): string {
   if (mc === null) return "unknown";
-  return mc >= 1000 ? `$${(mc / 1000).toFixed(1)}K` : `$${mc.toFixed(0)}`;
+  return mc >= 1000 ? `${(mc / 1000).toFixed(1)}K` : `${mc.toFixed(0)}`;
+}
+
+// On a seconds-old mint the supply/price lookups ALWAYS fail ("could not
+// find account") and just burn rate-limit budget at the worst moment.
+// Delay them off the hot buy window — the alert only needs them later.
+function delayedMarketCapSnapshot(mint: string, delayMs = 2500) {
+  return new Promise<{ tokenPriceUSD: number | null; marketCapUSD: number | null }>((resolve) => {
+    setTimeout(() => resolve(fetchPriceAndMarketCap(mint)), delayMs);
+  });
 }
 
 /* ================= PERSISTENCE (Upstash Redis) ================= */
@@ -595,7 +609,7 @@ async function sendRawTransactionDual(rawTx: Uint8Array): Promise<string | null>
 /* ================= PUMPPORTAL-BUILT TRANSACTIONS ================= */
 // Build direct Pump.fun buys locally from the official SDK. This avoids the
 // PumpPortal HTTP hop and uses the current bonding-curve accounts for the mint.
-async function buildLocalPumpBuyTx(mint: string): Promise<Uint8Array | null> {
+async function buildLocalPumpBuyTx(mint: string, slippageBps = SLIPPAGE_BPS): Promise<Uint8Array | null> {
   try {
     const mintKey = new PublicKey(mint);
     const [mintInfo, global, latest] = await Promise.all([
@@ -632,7 +646,7 @@ async function buildLocalPumpBuyTx(mint: string): Promise<Uint8Array | null> {
       user: wallet.publicKey,
       amount: tokenAmount,
       solAmount,
-      slippage: SLIPPAGE_BPS / 100,
+      slippage: slippageBps / 100,
       tokenProgram,
     });
     const priorityMicroLamports = Math.ceil((BASE_PRIORITY_FEE * 1_000_000) / LOCAL_PUMP_COMPUTE_UNITS);
@@ -666,7 +680,9 @@ async function buildPumpPortalTx(
   action: "buy" | "sell",
   mint: string,
   amount: number | string,
-  denominatedInSol: boolean
+  denominatedInSol: boolean,
+  slippageBps = SLIPPAGE_BPS,
+  pool: "pump" | "auto" = "auto"
 ): Promise<Uint8Array | null> {
   try {
     const res: any = await fetch("https://pumpportal.fun/api/trade-local", {
@@ -679,9 +695,9 @@ async function buildPumpPortalTx(
         mint,
         amount,
         denominatedInSol: denominatedInSol ? "true" : "false",
-        slippage: SLIPPAGE_BPS / 100,
+        slippage: slippageBps / 100,
         priorityFee: BASE_PRIORITY_FEE / 1e9,
-        pool: "auto",
+        pool,
       }),
     });
     if (!res.ok) {
@@ -700,22 +716,18 @@ async function buildPumpPortalTx(
 }
 /* ================= BALANCE ================= */
 
+let tokenBalanceRpcFlip = 0;
+
 async function getTokenBalance(mint: string): Promise<number> {
   try {
     const tokenMint = new PublicKey(mint);
-    const results = await Promise.allSettled(
-      [connection, broadcastConnection].map((conn) =>
-        conn.getParsedTokenAccountsByOwner(wallet.publicKey, { mint: tokenMint })
-      )
+    const rpcs = [connection, broadcastConnection];
+    const conn = rpcs[tokenBalanceRpcFlip++ % rpcs.length]!;
+    const res = await conn.getParsedTokenAccountsByOwner(wallet.publicKey, { mint: tokenMint });
+    return res.value.reduce(
+      (sum: number, account: any) => sum + Number(account.account?.data?.parsed?.info?.tokenAmount?.amount ?? 0),
+      0
     );
-    return results.reduce((highest, result) => {
-      if (result.status !== "fulfilled") return highest;
-      const balance = result.value.value.reduce(
-        (sum, account: any) => sum + Number(account.account?.data?.parsed?.info?.tokenAmount?.amount ?? 0),
-        0
-      );
-      return Math.max(highest, balance);
-    }, 0);
   } catch {
     return 0;
   }
@@ -723,23 +735,23 @@ async function getTokenBalance(mint: string): Promise<number> {
 
 type SignatureCheck = "confirmed" | "failed" | "pending";
 
-async function waitForConfirmation(signature: string, attempts = 20, delayMs = 400): Promise<SignatureCheck> {
+async function waitForConfirmation(signature: string, attempts = 20, delayMs = 500): Promise<SignatureCheck> {
+  // One RPC per attempt (alternating). Hammering both providers at once
+  // was a major source of the 429 storms that degraded the hot path.
+  const rpcs = [connection, broadcastConnection];
   for (let i = 0; i < attempts; i++) {
-    const checks = await Promise.allSettled(
-      [connection, broadcastConnection].map((conn) =>
-        conn.getSignatureStatuses([signature], { searchTransactionHistory: true })
-      )
-    );
-    for (const check of checks) {
-      if (check.status !== "fulfilled") continue;
-      const status = check.value.value[0];
-      if (!status) continue;
-      if (status.err) {
-        console.log("❌ Buy transaction failed on-chain:", signature, JSON.stringify(status.err));
-        return "failed";
+    try {
+      const conn = rpcs[i % rpcs.length]!;
+      const check = await conn.getSignatureStatuses([signature], { searchTransactionHistory: true });
+      const status = check.value[0];
+      if (status) {
+        if (status.err) {
+          console.log("❌ Buy transaction failed on-chain:", signature, JSON.stringify(status.err));
+          return "failed";
+        }
+        if (status.confirmationStatus === "confirmed" || status.confirmationStatus === "finalized") return "confirmed";
       }
-      if (status.confirmationStatus === "confirmed" || status.confirmationStatus === "finalized") return "confirmed";
-    }
+    } catch {}
     if (i < attempts - 1) await new Promise((r) => setTimeout(r, delayMs));
   }
   return "pending";
@@ -807,8 +819,17 @@ async function executeBuy(
   try {
     let sig: string | null = null;
 
-    // 1. Primary: local official Pump SDK build. No external builder latency.
+    // 1. Primary: local official Pump SDK build. No external builder
+    // latency, and the curve accounts are DERIVED from the mint — immune
+    // by construction to the mint/bonding-curve mismatch (error 6004) a
+    // stale external builder can produce on a seconds-old token. When the
+    // curve state is one slot behind ("zero tokens"), one quick second
+    // look usually succeeds.
     let rawTx = await buildLocalPumpBuyTx(mint);
+    if (!rawTx) {
+      await new Promise((r) => setTimeout(r, 300));
+      rawTx = await buildLocalPumpBuyTx(mint);
+    }
     if (rawTx) {
       sig = await sendRawTransactionDual(rawTx);
       if (sig) {
@@ -816,10 +837,13 @@ async function executeBuy(
       }
     }
 
-    // 2. Compatibility fallback for a route the local SDK cannot build.
+    // 2. Compatibility fallback. Ask for the bonding-curve pool EXPLICITLY
+    // first: "auto" makes the builder race its own index on brand-new
+    // tokens — that race is what produced the 6004 rejection.
     if (!sig) {
       console.log("↪️ Local Pump.fun build unavailable — trying PumpPortal for", mint);
-      rawTx = await buildPumpPortalTx("buy", mint, BUY_AMOUNT / 1e9, true);
+      rawTx = await buildPumpPortalTx("buy", mint, BUY_AMOUNT / 1e9, true, SLIPPAGE_BPS, "pump");
+      if (!rawTx) rawTx = await buildPumpPortalTx("buy", mint, BUY_AMOUNT / 1e9, true, SLIPPAGE_BPS, "auto");
       if (rawTx) {
         sig = await sendRawTransactionDual(rawTx);
         if (sig) {
@@ -839,20 +863,34 @@ async function executeBuy(
       return;
     }
 
-    const myMcPromise = fetchPriceAndMarketCap(mint);
+    const myMcPromise = delayedMarketCapSnapshot(mint, 2000);
     const targetMcPromise = targetSnapshotPromise ?? Promise.resolve({ tokenPriceUSD: null, marketCapUSD: null });
     let confirmationPromise = waitForConfirmation(sig);
     let actual = await waitForBalance(mint);
     let confirmation = await confirmationPromise;
 
     if (confirmation === "failed") {
-      console.log("↪️ Primary buy failed on-chain — trying Jupiter fallback for", mint);
+      // Rebuild ONCE with completely fresh state at higher slippage. Local
+      // SDK first (derived accounts, current price), then PumpPortal.
+      // Jupiter last — it usually cannot even quote a seconds-old token.
+      console.log(`↪️ Buy failed on-chain — rebuilding fresh at ${RETRY_SLIPPAGE_BPS / 100}% slippage:`, mint);
       const failedPrimarySig = sig;
-      sig = await submitJupiterBuy(mint);
+      sig = null;
+      let retryTx = await buildLocalPumpBuyTx(mint, RETRY_SLIPPAGE_BPS);
+      if (!retryTx) retryTx = await buildPumpPortalTx("buy", mint, BUY_AMOUNT / 1e9, true, RETRY_SLIPPAGE_BPS, "pump");
+      if (!retryTx) retryTx = await buildPumpPortalTx("buy", mint, BUY_AMOUNT / 1e9, true, RETRY_SLIPPAGE_BPS, "auto");
+      if (retryTx) {
+        sig = await sendRawTransactionDual(retryTx);
+        if (sig) console.log("🚀 BUY retry submitted (fresh build, higher slippage):", mint, sig);
+      }
+      if (!sig) {
+        console.log("↪️ Rebuild unavailable — trying Jupiter for", mint);
+        sig = await submitJupiterBuy(mint);
+      }
       if (!sig) {
         await sendTelegramAlert(
           `❌ <b>BUY FAILED ON-CHAIN</b>\nMint: <code>${mint}</code>\n` +
-          `Primary transaction failed; Jupiter fallback was unavailable.\n` +
+          `Primary tx failed; rebuild and Jupiter fallback were unavailable.\n` +
           `<a href="https://solscan.io/tx/${failedPrimarySig}">View failed transaction</a>`
         );
         return;
@@ -863,6 +901,7 @@ async function executeBuy(
       if (confirmation === "failed") {
         await sendTelegramAlert(
           `❌ <b>BUY FAILED ON-CHAIN</b>\nMint: <code>${mint}</code>\n` +
+          `Retry also failed — the exact program error is in the Render logs.\n` +
           `<a href="https://solscan.io/tx/${sig}">View transaction</a>`
         );
         return;
@@ -1068,17 +1107,12 @@ async function getTransactionWithRetry(signature: string, attempts = 8, delayMs 
   const rpcs = [connection, broadcastConnection];
   for (let i = 0; i < attempts; i++) {
     try {
-      const tx = await Promise.any(
-        rpcs.map(async (conn) => {
-          const result = await conn.getTransaction(signature, {
-            commitment: "confirmed",
-            maxSupportedTransactionVersion: 0,
-          });
-          if (!result?.meta) throw new Error("transaction not available yet");
-          return result;
-        })
-      );
-      return tx;
+      const conn = rpcs[i % rpcs.length]!;
+      const result = await conn.getTransaction(signature, {
+        commitment: "confirmed",
+        maxSupportedTransactionVersion: 0,
+      });
+      if (result?.meta) return result;
     } catch {}
     if (i < attempts - 1) await new Promise((r) => setTimeout(r, delayMs));
   }
@@ -1154,7 +1188,7 @@ async function handleTxInternal(tx: any, signature: string): Promise<boolean> {
       if (postAmount > preAmount) {
         foundAny = true;
         console.log("🔥 DETECTED buy:", post.mint);
-        executeBuy(post.mint, fetchPriceAndMarketCap(post.mint));
+        executeBuy(post.mint, delayedMarketCapSnapshot(post.mint));
         return true;
       }
     }
@@ -1177,7 +1211,7 @@ async function handleTx(signature: string) {
     // The log arrives at `processed`; transaction metadata usually becomes
     // readable shortly afterward. Poll both free RPCs at 250 ms so we catch
     // the first available response instead of waiting a full half-second.
-    const tx = await getTransactionWithRetry(signature, 16, 250);
+    const tx = await getTransactionWithRetry(signature, 12, 350);
     if (!tx?.meta) {
       console.log("❌ Could not fetch tx for", signature, "— queueing for retry");
       queueForRetry(signature);
@@ -1206,7 +1240,7 @@ function onWalletLog(log: Logs) {
   if (isTargetTrade && fast.isBuy && fast.solAmount >= MIN_BUY_SOL) {
     console.log(`⚡ IDL FAST-PATH BUY: ${fast.mint}`);
     seenSignatures.add(signature);
-    executeBuy(fast.mint, fetchPriceAndMarketCap(fast.mint));
+    executeBuy(fast.mint, delayedMarketCapSnapshot(fast.mint));
     return;
   }
   if (isTargetTrade && !fast.isBuy) {
@@ -1342,7 +1376,7 @@ async function startPumpPortal() {
 
         console.log("⚡ PUMPPORTAL detected buy:", msg.mint);
         seenSignatures.add(msg.signature);
-        executeBuy(msg.mint, fetchPriceAndMarketCap(msg.mint));
+        executeBuy(msg.mint, delayedMarketCapSnapshot(msg.mint));
       } catch {
         // non-JSON frame, ignore
       }
@@ -1444,8 +1478,8 @@ async function start() {
 
   console.log("✅ Bot fully running (rotating WS + PumpPortal + polling + PumpPortal-built buys)");
   await sendTelegramAlert(
-    `🟢 <b>V23 Engine Online</b>\nTarget: <code>${TARGET_WALLET.toString()}</code>\n` +
-    `Buy path: PumpPortal-built tx first, Jupiter fallback\n` +
+    `🟢 <b>V25 Engine Online</b>\nTarget: <code>${TARGET_WALLET.toString()}</code>\n` +
+    `Buy path: local Pump SDK → PumpPortal (pump pool) → Jupiter\n` +
     `Exit: TARGET-EXIT mirror + TP 700/1100/1500% + time net 15/25/40s\n` +
     `Channels: ${DETECTION_URLS.length} rotating WS + ${PUMPPORTAL_ENABLED ? "PumpPortal" : "no PumpPortal"} + polling\n` +
     `Commands: /pause /resume /status`
