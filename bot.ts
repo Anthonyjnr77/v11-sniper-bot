@@ -154,7 +154,9 @@ async function initPumpDecoder() {
   }
 }
 
-function tryFastDecode(logs: string[]): { mint: string; isBuy: boolean; solAmount: number; user: string } | null {
+type PumpTradeEvent = { mint: string; isBuy: boolean; solAmount: number; user: string };
+
+function tryFastDecode(logs: string[]): PumpTradeEvent | null {
   if (!pumpEventCoder) return null;
   for (const log of logs) {
     if (!log.startsWith("Program data: ")) continue;
@@ -164,7 +166,7 @@ function tryFastDecode(logs: string[]): { mint: string; isBuy: boolean; solAmoun
         const d: any = decoded.data;
         const mint = d.mint?.toString();
         const user = d.user?.toString();
-        if (!mint || !user) return null;
+        if (!mint || !user) continue;
         return {
           mint,
           isBuy: Boolean(d.isBuy),
@@ -957,13 +959,18 @@ function getResolvedAccountKeys(tx: any): PublicKey[] {
 async function getTransactionWithRetry(signature: string, attempts = 8, delayMs = 500) {
   const rpcs = [connection, broadcastConnection];
   for (let i = 0; i < attempts; i++) {
-    const conn = rpcs[i % rpcs.length]!;
     try {
-      const tx = await conn.getTransaction(signature, {
-        commitment: "confirmed",
-        maxSupportedTransactionVersion: 0,
-      });
-      if (tx?.meta) return tx;
+      const tx = await Promise.any(
+        rpcs.map(async (conn) => {
+          const result = await conn.getTransaction(signature, {
+            commitment: "confirmed",
+            maxSupportedTransactionVersion: 0,
+          });
+          if (!result?.meta) throw new Error("transaction not available yet");
+          return result;
+        })
+      );
+      return tx;
     } catch {}
     if (i < attempts - 1) await new Promise((r) => setTimeout(r, delayMs));
   }
@@ -1081,13 +1088,17 @@ function onWalletLog(log: Logs) {
   console.log(`👀 Activity: https://solscan.io/tx/${signature}`);
 
   const fast = tryFastDecode(log.logs);
-  if (fast && fast.user === TARGET_WALLET.toString() && fast.isBuy && fast.solAmount >= MIN_BUY_SOL) {
+  const isTargetTrade = fast && (() => {
+    try { return new PublicKey(fast.user).equals(TARGET_WALLET); } catch { return false; }
+  })();
+
+  if (isTargetTrade && fast.isBuy && fast.solAmount >= MIN_BUY_SOL) {
     console.log(`⚡ IDL FAST-PATH BUY: ${fast.mint}`);
     seenSignatures.add(signature);
     executeBuy(fast.mint, fetchPriceAndMarketCap(fast.mint));
     return;
   }
-  if (fast && fast.user === TARGET_WALLET.toString() && !fast.isBuy) {
+  if (isTargetTrade && !fast.isBuy) {
     const held = positions.get(fast.mint);
     if (held && held.remainingAmount > 0) {
       console.log("🚨 Fast-path: target SOLD a token we hold — dumping:", fast.mint);
@@ -1097,7 +1108,13 @@ function onWalletLog(log: Logs) {
     }
   }
 
-  console.log("↪️ No fast-path match — falling back to getTransaction");
+  if (fast && !isTargetTrade) {
+    console.log("↪️ Pump.fun trade event belongs to another wallet — racing RPC transaction fetch");
+  } else if (fast && fast.isBuy && fast.solAmount < MIN_BUY_SOL) {
+    console.log("↪️ Pump.fun buy is below MIN_BUY_SOL — racing RPC transaction fetch");
+  } else {
+    console.log("↪️ No direct Pump.fun TradeEvent — racing RPC transaction fetch");
+  }
   handleTx(signature);
 }
 
