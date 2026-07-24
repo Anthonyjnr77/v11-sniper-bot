@@ -54,9 +54,8 @@ const TARGET_WALLET = new PublicKey(requireEnv("TARGET_WALLET"));
 
 const BUY_AMOUNT_SOL = Number(process.env.BUY_AMOUNT_SOL);
 const BUY_AMOUNT = BUY_AMOUNT_SOL * 1e9;
-const BASE_PRIORITY_FEE = Number(process.env.PRIORITY_FEE_LAMPORTS ?? 750_000);
-const SLIPPAGE_BPS = Number(process.env.SLIPPAGE_BPS ?? 4000);
-const RETRY_SLIPPAGE_BPS = Number(process.env.RETRY_SLIPPAGE_BPS ?? 5000);
+const BASE_PRIORITY_FEE = Number(process.env.PRIORITY_FEE_LAMPORTS ?? 500_000);
+const SLIPPAGE_BPS = Number(process.env.SLIPPAGE_BPS ?? 1500);
 const MIN_BUY_SOL = Number(process.env.MIN_BUY_SOL ?? 0.01) * 1e9;
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS ?? 5000);
 
@@ -71,13 +70,10 @@ const SOL_MINT = "So11111111111111111111111111111111111111112";
 const JUP_BASE = "https://api.jup.ag/swap/v1";
 const JUP_API_KEY = process.env.JUP_API_KEY;
 
-// Full exit at +300%: target dumps ~45-50k MC; from our ~11-14k post-impact
-// entry that is ~4x price (= +300% PnL). Selling 100% here means selling into
-// good liquidity BEFORE his 20 SOL exit crushes the curve. TARGET_EXITED
-// (which also catches transfers out via balance-decrease detection) and the
-// time-based tiers remain as safety nets for trades that never get there.
 const TP_TIERS = [
-  { tp: 3.0, sellFraction: 1.0 },
+  { tp: 7.0, sellFraction: 0.5 },
+  { tp: 11.0, sellFraction: 0.3 },
+  { tp: 15.0, sellFraction: 0.2 },
 ];
 
 const TIME_BASED_TP = [
@@ -198,7 +194,7 @@ const JITO_TIP_ACCOUNTS: string[] = [
   "E2eSqe33tuhAHKTrwky5uEjaVqnb2T9ns6nHHUrN8588",
   "ARTtviJkLLt6cHGQDydfo1Wyk6M4VGZdKZ2ZhdnJL336",
 ];
-const JITO_TIP_LAMPORTS = Number(process.env.JITO_TIP_LAMPORTS ?? 1_000_000);
+const JITO_TIP_LAMPORTS = Number(process.env.JITO_TIP_LAMPORTS ?? 2_000_000);
 
 function randomTipAccount(): PublicKey {
   const idx = Math.floor(Math.random() * JITO_TIP_ACCOUNTS.length);
@@ -639,9 +635,7 @@ async function buildPumpPortalTx(
   action: "buy" | "sell",
   mint: string,
   amount: number | string,
-  denominatedInSol: boolean,
-  slippageBps: number = SLIPPAGE_BPS,
-  pool: string = "auto"
+  denominatedInSol: boolean
 ): Promise<Uint8Array | null> {
   try {
     const res: any = await fetch("https://pumpportal.fun/api/trade-local", {
@@ -654,9 +648,9 @@ async function buildPumpPortalTx(
         mint,
         amount,
         denominatedInSol: denominatedInSol ? "true" : "false",
-        slippage: slippageBps / 100,
+        slippage: SLIPPAGE_BPS / 100,
         priorityFee: BASE_PRIORITY_FEE / 1e9,
-        pool,
+        pool: "auto",
       }),
     });
     if (!res.ok) {
@@ -673,42 +667,6 @@ async function buildPumpPortalTx(
     return null;
   }
 }
-
-/* ================= TX CONFIRMATION ================= */
-// "Sent" is NOT "landed": sendRawTransaction with skipPreflight returns a
-// signature even if the tx later fails on-chain, and Jito returns a bundle ID
-// whether or not the bundle is included. Poll the real tx signature so
-// slippage failures on fresh bonding curves are detected and retried instead
-// of surfacing as vague balance warnings.
-
-function txSignatureFromRaw(rawTx: Uint8Array): string {
-  const tx = VersionedTransaction.deserialize(rawTx);
-  return bs58.encode(tx.signatures[0]!);
-}
-
-async function confirmTxOnChain(
-  signature: string,
-  timeoutMs = 8000
-): Promise<"landed" | "failed" | "unknown"> {
-  const started = Date.now();
-  while (Date.now() - started < timeoutMs) {
-    try {
-      const st = await connection.getSignatureStatuses([signature]);
-      const s = st?.value?.[0];
-      if (s) {
-        if (s.err) {
-          console.log("❌ Tx FAILED on-chain:", signature, JSON.stringify(s.err));
-          return "failed";
-        }
-        return "landed";
-      }
-    } catch {}
-    await new Promise((r) => setTimeout(r, 400));
-  }
-  console.log("⚠️ Tx not seen on-chain within timeout:", signature);
-  return "unknown";
-}
-
 /* ================= BALANCE ================= */
 
 async function getTokenBalance(mint: string): Promise<number> {
@@ -722,7 +680,7 @@ async function getTokenBalance(mint: string): Promise<number> {
   }
 }
 
-async function waitForBalance(mint: string, attempts = 10, delayMs = 1000): Promise<number> {
+async function waitForBalance(mint: string, attempts = 6, delayMs = 500): Promise<number> {
   for (let i = 0; i < attempts; i++) {
     const bal = await getTokenBalance(mint);
     if (bal > 0) return bal;
@@ -745,8 +703,10 @@ function passesFilters(quote: any) {
 }
 
 /* ================= BUY ================= */
-// PumpPortal-built tx first (bonding-curve pool, then auto), confirmed
-// on-chain, with one instant higher-slippage retry; Jupiter as fallback.
+// Direct Pump.fun is now tried FIRST — no Jupiter round trip for tokens still
+// on the bonding curve, which is every real trade from this target wallet.
+// Jupiter only runs as a fallback if the curve read fails or the token has
+// already migrated off the bonding curve.
 
 async function executeBuy(
   mint: string,
@@ -774,35 +734,10 @@ async function executeBuy(
 
     // 1. Primary: PumpPortal-built transaction — correct current Pump.fun
     // layout, works on seconds-old tokens, one HTTP round trip.
-    // Bonding-curve pool is tried FIRST (target buys at ~3k MC, pre-migration);
-    // if the token already migrated the build fails and we fall back to auto.
-    let rawTx = await buildPumpPortalTx("buy", mint, BUY_AMOUNT / 1e9, true, SLIPPAGE_BPS, "pump");
-    if (!rawTx) rawTx = await buildPumpPortalTx("buy", mint, BUY_AMOUNT / 1e9, true, SLIPPAGE_BPS, "auto");
+    const rawTx = await buildPumpPortalTx("buy", mint, BUY_AMOUNT / 1e9, true);
     if (rawTx) {
       sig = await sendRawTransactionDual(rawTx);
-      if (sig) {
-        console.log("🚀 BUY sent (PumpPortal-built):", mint, sig);
-        const status = await confirmTxOnChain(txSignatureFromRaw(rawTx));
-        if (status === "failed") {
-          // Most common on a fresh curve: slippage exceeded. Retry once
-          // immediately at higher slippage — every block matters at 3k MC.
-          console.log("⚠️ Buy failed on-chain (likely slippage) — instant retry at higher slippage:", mint);
-          sig = null;
-          rawTx = await buildPumpPortalTx("buy", mint, BUY_AMOUNT / 1e9, true, RETRY_SLIPPAGE_BPS, "pump");
-          if (!rawTx) rawTx = await buildPumpPortalTx("buy", mint, BUY_AMOUNT / 1e9, true, RETRY_SLIPPAGE_BPS, "auto");
-          if (rawTx) {
-            sig = await sendRawTransactionDual(rawTx);
-            if (sig) {
-              console.log("🚀 BUY retry sent (higher slippage):", mint, sig);
-              const retryStatus = await confirmTxOnChain(txSignatureFromRaw(rawTx));
-              if (retryStatus === "failed") {
-                console.log("❌ Buy retry also failed on-chain:", mint);
-                sig = null;
-              }
-            }
-          }
-        }
-      }
+      if (sig) console.log("🚀 BUY sent (PumpPortal-built):", mint, sig);
     }
 
     // 2. Fallback to Jupiter if the build service is unavailable
@@ -1092,15 +1027,6 @@ async function handleTxInternal(tx: any, signature: string): Promise<boolean> {
       }
     }
 
-    // Buy threshold: the target must have actually SPENT SOL in this tx.
-    // Without this check, dust buys and tokens transferred INTO the target
-    // wallet would be copied as real buys.
-    const solDelta = (tx.meta.preBalances?.[targetIdx] ?? 0) - (tx.meta.postBalances?.[targetIdx] ?? 0);
-    if (solDelta < MIN_BUY_SOL) {
-      console.log(`⏭️ SOL delta ${(solDelta / 1e9).toFixed(4)} below threshold — not a copyable buy`);
-      return true;
-    }
-
     const preBalances = tx.meta.preTokenBalances ?? [];
     const postBalances = tx.meta.postTokenBalances ?? [];
     let foundAny = false;
@@ -1155,27 +1081,20 @@ function onWalletLog(log: Logs) {
   console.log(`👀 Activity: https://solscan.io/tx/${signature}`);
 
   const fast = tryFastDecode(log.logs);
-  if (fast) {
-    // Fast-path is AUTHORITATIVE: a decoded TradeEvent is a definitive
-    // answer. Falling through to getTransaction on a decoded-but-rejected
-    // event silently bypassed the min-buy threshold via the fallback scan.
+  if (fast && fast.user === TARGET_WALLET.toString() && fast.isBuy && fast.solAmount >= MIN_BUY_SOL) {
+    console.log(`⚡ IDL FAST-PATH BUY: ${fast.mint}`);
     seenSignatures.add(signature);
-    if (fast.user !== TARGET_WALLET.toString()) return;
-    if (fast.isBuy) {
-      if (fast.solAmount < MIN_BUY_SOL) {
-        console.log(`⏭️ Fast-path: buy below threshold (${(fast.solAmount / 1e9).toFixed(4)} SOL) — ignoring`);
-        return;
-      }
-      console.log(`⚡ IDL FAST-PATH BUY: ${fast.mint}`);
-      executeBuy(fast.mint, fetchPriceAndMarketCap(fast.mint));
-      return;
-    }
+    executeBuy(fast.mint, fetchPriceAndMarketCap(fast.mint));
+    return;
+  }
+  if (fast && fast.user === TARGET_WALLET.toString() && !fast.isBuy) {
     const held = positions.get(fast.mint);
     if (held && held.remainingAmount > 0) {
       console.log("🚨 Fast-path: target SOLD a token we hold — dumping:", fast.mint);
+      seenSignatures.add(signature);
       executeSell(fast.mint, held.remainingAmount, "TARGET_EXITED");
+      return;
     }
-    return;
   }
 
   console.log("↪️ No fast-path match — falling back to getTransaction");
@@ -1397,9 +1316,9 @@ async function start() {
 
   console.log("✅ Bot fully running (rotating WS + PumpPortal + polling + PumpPortal-built buys)");
   await sendTelegramAlert(
-    `🟢 <b>V24 Engine Online</b>\nTarget: <code>${TARGET_WALLET.toString()}</code>\n` +
+    `🟢 <b>V23 Engine Online</b>\nTarget: <code>${TARGET_WALLET.toString()}</code>\n` +
     `Buy path: PumpPortal-built tx first, Jupiter fallback\n` +
-    `Exit: TARGET-EXIT mirror + full exit at +300% + time net 15/25/40s\n` +
+    `Exit: TARGET-EXIT mirror + TP 700/1100/1500% + time net 15/25/40s\n` +
     `Channels: ${DETECTION_URLS.length} rotating WS + ${PUMPPORTAL_ENABLED ? "PumpPortal" : "no PumpPortal"} + polling\n` +
     `Commands: /pause /resume /status`
   );
