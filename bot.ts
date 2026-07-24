@@ -528,100 +528,39 @@ function scheduleRebroadcasts(rawBytes: Uint8Array) {
   }, 500);
 }
 
+async function submitSignedTransaction(rawBytes: Uint8Array): Promise<string | null> {
+  const signed = VersionedTransaction.deserialize(rawBytes);
+  const signature = bs58.encode(signed.signatures[0]!);
+  const jitoAttempt = (async () => {
+    const blockhash = await getBlockhashFast();
+    const tipTx = new Transaction({ feePayer: wallet.publicKey, recentBlockhash: blockhash }).add(
+      SystemProgram.transfer({ fromPubkey: wallet.publicKey, toPubkey: randomTipAccount(), lamports: JITO_TIP_LAMPORTS })
+    );
+    tipTx.sign(wallet);
+    const res = await fetchJson(JITO_BLOCK_ENGINE_URL, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "sendBundle", params: [[bs58.encode(rawBytes), bs58.encode(tipTx.serialize())]] }),
+    });
+    if (!res?.result) throw new Error("Jito did not accept the bundle");
+    return "Jito";
+  })();
+  const rpcAttempt = connection.sendRawTransaction(rawBytes, { skipPreflight: true, maxRetries: 3 }).then(() => "RPC");
+  scheduleRebroadcasts(rawBytes);
+  try {
+    const via = await Promise.any([jitoAttempt, rpcAttempt]);
+    console.log(`📤 Transaction submitted via ${via}:`, signature);
+    return signature;
+  } catch { return null; }
+}
+
 async function sendSwapDual(txBase64: string): Promise<string | null> {
   const swapTx = VersionedTransaction.deserialize(Buffer.from(txBase64, "base64"));
   swapTx.sign([wallet]);
-  const rawBytes = swapTx.serialize();
-
-  const jitoAttempt = (async () => {
-    try {
-      const blockhash = await getBlockhashFast();
-      const tipTx = new Transaction({ feePayer: wallet.publicKey, recentBlockhash: blockhash }).add(
-        SystemProgram.transfer({
-          fromPubkey: wallet.publicKey,
-          toPubkey: randomTipAccount(),
-          lamports: JITO_TIP_LAMPORTS,
-        })
-      );
-      tipTx.sign(wallet);
-
-      const bundle = [bs58.encode(rawBytes), bs58.encode(tipTx.serialize())];
-      const res = await fetchJson(JITO_BLOCK_ENGINE_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "sendBundle", params: [bundle] }),
-      });
-      return res?.result ? `jito:${res.result}` : null;
-    } catch {
-      return null;
-    }
-  })();
-
-  const rpcAttempt = (async () => {
-    try {
-      const sig = await connection.sendRawTransaction(rawBytes, { skipPreflight: true, maxRetries: 3 });
-      return `rpc:${sig}`;
-    } catch {
-      return null;
-    }
-  })();
-
-  scheduleRebroadcasts(rawBytes);
-
-  const results = await Promise.allSettled([jitoAttempt, rpcAttempt]);
-  for (const r of results) {
-    if (r.status === "fulfilled" && r.value) {
-      console.log("✅ Landed via:", r.value);
-      return r.value;
-    }
-  }
-  return null;
+  return submitSignedTransaction(swapTx.serialize());
 }
 
 async function sendRawTransactionDual(rawTx: Uint8Array): Promise<string | null> {
-  const jitoAttempt = (async () => {
-    try {
-      const blockhash = await getBlockhashFast();
-      const tipTx = new Transaction({ feePayer: wallet.publicKey, recentBlockhash: blockhash }).add(
-        SystemProgram.transfer({
-          fromPubkey: wallet.publicKey,
-          toPubkey: randomTipAccount(),
-          lamports: JITO_TIP_LAMPORTS,
-        })
-      );
-      tipTx.sign(wallet);
-
-      const bundle = [bs58.encode(rawTx), bs58.encode(tipTx.serialize())];
-      const res = await fetchJson(JITO_BLOCK_ENGINE_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "sendBundle", params: [bundle] }),
-      });
-      return res?.result ? `jito:${res.result}` : null;
-    } catch {
-      return null;
-    }
-  })();
-
-  const rpcAttempt = (async () => {
-    try {
-      const sig = await connection.sendRawTransaction(rawTx, { skipPreflight: true, maxRetries: 3 });
-      return `rpc:${sig}`;
-    } catch {
-      return null;
-    }
-  })();
-
-  scheduleRebroadcasts(rawTx);
-
-  const results = await Promise.allSettled([jitoAttempt, rpcAttempt]);
-  for (const r of results) {
-    if (r.status === "fulfilled" && r.value) {
-      console.log("✅ Landed via:", r.value);
-      return r.value;
-    }
-  }
-  return null;
+  return submitSignedTransaction(rawTx);
 }
 
 /* ================= PUMPPORTAL-BUILT TRANSACTIONS ================= */
@@ -673,16 +612,50 @@ async function buildPumpPortalTx(
 
 async function getTokenBalance(mint: string): Promise<number> {
   try {
-    const accs = await connection.getParsedTokenAccountsByOwner(wallet.publicKey, {
-      mint: new PublicKey(mint),
-    });
-    return Number(accs.value[0]?.account?.data?.parsed?.info?.tokenAmount?.amount ?? 0);
+    const tokenMint = new PublicKey(mint);
+    const results = await Promise.allSettled(
+      [connection, broadcastConnection].map((conn) =>
+        conn.getParsedTokenAccountsByOwner(wallet.publicKey, { mint: tokenMint })
+      )
+    );
+    return results.reduce((highest, result) => {
+      if (result.status !== "fulfilled") return highest;
+      const balance = result.value.value.reduce(
+        (sum, account: any) => sum + Number(account.account?.data?.parsed?.info?.tokenAmount?.amount ?? 0),
+        0
+      );
+      return Math.max(highest, balance);
+    }, 0);
   } catch {
     return 0;
   }
 }
 
-async function waitForBalance(mint: string, attempts = 6, delayMs = 500): Promise<number> {
+type SignatureCheck = "confirmed" | "failed" | "pending";
+
+async function waitForConfirmation(signature: string, attempts = 20, delayMs = 400): Promise<SignatureCheck> {
+  for (let i = 0; i < attempts; i++) {
+    const checks = await Promise.allSettled(
+      [connection, broadcastConnection].map((conn) =>
+        conn.getSignatureStatuses([signature], { searchTransactionHistory: true })
+      )
+    );
+    for (const check of checks) {
+      if (check.status !== "fulfilled") continue;
+      const status = check.value.value[0];
+      if (!status) continue;
+      if (status.err) {
+        console.log("❌ Buy transaction failed on-chain:", signature, JSON.stringify(status.err));
+        return "failed";
+      }
+      if (status.confirmationStatus === "confirmed" || status.confirmationStatus === "finalized") return "confirmed";
+    }
+    if (i < attempts - 1) await new Promise((r) => setTimeout(r, delayMs));
+  }
+  return "pending";
+}
+
+async function waitForBalance(mint: string, attempts = 20, delayMs = 500): Promise<number> {
   for (let i = 0; i < attempts; i++) {
     const bal = await getTokenBalance(mint);
     if (bal > 0) return bal;
@@ -739,7 +712,7 @@ async function executeBuy(
     const rawTx = await buildPumpPortalTx("buy", mint, BUY_AMOUNT / 1e9, true);
     if (rawTx) {
       sig = await sendRawTransactionDual(rawTx);
-      if (sig) console.log("🚀 BUY sent (PumpPortal-built):", mint, sig);
+      if (sig) console.log("🚀 BUY submitted (PumpPortal-built):", mint, sig);
     }
 
     // 2. Fallback to Jupiter if the build service is unavailable
@@ -750,7 +723,7 @@ async function executeBuy(
         const tx = await buildSwapTx(quote);
         if (tx) {
           sig = await sendSwapDual(tx);
-          if (sig) console.log("🚀 BUY sent (Jupiter):", mint, sig);
+          if (sig) console.log("🚀 BUY submitted (Jupiter):", mint, sig);
         }
       }
     }
@@ -762,11 +735,24 @@ async function executeBuy(
 
     const myMcPromise = fetchPriceAndMarketCap(mint);
     const targetMcPromise = targetSnapshotPromise ?? Promise.resolve({ tokenPriceUSD: null, marketCapUSD: null });
-
+    const confirmationPromise = waitForConfirmation(sig);
     const actual = await waitForBalance(mint);
+    const confirmation = await confirmationPromise;
+
+    if (confirmation === "failed") {
+      await sendTelegramAlert(
+        `❌ <b>BUY FAILED ON-CHAIN</b>\nMint: <code>${mint}</code>\n` +
+        `<a href="https://solscan.io/tx/${sig}">View transaction</a>`
+      );
+      return;
+    }
     if (actual <= 0) {
-      console.log("⚠️ Could not confirm balance for", mint);
-      await sendTelegramAlert(`⚠️ <b>BALANCE WARNING</b>\nCould not confirm balance for <code>${mint}</code> after buy. Check manually.`);
+      const state = confirmation === "confirmed" ? "confirmed transaction, but no token balance" : "transaction still pending and no token balance";
+      console.log(`⚠️ Could not confirm ${state} for`, mint, sig);
+      await sendTelegramAlert(
+        `⚠️ <b>BALANCE WARNING</b>\n${state} for <code>${mint}</code>.\n` +
+        `<a href="https://solscan.io/tx/${sig}">View transaction</a>`
+      );
       return;
     }
 
@@ -786,7 +772,7 @@ async function executeBuy(
 
     await persistPositions();
 
-    const cleanSig = sig.split(":")[1] || sig;
+    const cleanSig = sig;
 
     await appendTradeJournal({
       mint,
@@ -853,7 +839,7 @@ async function executeSell(mint: string, amount: number, reason: string) {
   await persistPositions();
 
   const { marketCapUSD } = await fetchPriceAndMarketCap(mint);
-  const cleanSig = sig.split(":")[1] || sig;
+  const cleanSig = sig;
 
   await appendTradeJournal({
     mint,
