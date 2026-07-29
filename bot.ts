@@ -108,6 +108,44 @@ const SL_PCT = -0.35;
 const TRAIL_DRAWDOWN = -0.2;
 const MAX_HOLD_MS = 5 * 60 * 1000;
 
+/* ================= CIRCUIT BREAKER & DRY-RUN ================= */
+const CIRCUIT_BREAKER_MAX_LOSSES = Number(process.env.CIRCUIT_BREAKER_MAX_LOSSES ?? 3);
+const CIRCUIT_BREAKER_WINDOW_MS = Number(process.env.CIRCUIT_BREAKER_WINDOW_MS ?? 15 * 60 * 1000); // 15 min
+const CIRCUIT_BREAKER_COOLDOWN_MS = Number(process.env.CIRCUIT_BREAKER_COOLDOWN_MS ?? 30 * 60 * 1000); // 30 min
+let recentStopLosses: number[] = [];
+let circuitBreakerUntil = 0;
+
+function recordStopLoss() {
+  const now = Date.now();
+  recentStopLosses = recentStopLosses.filter(t => now - t < CIRCUIT_BREAKER_WINDOW_MS);
+  recentStopLosses.push(now);
+  if (recentStopLosses.length >= CIRCUIT_BREAKER_MAX_LOSSES) {
+    circuitBreakerUntil = now + CIRCUIT_BREAKER_COOLDOWN_MS;
+    console.log(`ðŸš« CIRCUIT BREAKER TRIGGERED â€” pausing new buys for ${CIRCUIT_BREAKER_COOLDOWN_MS / 60000} min (${recentStopLosses.length} stop-losses in window)`);
+    sendTelegramAlert(`ðŸš« <b>CIRCUIT BREAKER</b>\n${recentStopLosses.length} stop-losses in ${CIRCUIT_BREAKER_WINDOW_MS / 60000} min\nPausing buys for ${CIRCUIT_BREAKER_COOLDOWN_MS / 60000} min`);
+  }
+}
+
+function isCircuitBreakerActive(): boolean {
+  return Date.now() < circuitBreakerUntil;
+}
+
+function getCircuitBreakerRemainingMs(): number {
+  return Math.max(0, circuitBreakerUntil - Date.now());
+}
+
+const DRY_RUN = (process.env.DRY_RUN ?? "false") === "true";
+const DRY_RUN_LOG_INTERVAL_MS = Number(process.env.DRY_RUN_LOG_INTERVAL_MS ?? 60_000);
+let dryRunStats = { buys: 0, sells: 0, totalLatencyMs: 0, pnlSol: 0 };
+if (DRY_RUN) {
+  console.log("ðŸ§Œ DRY-RUN MODE ENABLED — no real transactions will be sent");
+  setInterval(() => {
+    if (dryRunStats.buys > 0) {
+      console.log(`ðŸŸ¢ DRY-RUN STATS: buys=${dryRunStats.buys}, avgLatency=${(dryRunStats.totalLatencyMs / dryRunStats.buys).toFixed(0)}ms, estPnL=${dryRunStats.pnlSol.toFixed(4)} SOL`);
+    }
+  }, DRY_RUN_LOG_INTERVAL_MS);
+}
+
 const PUMPFUN_PROGRAM = new PublicKey("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
 const pumpSdk = new OnlinePumpSdk(connection);
 const LOCAL_PUMP_COMPUTE_UNITS = 200_000;
@@ -138,6 +176,71 @@ const bondingCurveCache = new Map<string, CachedBondingCurve>();
 
 // Pump.fun global PDA (constant, never changes)
 const PUMPFUN_GLOBAL_PDA = new PublicKey("4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf");
+
+/* ================= PRE-BUILD CACHE (Top Pump Tokens) ================= */
+// Proactively fetch bonding curve data for top 500 Pump.fun tokens by volume
+// so local SDK build is instant when target wallet buys them.
+const PREBUILD_CACHE_TTL_MS = 10 * 60 * 1000; // 10 min
+const PREBUILD_MAX_TOKENS = 500;
+const prebuildCache = new Map<string, CachedBondingCurve>();
+
+async function refreshPrebuildCache() {
+  try {
+    // Fetch top tokens from Pump.fun API (graduated + high volume)
+    const res = await fetch("https://frontend-api.pump.fun/coins?offset=0&limit=500&sort=market_cap&include_nsfw=false", { agent });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const tokens = await res.json();
+    const mints = tokens.map((t: any) => t.mint).filter((m: string) => m);
+
+    console.log(`ðŸ§¨ Pre-building cache for ${mints.length} top Pump tokens...`);
+    let cached = 0;
+    for (const mint of mints) {
+      try {
+        const mintKey = new PublicKey(mint);
+        const bondingCurveAddress = bondingCurvePda(mintKey);
+        const [bcAccount, abcAccountPlaceholder, feeConfig] = await Promise.all([
+          pumpSdkConnection.getAccountInfo(bondingCurveAddress, "processed"),
+          pumpSdkConnection.getAccountInfo(new PublicKey("ASSOCIATED_BONDING_CURVE_PLACEHOLDER"), "processed"),
+          pumpSdkForBuild.fetchFeeConfig(),
+        ]);
+        // Note: Associated bonding curve needs to be derived from mint
+        const associatedBondingCurve = (
+          await PublicKey.findProgramAddress(
+            [Buffer.from("associated-bonding-curve"), mintKey.toBuffer()],
+            PUMPFUN_PROGRAM
+          )
+        )[0];
+        const abcAccount = await pumpSdkConnection.getAccountInfo(associatedBondingCurve, "processed");
+
+        if (bcAccount?.data && abcAccount?.data && feeConfig) {
+          const data = bcAccount.data;
+          if (data.length >= 48) {
+            prebuildCache.set(mint, {
+              bondingCurve: bondingCurveAddress,
+              associatedBondingCurve: associatedBondingCurve,
+              virtualQuoteReserves: new BN(data.subarray(8, 16).readBigUInt64LE(0).toString()),
+              virtualTokenReserves: new BN(data.subarray(16, 24).readBigUInt64LE(0).toString()),
+              realQuoteReserves: new BN(data.subarray(24, 32).readBigUInt64LE(0).toString()),
+              realTokenReserves: new BN(data.subarray(32, 40).readBigUInt64LE(0).toString()),
+              timestamp: Date.now(),
+            });
+            cached++;
+          }
+        }
+      } catch {
+        // Ignore individual token failures
+      }
+    }
+    console.log(`âœ… Pre-build cache ready: ${cached}/${mints.length} tokens`);
+  } catch (e: any) {
+    console.log("âš ï¸ Pre-build cache refresh failed:", e.message);
+  }
+}
+
+// Refresh pre-build cache every 10 minutes
+setInterval(refreshPrebuildCache, PREBUILD_CACHE_TTL_MS);
+// Initial fetch
+refreshPrebuildCache();
 
 /* ================= DEDICATED PUMP SDK RPC ================= */
 // Isolate SDK read traffic from detection/write traffic so free-tier Helius
@@ -302,7 +405,8 @@ function randomTipAccount(): PublicKey {
 }
 
 function logFeeSizingWarning() {
-  const totalFeeLamports = JITO_TIP_LAMPORTS + BASE_PRIORITY_FEE;
+  const currentPriorityFee = getDynamicPriorityFee();
+  const totalFeeLamports = JITO_TIP_LAMPORTS + currentPriorityFee;
   const pctOfBuy = (totalFeeLamports / BUY_AMOUNT) * 100;
   console.log(
     `ðŸ’¸ Fee sizing: Jito tip + priority fee â‰ˆ ${(totalFeeLamports / 1e9).toFixed(4)} SOL ` +
@@ -328,7 +432,8 @@ async function fetchJson(url: string, options: any = {}, retries = 2): Promise<a
 }
 
 function getPriorityFee() {
-  return Math.floor(BASE_PRIORITY_FEE * (1 + Math.random()));
+  // Use dynamic priority fee for Jupiter swaps
+  return getDynamicPriorityFee();
 }
 
 function jupHeaders(extra: Record<string, string> = {}) {
@@ -641,6 +746,61 @@ async function buildSwapTx(quoteResponse: any) {
 
 /* ================= DUAL-PATH SUBMISSION ================= */
 
+// Multi-RPC endpoints for parallel submission (first success wins)
+const SUBMISSION_RPCS = [
+  process.env.BUY_EXEC_RPC_URL,
+  process.env.RPC_URL,
+  "https://rpc.ankr.com/solana",
+  "https://solana-rpc.publicnode.com",
+  "https://api.mainnet-beta.solana.com",
+].filter((v): v is string => Boolean(v));
+
+const submissionConnections = SUBMISSION_RPCS.map(url =>
+  new Connection(url, { commitment: "processed", httpAgent: agent })
+);
+
+// Dynamic priority fee cache (refreshed every 15s)
+let dynamicPriorityFeeLamports = BASE_PRIORITY_FEE;
+let lastPriorityFeeUpdate = 0;
+const PRIORITY_FEE_TTL_MS = 15_000;
+
+async function refreshPriorityFee() {
+  try {
+    // Fetch recent prioritization fees from multiple RPCs, use 95th percentile
+    const fees = await Promise.allSettled(
+      submissionConnections.slice(0, 3).map(c => c.getRecentPrioritizationFees())
+    );
+    const allFees: number[] = [];
+    for (const f of fees) {
+      if (f.status === "fulfilled" && f.value) {
+        allFees.push(...f.value.map(x => x.prioritizationFee));
+      }
+    }
+    if (allFees.length === 0) return;
+    allFees.sort((a, b) => a - b);
+    const p95 = allFees[Math.floor(allFees.length * 0.95)] ?? BASE_PRIORITY_FEE;
+    // Add 20% buffer, cap at 5x base
+    dynamicPriorityFeeLamports = Math.min(Math.ceil(p95 * 1.2), BASE_PRIORITY_FEE * 5);
+    lastPriorityFeeUpdate = Date.now();
+    console.log(`âš™ï¸ Dynamic priority fee updated: ${dynamicPriorityFeeLamports} lamports (P95: ${p95})`);
+  } catch (e: any) {
+    console.log("âš ï¸ Priority fee refresh failed:", e.message);
+  }
+}
+
+// Refresh priority fee periodically
+setInterval(refreshPriorityFee, PRIORITY_FEE_TTL_MS);
+// Initial fetch
+refreshPriorityFee();
+
+function getDynamicPriorityFee(): number {
+  // Fall back to base if cache is stale
+  if (Date.now() - lastPriorityFeeUpdate > PRIORITY_FEE_TTL_MS * 2) {
+    return BASE_PRIORITY_FEE;
+  }
+  return dynamicPriorityFeeLamports;
+}
+
 function scheduleRebroadcasts(rawBytes: Uint8Array) {
   let sends = 0;
   const timer = setInterval(async () => {
@@ -664,14 +824,15 @@ async function submitSignedTransaction(rawBytes: Uint8Array, useJito = BUY_AMOUN
   const signed = VersionedTransaction.deserialize(rawBytes);
   const signature = bs58.encode(signed.signatures[0]!);
 
-  const rpcAttempt = (async () => {
-    // Use dedicated low-latency RPC for submission
-    await buyExecConnection.sendRawTransaction(rawBytes, { skipPreflight: true, maxRetries: 0 });
-    return "RPC";
-  })();
+  // Parallel multi-RPC submit: fire to all endpoints simultaneously, first success wins
+  const rpcAttempts = submissionConnections.map(conn =>
+    conn.sendRawTransaction(rawBytes, { skipPreflight: true, maxRetries: 0 })
+      .then(() => "RPC")
+      .catch(() => null)
+  );
 
   // Only use Jito for larger buys where MEV protection matters
-  let jitoAttempt: Promise<string>;
+  let jitoAttempt: Promise<string | null>;
   if (useJito) {
     jitoAttempt = (async () => {
       const blockhash = await getBlockhashFast();
@@ -687,16 +848,19 @@ async function submitSignedTransaction(rawBytes: Uint8Array, useJito = BUY_AMOUN
       return "Jito";
     })();
   } else {
-    jitoAttempt = Promise.reject(new Error("Jito skipped for small buy"));
+    jitoAttempt = Promise.resolve(null);
   }
 
   scheduleRebroadcasts(rawBytes);
   try {
-    const via = await Promise.any([jitoAttempt, rpcAttempt]);
+    // Race all RPC attempts + Jito, first non-null wins
+    const allAttempts = [...rpcAttempts, jitoAttempt];
+    const via = await Promise.race(allAttempts.filter(p => p !== null));
+    if (!via) throw new Error("All submission paths failed");
     console.log(`ðŸ“¤ Transaction submitted via ${via}:`, signature);
     return signature;
   } catch {
-    // If both fail, try RPC one more time with retries
+    // Final fallback: retry on dedicated RPC with retries
     try {
       await buyExecConnection.sendRawTransaction(rawBytes, { skipPreflight: true, maxRetries: 2 });
       console.log(`ðŸ“¤ Transaction submitted via RPC (retry):`, signature);
@@ -737,7 +901,14 @@ async function sendRawTransactionDual(rawTx: Uint8Array): Promise<string | null>
       if (cachedCurve && Date.now() - cachedCurve.timestamp < BONDING_CURVE_TTL_MS) {
         console.log("âš¡ Using cached bonding curve for", mint);
       } else {
-        cachedCurve = undefined;
+        // Fall back to pre-build cache for top tokens
+        const prebuilt = prebuildCache.get(mint);
+        if (prebuilt && Date.now() - prebuilt.timestamp < PREBUILD_CACHE_TTL_MS) {
+          console.log("ðŸ§¨ Using pre-built bonding curve for", mint);
+          cachedCurve = prebuilt;
+        } else {
+          cachedCurve = undefined;
+        }
       }
 
       const [buyState, mintState, feeConfig] = await Promise.all([
@@ -806,7 +977,8 @@ async function sendRawTransactionDual(rawTx: Uint8Array): Promise<string | null>
        slippage: slippageBps / 100,
        tokenProgram,
      });
-     const priorityMicroLamports = Math.ceil((BASE_PRIORITY_FEE * 1_000_000) / LOCAL_PUMP_COMPUTE_UNITS);
+     const dynamicFee = getDynamicPriorityFee();
+    const priorityMicroLamports = Math.ceil((dynamicFee * 1_000_000) / LOCAL_PUMP_COMPUTE_UNITS);
      const message = new TransactionMessage({
        payerKey: wallet.publicKey,
         recentBlockhash: latest.blockhash,
@@ -853,7 +1025,7 @@ async function buildPumpPortalTx(
         amount,
         denominatedInSol: denominatedInSol ? "true" : "false",
         slippage: slippageBps / 100,
-        priorityFee: BASE_PRIORITY_FEE / 1e9,
+        priorityFee: getDynamicPriorityFee() / 1e9,
         pool,
       }),
     });
@@ -968,14 +1140,21 @@ async function executeBuy(
     targetSnapshotPromise?: Promise<{ tokenPriceUSD: number | null; marketCapUSD: number | null }>
   ) {
     if (botPaused) {
-      console.log("⏸️ Buy skipped — bot is paused:", mint);
+      console.log("⏸ Buy skipped — bot is paused:", mint);
+      return;
+    }
+
+    // Circuit breaker check
+    if (isCircuitBreakerActive()) {
+      const remaining = getCircuitBreakerRemainingMs();
+      console.log(`🚫 Buy skipped — circuit breaker active (${(remaining / 1000).toFixed(0)}s remaining):`, mint);
       return;
     }
 
     const requiredLamports = BUY_AMOUNT + JITO_TIP_LAMPORTS + 3_000_000;
     if (lastKnownBalanceLamports !== null && lastKnownBalanceLamports < requiredLamports) {
       console.log(
-        `\⏸️ Buy skipped — wallet ${(lastKnownBalanceLamports / 1e9).toFixed(4)} SOL below required ~${(requiredLamports / 1e9).toFixed(4)} SOL:`,
+        `\⏸ Buy skipped — wallet ${(lastKnownBalanceLamports / 1e9).toFixed(4)} SOL below required ~${(requiredLamports / 1e9).toFixed(4)} SOL:`,
         mint
       );
       return;
@@ -984,39 +1163,52 @@ async function executeBuy(
     if (positions.has(mint) || inFlight.has(mint)) return;
     inFlight.add(mint);
 
+    const buyStartMs = Date.now();
+
     try {
       let sig: string | null = null;
 
-      // ===== PHASE 2: PARALLEL BUILDER RACE =====
-      // Fire all builders simultaneously; first valid signed tx wins.
-      // This eliminates the sequential wait that was adding 300-800ms latency.
-      async function buildAndSend(builderName: string, buildFn: () => Promise<Uint8Array | null>): Promise<string | null> {
-        try {
-          const tx = await buildFn();
-          if (tx) {
-            const s = await sendRawTransactionDual(tx);
-            if (s) {
-              console.log(`🚀 BUY submitted (${builderName}):`, mint, s);
-              return s;
+      if (DRY_RUN) {
+        // Simulate: log what we would do, track latency
+        const simulatedSig = `DRYRUN_${Date.now()}_${mint.slice(0, 6)}`;
+        console.log(`ðŸ§Œ [DRY-RUN] Would buy: ${mint} | builder race would fire now`);
+        sig = simulatedSig;
+        dryRunStats.buys++;
+        dryRunStats.totalLatencyMs += Date.now() - buyStartMs;
+        // Mock PnL estimation (random walk for demo)
+        dryRunStats.pnlSol += (Math.random() - 0.45) * 0.01;
+      } else {
+        // ===== PHASE 2: PARALLEL BUILDER RACE =====
+        // Fire all builders simultaneously; first valid signed tx wins.
+        // This eliminates the sequential wait that was adding 300-800ms latency.
+        async function buildAndSend(builderName: string, buildFn: () => Promise<Uint8Array | null>): Promise<string | null> {
+          try {
+            const tx = await buildFn();
+            if (tx) {
+              const s = await sendRawTransactionDual(tx);
+              if (s) {
+                console.log(`ðŸš€ BUY submitted (${builderName}):`, mint, s);
+                return s;
+              }
             }
+          } catch (e: any) {
+            console.log(`âš ï¸ ${builderName} build error:`, e.message);
           }
-        } catch (e: any) {
-          console.log(`⚠️ ${builderName} build error:`, e.message);
+          return null;
         }
-        return null;
-      }
 
-      const [sigPumpPortal, sigLocal, sigJupiter] = await Promise.allSettled([
-        buildAndSend("PumpPortal-trade-local", () => buildPumpPortalTx("buy", mint, BUY_AMOUNT / 1e9, true, SLIPPAGE_BPS, "pump")),
-        buildAndSend("local Pump SDK",     () => buildLocalPumpBuyTx(mint, SLIPPAGE_BPS)),
-        buildAndSend("Jupiter",            () => buildJupiterBuyTx(mint)),
-      ]);
+        const [sigPumpPortal, sigLocal, sigJupiter] = await Promise.allSettled([
+          buildAndSend("PumpPortal-trade-local", () => buildPumpPortalTx("buy", mint, BUY_AMOUNT / 1e9, true, SLIPPAGE_BPS, "pump")),
+          buildAndSend("local Pump SDK",     () => buildLocalPumpBuyTx(mint, SLIPPAGE_BPS)),
+          buildAndSend("Jupiter",            () => buildJupiterBuyTx(mint)),
+        ]);
 
-      sig = (sigPumpPortal.status === "fulfilled" ? sigPumpPortal.value : null) ?? (sigLocal.status === "fulfilled" ? sigLocal.value : null) ?? (sigJupiter.status === "fulfilled" ? sigJupiter.value : null) ?? null;
+        sig = (sigPumpPortal.status === "fulfilled" ? sigPumpPortal.value : null) ?? (sigLocal.status === "fulfilled" ? sigLocal.value : null) ?? (sigJupiter.status === "fulfilled" ? sigJupiter.value : null) ?? null;
 
-      if (!sig) {
-        console.log("❌ Buy aborted — all builders failed for", mint);
-        return;
+        if (!sig) {
+          console.log("âŒ Buy aborted — all builders failed for", mint);
+          return;
+        }
       }
 
       const myMcPromise = delayedMarketCapSnapshot(mint, 2000);
@@ -1194,6 +1386,7 @@ async function monitor() {
       const pnl = (value - pos.costBasisLamports) / pos.costBasisLamports;
 
       if (pnl <= SL_PCT) {
+        recordStopLoss();
         executeSell(mint, pos.remainingAmount, `SL ${(pnl * 100).toFixed(0)}%`);
         return;
       }
