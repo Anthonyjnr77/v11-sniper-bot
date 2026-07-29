@@ -1,4 +1,4 @@
-import "dotenv/config";
+﻿import "dotenv/config";
 import {
   Connection,
   Keypair,
@@ -11,8 +11,8 @@ import {
 } from "@solana/web3.js";
 import type { Logs } from "@solana/web3.js";
 import { Program, AnchorProvider, BorshEventCoder } from "@coral-xyz/anchor";
-import { getMint, TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID } from "@solana/spl-token";
-import { OnlinePumpSdk, PUMP_SDK, getBuyTokenAmountFromSolAmount } from "@pump-fun/pump-sdk";
+import { getMint, getAssociatedTokenAddress, TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID } from "@solana/spl-token";
+import { OnlinePumpSdk, PUMP_SDK, getBuyTokenAmountFromSolAmount, bondingCurvePda } from "@pump-fun/pump-sdk";
 import BN from "bn.js";
 import fetch from "node-fetch";
 import bs58 from "bs58";
@@ -29,7 +29,22 @@ function requireEnv(name: string): string {
 
 const RPC_URL = requireEnv("RPC_URL");
 
-const agent = new https.Agent({ keepAlive: true, maxSockets: 64 });
+// High-performance HTTP agent for all outbound requests (Jupiter, PumpPortal, Jito, etc.)
+const agent = new https.Agent({
+  keepAlive: true,
+  maxSockets: 256,                    // Increased from 64 for high-concurrency bursts
+  maxFreeSockets: 128,
+  timeout: 8000,                      // 8s total timeout
+  keepAliveMsecs: 1000,
+  scheduling: 'fifo' as any,
+});
+
+// Separate agent for PumpPortal trade-local (can burst independently)
+const pumpPortalAgent = new https.Agent({
+  keepAlive: true,
+  maxSockets: 64,
+  timeout: 6000,
+});
 
 function makeConnection(url: string): Connection {
   return new Connection(url, {
@@ -63,7 +78,7 @@ const BASE_PRIORITY_FEE = Number(process.env.PRIORITY_FEE_LAMPORTS ?? 500_000);
 const SLIPPAGE_BPS = Number(process.env.SLIPPAGE_BPS ?? 3000);
 const RETRY_SLIPPAGE_BPS = Number(process.env.RETRY_SLIPPAGE_BPS ?? 5000);
 const MIN_BUY_SOL = Number(process.env.MIN_BUY_SOL ?? 0.01) * 1e9;
-const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS ?? 5000);
+const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS ?? 2500);
 
 const MAX_PRICE_IMPACT = Number(process.env.MAX_PRICE_IMPACT ?? 0.15);
 const ONLY_DIRECT_ROUTES = (process.env.ONLY_DIRECT_ROUTES ?? "true") === "true";
@@ -96,6 +111,57 @@ const MAX_HOLD_MS = 5 * 60 * 1000;
 const PUMPFUN_PROGRAM = new PublicKey("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
 const pumpSdk = new OnlinePumpSdk(connection);
 const LOCAL_PUMP_COMPUTE_UNITS = 200_000;
+
+/* ================= PUMPPORTAL PRIMARY DETECTION ================= */
+// PumpPortal WS delivers pre-decoded trade data (mint, buy/sell, SOL amount)
+// for the target wallet with NO RPC round-trip. This is the FASTEST detection
+// channel (~100ms typical). Requires API key + linked wallet funded with >=0.02 SOL.
+// Bonding-curve data is NOT free despite docs implying otherwise -- confirmed via testing.
+
+/* ================= BONDING CURVE CACHE ================= */
+// Cache bonding curve state from PumpPortal detection to eliminate "zero tokens"
+// / 6004 errors on brand-new tokens. PumpPortal emits the bonding curve address
+// in its trade event, so we can pre-fetch & cache it before the buy fires.
+const BONDING_CURVE_TTL_MS = 5 * 60 * 1000; // 5 min
+
+interface CachedBondingCurve {
+  bondingCurve: PublicKey;
+  associatedBondingCurve: PublicKey;
+  virtualQuoteReserves: BN;
+  virtualTokenReserves: BN;
+  realQuoteReserves: BN;
+  realTokenReserves: BN;
+  timestamp: number;
+}
+
+const bondingCurveCache = new Map<string, CachedBondingCurve>();
+
+// Pump.fun global PDA (constant, never changes)
+const PUMPFUN_GLOBAL_PDA = new PublicKey("4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf");
+
+/* ================= DEDICATED PUMP SDK RPC ================= */
+// Isolate SDK read traffic from detection/write traffic so free-tier Helius
+// rate limits on detection WS don't starve the buy builder.
+const PUMP_SDK_RPC_URL = process.env.PUMP_SDK_RPC_URL ?? "https://rpc.ankr.com/solana";
+const pumpSdkConnection = new Connection(PUMP_SDK_RPC_URL, {
+  commitment: "processed",
+  wsEndpoint: PUMP_SDK_RPC_URL.replace("https", "wss"),
+  httpAgent: agent,
+});
+const pumpSdkForBuild = new OnlinePumpSdk(pumpSdkConnection);
+
+/* ================= DEDICATED BUY EXECUTION RPC ================= */
+// Low-latency RPC for transaction submission only (no WS)
+// Set BUY_EXEC_RPC_URL to a premium endpoint (Helius paid, Triton, QuickNode, etc.)
+// Falls back to main RPC if not set.
+const BUY_EXEC_RPC_URL = process.env.BUY_EXEC_RPC_URL ?? RPC_URL;
+const buyExecConnection = new Connection(BUY_EXEC_RPC_URL, {
+  commitment: "processed",
+  httpAgent: agent,
+  // Disable WS for this connection - we only need HTTP for sendRawTransaction
+  wsEndpoint: "" as any,
+});
+
 
 const originalLog = console.log;
 console.log = (...args: any[]) => {
@@ -134,13 +200,13 @@ async function sendTelegramAlert(message: string) {
 /* ================= CRASH ALERTS ================= */
 
 process.on("uncaughtException", async (err) => {
-  console.log("💥 UNCAUGHT EXCEPTION:", err.message);
-  await sendTelegramAlert(`💥 <b>BOT CRASHED</b>\n${err.message}\nRender should auto-restart it.`);
+  console.log("ðŸ’¥ UNCAUGHT EXCEPTION:", err.message);
+  await sendTelegramAlert(`ðŸ’¥ <b>BOT CRASHED</b>\n${err.message}\nRender should auto-restart it.`);
 });
 
 process.on("unhandledRejection", async (reason: any) => {
-  console.log("💥 UNHANDLED REJECTION:", reason);
-  await sendTelegramAlert(`💥 <b>BOT ERROR</b>\n${String(reason).slice(0, 200)}`);
+  console.log("ðŸ’¥ UNHANDLED REJECTION:", reason);
+  await sendTelegramAlert(`ðŸ’¥ <b>BOT ERROR</b>\n${String(reason).slice(0, 200)}`);
 });
 
 /* ================= PUMP.FUN FAST-PATH DECODER ================= */
@@ -157,13 +223,13 @@ async function initPumpDecoder() {
     const provider = new AnchorProvider(connection, {} as any, {});
     const idl = await Program.fetchIdl(PUMPFUN_PROGRAM, provider);
     if (!idl) {
-      console.log("⚠️ Could not fetch Pump.fun IDL — fast path disabled.");
+      console.log("âš ï¸ Could not fetch Pump.fun IDL â€” fast path disabled.");
       return;
     }
     pumpEventCoder = new BorshEventCoder(idl as any);
-    console.log("✅ Pump.fun fast-path decoder ready");
+    console.log("âœ… Pump.fun fast-path decoder ready");
   } catch (e: any) {
-    console.log("⚠️ Pump.fun decoder init failed:", e.message);
+    console.log("âš ï¸ Pump.fun decoder init failed:", e.message);
   }
 }
 
@@ -226,7 +292,8 @@ const JITO_TIP_ACCOUNTS: string[] = [
   "E2eSqe33tuhAHKTrwky5uEjaVqnb2T9ns6nHHUrN8588",
   "ARTtviJkLLt6cHGQDydfo1Wyk6M4VGZdKZ2ZhdnJL336",
 ];
-const JITO_TIP_LAMPORTS = Number(process.env.JITO_TIP_LAMPORTS ?? 2_000_000);
+const JITO_TIP_BPS = Number(process.env.JITO_TIP_BPS ?? 2000); // 20% of position
+const JITO_TIP_LAMPORTS = Math.floor(BUY_AMOUNT * JITO_TIP_BPS / 10000);
 
 function randomTipAccount(): PublicKey {
   const idx = Math.floor(Math.random() * JITO_TIP_ACCOUNTS.length);
@@ -238,11 +305,11 @@ function logFeeSizingWarning() {
   const totalFeeLamports = JITO_TIP_LAMPORTS + BASE_PRIORITY_FEE;
   const pctOfBuy = (totalFeeLamports / BUY_AMOUNT) * 100;
   console.log(
-    `💸 Fee sizing: Jito tip + priority fee ≈ ${(totalFeeLamports / 1e9).toFixed(4)} SOL ` +
+    `ðŸ’¸ Fee sizing: Jito tip + priority fee â‰ˆ ${(totalFeeLamports / 1e9).toFixed(4)} SOL ` +
     `(~${pctOfBuy.toFixed(1)}% of ${(BUY_AMOUNT / 1e9).toFixed(4)} SOL buy)`
   );
   console.log(
-    `🎯 Effective slippage: ${(SLIPPAGE_BPS / 100).toFixed(0)}% (retry ${(RETRY_SLIPPAGE_BPS / 100).toFixed(0)}%) — ` +
+    `ðŸŽ¯ Effective slippage: ${(SLIPPAGE_BPS / 100).toFixed(0)}% (retry ${(RETRY_SLIPPAGE_BPS / 100).toFixed(0)}%) â€” ` +
     `if this is not 30/50, a SLIPPAGE_BPS env var on Render is overriding the code`
   );
 }
@@ -273,9 +340,29 @@ function jupHeaders(extra: Record<string, string> = {}) {
 let cachedBlockhash: string | null = null;
 let cachedBlockhashAt = 0;
 
+// Background blockhash refresher - keeps cache warm without blocking hot path
+let blockhashRefreshInterval: NodeJS.Timeout | null = null;
+
+function startBlockhashRefresher() {
+  if (blockhashRefreshInterval) return;
+  // Refresh immediately on start
+  refreshBlockhash();
+  // Then every 10 seconds in background
+  blockhashRefreshInterval = setInterval(refreshBlockhash, 10_000);
+  console.log("âœ… Blockhash background refresher started (10s interval)");
+}
+
+function stopBlockhashRefresher() {
+  if (blockhashRefreshInterval) {
+    clearInterval(blockhashRefreshInterval);
+    blockhashRefreshInterval = null;
+  }
+}
+
 async function refreshBlockhash() {
   try {
-    const { blockhash } = await connection.getLatestBlockhash("processed");
+    // Use buyExecConnection for faster response
+    const { blockhash } = await buyExecConnection.getLatestBlockhash("processed");
     cachedBlockhash = blockhash;
     cachedBlockhashAt = Date.now();
   } catch {
@@ -284,10 +371,12 @@ async function refreshBlockhash() {
 }
 
 async function getBlockhashFast(): Promise<string> {
-  if (cachedBlockhash && Date.now() - cachedBlockhashAt < 40_000) return cachedBlockhash;
+  // Very short TTL since we refresh in background
+  if (cachedBlockhash && Date.now() - cachedBlockhashAt < 15_000) return cachedBlockhash;
+  // Fallback: synchronous refresh (should rarely hit this)
   await refreshBlockhash();
-  if (cachedBlockhash && Date.now() - cachedBlockhashAt < 40_000) return cachedBlockhash;
-  return (await connection.getLatestBlockhash("processed")).blockhash;
+  if (cachedBlockhash && Date.now() - cachedBlockhashAt < 15_000) return cachedBlockhash;
+  return (await buyExecConnection.getLatestBlockhash("processed")).blockhash;
 }
 
 /* ================= WALLET BALANCE CHECK ================= */
@@ -306,9 +395,9 @@ async function checkWalletBalance() {
       const now = Date.now();
       if (now - lastLowBalanceAlertAt > LOW_BALANCE_ALERT_COOLDOWN_MS) {
         lastLowBalanceAlertAt = now;
-        console.log(`⚠️ Wallet balance low: ${sol.toFixed(4)} SOL`);
+        console.log(`âš ï¸ Wallet balance low: ${sol.toFixed(4)} SOL`);
         await sendTelegramAlert(
-          `⚠️ <b>LOW WALLET BALANCE</b>\nCurrent: ${sol.toFixed(4)} SOL\nThreshold: ${MIN_WALLET_BALANCE_SOL} SOL`
+          `âš ï¸ <b>LOW WALLET BALANCE</b>\nCurrent: ${sol.toFixed(4)} SOL\nThreshold: ${MIN_WALLET_BALANCE_SOL} SOL`
         );
       }
     }
@@ -347,7 +436,7 @@ function fmtMC(mc: number | null): string {
 
 // On a seconds-old mint the supply/price lookups ALWAYS fail ("could not
 // find account") and just burn rate-limit budget at the worst moment.
-// Delay them off the hot buy window — the alert only needs them later.
+// Delay them off the hot buy window â€” the alert only needs them later.
 function delayedMarketCapSnapshot(mint: string, delayMs = 2500) {
   return new Promise<{ tokenPriceUSD: number | null; marketCapUSD: number | null }>((resolve) => {
     setTimeout(() => resolve(fetchPriceAndMarketCap(mint)), delayMs);
@@ -398,7 +487,7 @@ async function loadPositions() {
   if (raw) {
     const entries = JSON.parse(raw);
     for (const [mint, pos] of entries) positions.set(mint, pos);
-    console.log(`✅ Restored ${entries.length} position(s) from before restart`);
+    console.log(`âœ… Restored ${entries.length} position(s) from before restart`);
   }
 }
 
@@ -484,23 +573,23 @@ async function pollTelegramCommands() {
       const text = (msg.text ?? "").trim().toLowerCase();
       if (text === "/pause") {
         botPaused = true;
-        console.log("⏸️ Bot PAUSED via Telegram command");
-        await sendTelegramAlert("⏸️ <b>Bot paused.</b> No new buys will be taken. Existing positions still monitored/sold normally. Send /resume to continue.");
+        console.log("â¸ï¸ Bot PAUSED via Telegram command");
+        await sendTelegramAlert("â¸ï¸ <b>Bot paused.</b> No new buys will be taken. Existing positions still monitored/sold normally. Send /resume to continue.");
       } else if (text === "/resume") {
         botPaused = false;
-        console.log("▶️ Bot RESUMED via Telegram command");
-        await sendTelegramAlert("▶️ <b>Bot resumed.</b> New buys re-enabled.");
+        console.log("â–¶ï¸ Bot RESUMED via Telegram command");
+        await sendTelegramAlert("â–¶ï¸ <b>Bot resumed.</b> New buys re-enabled.");
       } else if (text === "/status") {
         const balanceStr = lastKnownBalanceLamports !== null
           ? `${(lastKnownBalanceLamports / 1e9).toFixed(4)} SOL`
           : "unknown";
         await sendTelegramAlert(
-          `📊 <b>Status</b>\n` +
+          `ðŸ“Š <b>Status</b>\n` +
           `Paused: ${botPaused ? "YES" : "no"}\n` +
           `Open positions: ${positions.size}\n` +
           `Wallet: ${balanceStr}\n` +
           `WS channels: ${DETECTION_URLS.length}\n` +
-          `PumpPortal: ${pumpPortalConnected ? "✅ connected" : "❌ NOT connected"}`
+          `PumpPortal: ${pumpPortalConnected ? "âœ… connected" : "âŒ NOT connected"}`
         );
       }
     }
@@ -529,7 +618,7 @@ async function getQuote(inputMint: string, outputMint: string, amount: number, a
     if (i < attempts - 1) await new Promise((r) => setTimeout(r, 400));
   }
   if (lastError && attempts > 1) {
-    console.log("❌ Quote failed after retries:", String(lastError).slice(0, 140));
+    console.log("âŒ Quote failed after retries:", String(lastError).slice(0, 140));
   }
   return null;
 }
@@ -571,29 +660,49 @@ function scheduleRebroadcasts(rawBytes: Uint8Array) {
   }, 500);
 }
 
-async function submitSignedTransaction(rawBytes: Uint8Array): Promise<string | null> {
+async function submitSignedTransaction(rawBytes: Uint8Array, useJito = BUY_AMOUNT >= 0.1 * 1e9): Promise<string | null> {
   const signed = VersionedTransaction.deserialize(rawBytes);
   const signature = bs58.encode(signed.signatures[0]!);
-  const jitoAttempt = (async () => {
-    const blockhash = await getBlockhashFast();
-    const tipTx = new Transaction({ feePayer: wallet.publicKey, recentBlockhash: blockhash }).add(
-      SystemProgram.transfer({ fromPubkey: wallet.publicKey, toPubkey: randomTipAccount(), lamports: JITO_TIP_LAMPORTS })
-    );
-    tipTx.sign(wallet);
-    const res = await fetchJson(JITO_BLOCK_ENGINE_URL, {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "sendBundle", params: [[bs58.encode(rawBytes), bs58.encode(tipTx.serialize())]] }),
-    });
-    if (!res?.result) throw new Error("Jito did not accept the bundle");
-    return "Jito";
+
+  const rpcAttempt = (async () => {
+    // Use dedicated low-latency RPC for submission
+    await buyExecConnection.sendRawTransaction(rawBytes, { skipPreflight: true, maxRetries: 0 });
+    return "RPC";
   })();
-  const rpcAttempt = connection.sendRawTransaction(rawBytes, { skipPreflight: true, maxRetries: 3 }).then(() => "RPC");
+
+  // Only use Jito for larger buys where MEV protection matters
+  let jitoAttempt: Promise<string>;
+  if (useJito) {
+    jitoAttempt = (async () => {
+      const blockhash = await getBlockhashFast();
+      const tipTx = new Transaction({ feePayer: wallet.publicKey, recentBlockhash: blockhash }).add(
+        SystemProgram.transfer({ fromPubkey: wallet.publicKey, toPubkey: randomTipAccount(), lamports: JITO_TIP_LAMPORTS })
+      );
+      tipTx.sign(wallet);
+      const res = await fetchJson(JITO_BLOCK_ENGINE_URL, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "sendBundle", params: [[bs58.encode(rawBytes), bs58.encode(tipTx.serialize())]] }),
+      });
+      if (!res?.result) throw new Error("Jito did not accept the bundle");
+      return "Jito";
+    })();
+  } else {
+    jitoAttempt = Promise.reject(new Error("Jito skipped for small buy"));
+  }
+
   scheduleRebroadcasts(rawBytes);
   try {
     const via = await Promise.any([jitoAttempt, rpcAttempt]);
-    console.log(`📤 Transaction submitted via ${via}:`, signature);
+    console.log(`ðŸ“¤ Transaction submitted via ${via}:`, signature);
     return signature;
-  } catch { return null; }
+  } catch {
+    // If both fail, try RPC one more time with retries
+    try {
+      await buyExecConnection.sendRawTransaction(rawBytes, { skipPreflight: true, maxRetries: 2 });
+      console.log(`ðŸ“¤ Transaction submitted via RPC (retry):`, signature);
+      return signature;
+    } catch { return null; }
+  }
 }
 
 async function sendSwapDual(txBase64: string): Promise<string | null> {
@@ -606,69 +715,117 @@ async function sendRawTransactionDual(rawTx: Uint8Array): Promise<string | null>
   return submitSignedTransaction(rawTx);
 }
 
-/* ================= PUMPPORTAL-BUILT TRANSACTIONS ================= */
-// Build direct Pump.fun buys locally from the official SDK. This avoids the
-// PumpPortal HTTP hop and uses the current bonding-curve accounts for the mint.
-async function buildLocalPumpBuyTx(mint: string, slippageBps = SLIPPAGE_BPS): Promise<Uint8Array | null> {
-  try {
-    const mintKey = new PublicKey(mint);
-    const [mintInfo, global, latest] = await Promise.all([
-      connection.getAccountInfo(mintKey, "processed"),
-      pumpSdk.fetchGlobal(),
-      connection.getLatestBlockhash("processed"),
-    ]);
-    if (!mintInfo) throw new Error("mint account not found");
-    const tokenProgram = mintInfo.owner;
-    if (!tokenProgram.equals(TOKEN_PROGRAM_ID) && !tokenProgram.equals(TOKEN_2022_PROGRAM_ID)) {
-      throw new Error("unsupported token program");
-    }
+ /* ================= PUMPPORTAL-BUILT TRANSACTIONS ================= */
+ // Build direct Pump.fun buys locally from the official SDK. This avoids the
+ // PumpPortal HTTP hop and uses the current bonding-curve accounts for the mint.
+ async function buildLocalPumpBuyTx(mint: string, slippageBps = SLIPPAGE_BPS): Promise<Uint8Array | null> {
+   try {
+     const mintKey = new PublicKey(mint);
+      const latest = await pumpSdkConnection.getLatestBlockhash("processed");
+      const [mintInfo, global] = await Promise.all([
+        pumpSdkConnection.getAccountInfo(mintKey, "processed"),
+        pumpSdkForBuild.fetchGlobal(), // dedicated SDK RPC
+      ]);
+      if (!mintInfo) throw new Error("mint account not found");
+     const tokenProgram = mintInfo.owner;
+     if (!tokenProgram.equals(TOKEN_PROGRAM_ID) && !tokenProgram.equals(TOKEN_2022_PROGRAM_ID)) {
+       throw new Error("unsupported token program");
+     }
 
-    const [buyState, mintState, feeConfig] = await Promise.all([
-      pumpSdk.fetchBuyState(mintKey, wallet.publicKey, tokenProgram),
-      getMint(connection, mintKey, "processed", tokenProgram),
-      pumpSdk.fetchFeeConfig(),
-    ]);
-    const solAmount = new BN(BUY_AMOUNT);
-    const tokenAmount = getBuyTokenAmountFromSolAmount({
-      global,
-      feeConfig,
-      mintSupply: mintState.supply,
-      bondingCurve: buyState.bondingCurve,
-      amount: solAmount,
-      quoteMint: new PublicKey(SOL_MINT),
-    });
-    if (tokenAmount.isZero()) throw new Error("bonding curve returned zero tokens");
+      // Check bonding curve cache first to avoid "zero tokens" on fresh tokens
+      let cachedCurve = bondingCurveCache.get(mint);
+      if (cachedCurve && Date.now() - cachedCurve.timestamp < BONDING_CURVE_TTL_MS) {
+        console.log("âš¡ Using cached bonding curve for", mint);
+      } else {
+        cachedCurve = undefined;
+      }
 
-    const instructions = await PUMP_SDK.buyInstructions({
-      global,
-      ...buyState,
-      mint: mintKey,
-      user: wallet.publicKey,
-      amount: tokenAmount,
-      solAmount,
-      slippage: slippageBps / 100,
-      tokenProgram,
-    });
-    const priorityMicroLamports = Math.ceil((BASE_PRIORITY_FEE * 1_000_000) / LOCAL_PUMP_COMPUTE_UNITS);
-    const message = new TransactionMessage({
-      payerKey: wallet.publicKey,
-      recentBlockhash: latest.blockhash,
-      instructions: [
-        ComputeBudgetProgram.setComputeUnitLimit({ units: LOCAL_PUMP_COMPUTE_UNITS }),
-        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityMicroLamports }),
-        ...instructions,
-      ],
-    }).compileToV0Message();
-    const tx = new VersionedTransaction(message);
-    tx.sign([wallet]);
-    return tx.serialize();
-  } catch (e: any) {
-    console.log("↪️ Local Pump.fun build unavailable:", e.message);
-    return null;
-  }
-}
+      const [buyState, mintState, feeConfig] = await Promise.all([
+        pumpSdkForBuild.fetchBuyState(mintKey, wallet.publicKey, tokenProgram), // dedicated SDK RPC
+        getMint(pumpSdkConnection, mintKey, "processed", tokenProgram), // dedicated SDK RPC
+        pumpSdkForBuild.fetchFeeConfig(), // dedicated SDK RPC
+      ]);
+     const solAmount = new BN(BUY_AMOUNT);
 
-// PumpPortal builds the current, correct Pump.fun transaction server-side —
+      // buyState.bondingCurve is the bonding curve account address (PublicKey).
+      // getBuyTokenAmountFromSolAmount requires a BondingCurve object with reserves.
+      // If we have cached reserves (from PumpPortal), use them. Otherwise fetch and parse the account.
+      let bondingCurveData: any;
+      if (cachedCurve) {
+        bondingCurveData = {
+          virtualTokenReserves: cachedCurve.virtualTokenReserves,
+          virtualQuoteReserves: cachedCurve.virtualQuoteReserves,
+          realTokenReserves: cachedCurve.realTokenReserves,
+          realQuoteReserves: cachedCurve.realQuoteReserves,
+          tokenTotalSupply: (typeof mintState.supply === "bigint" ? new BN(mintState.supply.toString()) : mintState.supply),
+          complete: false,
+          creator: new PublicKey("11111111111111111111111111111111"),
+          isMayhemMode: false,
+          isCashbackCoin: false,
+          quoteMint: new PublicKey(SOL_MINT),
+        };
+      } else {
+        // Fetch bonding curve account data and parse reserves
+        const bondingCurveAddress = bondingCurvePda(mintKey);
+        const bcAccount = await pumpSdkConnection.getAccountInfo(bondingCurveAddress, "processed");
+        if (!bcAccount || bcAccount.data.length < 8 + 8 + 8 + 8 + 8 + 8) {
+          throw new Error("Failed to fetch bonding curve account data");
+        }
+        const data = bcAccount.data;
+        // Pump.fun bonding curve layout: discriminator(8) + virtualSolReserves(8) + virtualTokenReserves(8) + realSolReserves(8) + realTokenReserves(8) + totalSupply(8)
+        bondingCurveData = {
+          virtualTokenReserves: new BN(data.subarray(16, 24).readBigUInt64LE(0).toString()),
+          virtualQuoteReserves: new BN(data.subarray(8, 16).readBigUInt64LE(0).toString()),
+          realTokenReserves: new BN(data.subarray(32, 40).readBigUInt64LE(0).toString()),
+          realQuoteReserves: new BN(data.subarray(24, 32).readBigUInt64LE(0).toString()),
+          tokenTotalSupply: (typeof mintState.supply === "bigint" ? new BN(mintState.supply.toString()) : mintState.supply),
+          complete: data[48] === 1,
+          creator: new PublicKey("11111111111111111111111111111111"),
+          isMayhemMode: false,
+          isCashbackCoin: false,
+          quoteMint: new PublicKey(SOL_MINT),
+        };
+      }
+     const tokenAmount = getBuyTokenAmountFromSolAmount({
+       global,
+       feeConfig,
+       mintSupply: (typeof mintState.supply === "bigint" ? new BN(mintState.supply.toString()) : mintState.supply),
+       bondingCurve: bondingCurveData,
+       amount: solAmount,
+       quoteMint: new PublicKey(SOL_MINT),
+     });
+     if (tokenAmount.isZero()) throw new Error("bonding curve returned zero tokens");
+
+     const instructions = await PUMP_SDK.buyInstructions({
+       global,
+        ...buyState, // buyState already has bondingCurve, associatedBondingCurve, etc.
+       mint: mintKey,
+       user: wallet.publicKey,
+       amount: tokenAmount,
+       solAmount,
+       slippage: slippageBps / 100,
+       tokenProgram,
+     });
+     const priorityMicroLamports = Math.ceil((BASE_PRIORITY_FEE * 1_000_000) / LOCAL_PUMP_COMPUTE_UNITS);
+     const message = new TransactionMessage({
+       payerKey: wallet.publicKey,
+        recentBlockhash: latest.blockhash,
+       instructions: [
+         ComputeBudgetProgram.setComputeUnitLimit({ units: LOCAL_PUMP_COMPUTE_UNITS }),
+         ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityMicroLamports }),
+         ...instructions,
+       ],
+     }).compileToV0Message();
+     const tx = new VersionedTransaction(message);
+     tx.sign([wallet]);
+     return tx.serialize();
+   } catch (e: any) {
+     console.log("â†ªï¸ Local Pump.fun build unavailable:", e.message);
+     return null;
+   }
+ }
+
+// PumpPortal builds the current, correct Pump.fun transaction server-side â€”
 // they maintain the account layouts through every Pump.fun breaking change,
 // which is exactly the burden this bot should not carry itself. The response
 // is an UNSIGNED transaction: the private key never leaves this bot. We sign
@@ -702,7 +859,7 @@ async function buildPumpPortalTx(
     });
     if (!res.ok) {
       const errText = await res.text().catch(() => "");
-      console.log(`⚠️ trade-local ${action} build failed:`, String(errText).slice(0, 140));
+      console.log(`âš ï¸ trade-local ${action} build failed:`, String(errText).slice(0, 140));
       return null;
     }
     const buf = new Uint8Array(await res.arrayBuffer());
@@ -710,7 +867,7 @@ async function buildPumpPortalTx(
     tx.sign([wallet]);
     return tx.serialize();
   } catch (e: any) {
-    console.log(`⚠️ trade-local ${action} error:`, e.message);
+    console.log(`âš ï¸ trade-local ${action} error:`, e.message);
     return null;
   }
 }
@@ -746,7 +903,7 @@ async function waitForConfirmation(signature: string, attempts = 20, delayMs = 5
       const status = check.value[0];
       if (status) {
         if (status.err) {
-          console.log("❌ Buy transaction failed on-chain:", signature, JSON.stringify(status.err));
+          console.log("âŒ Buy transaction failed on-chain:", signature, JSON.stringify(status.err));
           return "failed";
         }
         if (status.confirmationStatus === "confirmed" || status.confirmationStatus === "finalized") return "confirmed";
@@ -772,7 +929,7 @@ function passesFilters(quote: any) {
   const impact = Number(quote.priceImpactPct ?? 0);
   if (impact > MAX_PRICE_IMPACT) {
     console.log(
-      `❌ Quote rejected — price impact ${(impact * 100).toFixed(1)}% above ${(MAX_PRICE_IMPACT * 100).toFixed(0)}% cap`
+      `âŒ Quote rejected â€” price impact ${(impact * 100).toFixed(1)}% above ${(MAX_PRICE_IMPACT * 100).toFixed(0)}% cap`
     );
     return false;
   }
@@ -780,100 +937,99 @@ function passesFilters(quote: any) {
 }
 
 /* ================= BUY ================= */
-// Direct Pump.fun is now tried FIRST — no Jupiter round trip for tokens still
+// Direct Pump.fun is now tried FIRST â€” no Jupiter round trip for tokens still
 // on the bonding curve, which is every real trade from this target wallet.
 // Jupiter only runs as a fallback if the curve read fails or the token has
 // already migrated off the bonding curve.
 
-async function submitJupiterBuy(mint: string): Promise<string | null> {
+// Build Jupiter buy transaction (returns signed Uint8Array for parallel race)
+async function buildJupiterBuyTx(mint: string) {
+  const quote = await getQuote(SOL_MINT, mint, BUY_AMOUNT);
+  if (!quote || !passesFilters(quote)) return null;
+  const txBase64 = await buildSwapTx(quote);
+  if (!txBase64) return null;
+  const swapTx = VersionedTransaction.deserialize(Buffer.from(txBase64, "base64"));
+  swapTx.sign([wallet]);
+  return swapTx.serialize();
+}
+
+async function submitJupiterBuy(mint: string) {
   const quote = await getQuote(SOL_MINT, mint, BUY_AMOUNT);
   if (!quote || !passesFilters(quote)) return null;
   const tx = await buildSwapTx(quote);
   if (!tx) return null;
   const sig = await sendSwapDual(tx);
-  if (sig) console.log("🚀 BUY submitted (Jupiter):", mint, sig);
+  if (sig) console.log("ðŸš€ BUY submitted (Jupiter):", mint, sig);
   return sig;
 }
 
 async function executeBuy(
-  mint: string,
-  targetSnapshotPromise?: Promise<{ tokenPriceUSD: number | null; marketCapUSD: number | null }>
-) {
-  if (botPaused) {
-    console.log("⏸️ Buy skipped — bot is paused:", mint);
-    return;
-  }
-
-  const requiredLamports = BUY_AMOUNT + JITO_TIP_LAMPORTS + 3_000_000;
-  if (lastKnownBalanceLamports !== null && lastKnownBalanceLamports < requiredLamports) {
-    console.log(
-      `⏸️ Buy skipped — wallet ${(lastKnownBalanceLamports / 1e9).toFixed(4)} SOL below required ~${(requiredLamports / 1e9).toFixed(4)} SOL:`,
-      mint
-    );
-    return;
-  }
-
-  if (positions.has(mint) || inFlight.has(mint)) return;
-  inFlight.add(mint);
-
-  try {
-    let sig: string | null = null;
-
-    // 1. Primary: local official Pump SDK build. No external builder
-    // latency, and the curve accounts are DERIVED from the mint — immune
-    // by construction to the mint/bonding-curve mismatch (error 6004) a
-    // stale external builder can produce on a seconds-old token. When the
-    // curve state is one slot behind ("zero tokens"), one quick second
-    // look usually succeeds.
-    let rawTx = await buildLocalPumpBuyTx(mint);
-    if (!rawTx) {
-      await new Promise((r) => setTimeout(r, 300));
-      rawTx = await buildLocalPumpBuyTx(mint);
-    }
-    if (rawTx) {
-      sig = await sendRawTransactionDual(rawTx);
-      if (sig) {
-        console.log("🚀 BUY submitted (local Pump.fun):", mint, sig);
-      }
-    }
-
-    // 2. Compatibility fallback. Ask for the bonding-curve pool EXPLICITLY
-    // first: "auto" makes the builder race its own index on brand-new
-    // tokens — that race is what produced the 6004 rejection.
-    if (!sig) {
-      console.log("↪️ Local Pump.fun build unavailable — trying PumpPortal for", mint);
-      rawTx = await buildPumpPortalTx("buy", mint, BUY_AMOUNT / 1e9, true, SLIPPAGE_BPS, "pump");
-      if (!rawTx) rawTx = await buildPumpPortalTx("buy", mint, BUY_AMOUNT / 1e9, true, SLIPPAGE_BPS, "auto");
-      if (rawTx) {
-        sig = await sendRawTransactionDual(rawTx);
-        if (sig) {
-          console.log("🚀 BUY submitted (PumpPortal-built):", mint, sig);
-        }
-      }
-    }
-
-    // 3. Last fallback for migrated or unsupported routes.
-    if (!sig) {
-      console.log("↪️ Pump.fun build unavailable — trying Jupiter for", mint);
-      sig = await submitJupiterBuy(mint);
-    }
-
-    if (!sig) {
-      console.log("❌ Buy aborted — both PumpPortal and Jupiter failed for", mint);
+    mint: string,
+    targetSnapshotPromise?: Promise<{ tokenPriceUSD: number | null; marketCapUSD: number | null }>
+  ) {
+    if (botPaused) {
+      console.log("⏸️ Buy skipped — bot is paused:", mint);
       return;
     }
 
-    const myMcPromise = delayedMarketCapSnapshot(mint, 2000);
-    const targetMcPromise = targetSnapshotPromise ?? Promise.resolve({ tokenPriceUSD: null, marketCapUSD: null });
-    let confirmationPromise = waitForConfirmation(sig);
-    let actual = await waitForBalance(mint);
-    let confirmation = await confirmationPromise;
+    const requiredLamports = BUY_AMOUNT + JITO_TIP_LAMPORTS + 3_000_000;
+    if (lastKnownBalanceLamports !== null && lastKnownBalanceLamports < requiredLamports) {
+      console.log(
+        `\⏸️ Buy skipped — wallet ${(lastKnownBalanceLamports / 1e9).toFixed(4)} SOL below required ~${(requiredLamports / 1e9).toFixed(4)} SOL:`,
+        mint
+      );
+      return;
+    }
 
-    if (confirmation === "failed") {
-      // Rebuild ONCE with completely fresh state at higher slippage. Local
-      // SDK first (derived accounts, current price), then PumpPortal.
-      // Jupiter last — it usually cannot even quote a seconds-old token.
-      console.log(`↪️ Buy failed on-chain — rebuilding fresh at ${RETRY_SLIPPAGE_BPS / 100}% slippage:`, mint);
+    if (positions.has(mint) || inFlight.has(mint)) return;
+    inFlight.add(mint);
+
+    try {
+      let sig: string | null = null;
+
+      // ===== PHASE 2: PARALLEL BUILDER RACE =====
+      // Fire all builders simultaneously; first valid signed tx wins.
+      // This eliminates the sequential wait that was adding 300-800ms latency.
+      async function buildAndSend(builderName: string, buildFn: () => Promise<Uint8Array | null>): Promise<string | null> {
+        try {
+          const tx = await buildFn();
+          if (tx) {
+            const s = await sendRawTransactionDual(tx);
+            if (s) {
+              console.log(`🚀 BUY submitted (${builderName}):`, mint, s);
+              return s;
+            }
+          }
+        } catch (e: any) {
+          console.log(`⚠️ ${builderName} build error:`, e.message);
+        }
+        return null;
+      }
+
+      const [sigPumpPortal, sigLocal, sigJupiter] = await Promise.allSettled([
+        buildAndSend("PumpPortal-trade-local", () => buildPumpPortalTx("buy", mint, BUY_AMOUNT / 1e9, true, SLIPPAGE_BPS, "pump")),
+        buildAndSend("local Pump SDK",     () => buildLocalPumpBuyTx(mint, SLIPPAGE_BPS)),
+        buildAndSend("Jupiter",            () => buildJupiterBuyTx(mint)),
+      ]);
+
+      sig = (sigPumpPortal.status === "fulfilled" ? sigPumpPortal.value : null) ?? (sigLocal.status === "fulfilled" ? sigLocal.value : null) ?? (sigJupiter.status === "fulfilled" ? sigJupiter.value : null) ?? null;
+
+      if (!sig) {
+        console.log("❌ Buy aborted — all builders failed for", mint);
+        return;
+      }
+
+      const myMcPromise = delayedMarketCapSnapshot(mint, 2000);
+      const targetMcPromise = targetSnapshotPromise ?? Promise.resolve({ tokenPriceUSD: null, marketCapUSD: null });
+      let confirmationPromise = waitForConfirmation(sig);
+      let actual = await waitForBalance(mint);
+      let confirmation = await confirmationPromise;
+
+      if (confirmation === "failed") {
+        // Rebuild ONCE with completely fresh state at higher slippage. Local
+        // SDK first (derived accounts, current price), then PumpPortal.
+        // Jupiter last — it usually cannot even quote a seconds-old token.
+        console.log(`↪️ Buy failed on-chain — rebuilding fresh at ${RETRY_SLIPPAGE_BPS / 100}% slippage:`, mint);
       const failedPrimarySig = sig;
       sig = null;
       let retryTx = await buildLocalPumpBuyTx(mint, RETRY_SLIPPAGE_BPS);
@@ -881,15 +1037,15 @@ async function executeBuy(
       if (!retryTx) retryTx = await buildPumpPortalTx("buy", mint, BUY_AMOUNT / 1e9, true, RETRY_SLIPPAGE_BPS, "auto");
       if (retryTx) {
         sig = await sendRawTransactionDual(retryTx);
-        if (sig) console.log("🚀 BUY retry submitted (fresh build, higher slippage):", mint, sig);
+        if (sig) console.log("ðŸš€ BUY retry submitted (fresh build, higher slippage):", mint, sig);
       }
       if (!sig) {
-        console.log("↪️ Rebuild unavailable — trying Jupiter for", mint);
+        console.log("â†ªï¸ Rebuild unavailable â€” trying Jupiter for", mint);
         sig = await submitJupiterBuy(mint);
       }
       if (!sig) {
         await sendTelegramAlert(
-          `❌ <b>BUY FAILED ON-CHAIN</b>\nMint: <code>${mint}</code>\n` +
+          `âŒ <b>BUY FAILED ON-CHAIN</b>\nMint: <code>${mint}</code>\n` +
           `Primary tx failed; rebuild and Jupiter fallback were unavailable.\n` +
           `<a href="https://solscan.io/tx/${failedPrimarySig}">View failed transaction</a>`
         );
@@ -900,8 +1056,8 @@ async function executeBuy(
       confirmation = await confirmationPromise;
       if (confirmation === "failed") {
         await sendTelegramAlert(
-          `❌ <b>BUY FAILED ON-CHAIN</b>\nMint: <code>${mint}</code>\n` +
-          `Retry also failed — the exact program error is in the Render logs.\n` +
+          `âŒ <b>BUY FAILED ON-CHAIN</b>\nMint: <code>${mint}</code>\n` +
+          `Retry also failed â€” the exact program error is in the Render logs.\n` +
           `<a href="https://solscan.io/tx/${sig}">View transaction</a>`
         );
         return;
@@ -909,9 +1065,9 @@ async function executeBuy(
     }
     if (actual <= 0) {
       const state = confirmation === "confirmed" ? "confirmed transaction, but no token balance" : "transaction still pending and no token balance";
-      console.log(`⚠️ Could not confirm ${state} for`, mint, sig);
+      console.log(`âš ï¸ Could not confirm ${state} for`, mint, sig);
       await sendTelegramAlert(
-        `⚠️ <b>BALANCE WARNING</b>\n${state} for <code>${mint}</code>.\n` +
+        `âš ï¸ <b>BALANCE WARNING</b>\n${state} for <code>${mint}</code>.\n` +
         `<a href="https://solscan.io/tx/${sig}">View transaction</a>`
       );
       return;
@@ -947,7 +1103,7 @@ async function executeBuy(
     });
 
     await sendTelegramAlert(
-      `🚀 <b>BUY EXECUTED</b>\n` +
+      `ðŸš€ <b>BUY EXECUTED</b>\n` +
       `Mint: <code>${mint}</code>\n` +
       `Amount: ${(BUY_AMOUNT / 1e9).toFixed(3)} SOL\n` +
       `<b>The Man's entry MC:</b> ${fmtMC(targetSnapshot.marketCapUSD)}\n` +
@@ -976,17 +1132,17 @@ async function executeSell(mint: string, amount: number, reason: string) {
   // Fallback for tokens Jupiter cannot quote yet (seconds old): sell via a
   // PumpPortal-built transaction. Pump.fun tokens use 6 decimals.
   if (!sig) {
-    console.log("↪️ Jupiter sell unavailable — trying PumpPortal build for", mint);
+    console.log("â†ªï¸ Jupiter sell unavailable â€” trying PumpPortal build for", mint);
     const rawTx = await buildPumpPortalTx("sell", mint, amount / 1e6, false);
     if (rawTx) sig = await sendRawTransactionDual(rawTx);
   }
 
   if (!sig) {
-    console.log(`❌ Sell failed on both paths for ${mint} (${reason})`);
+    console.log(`âŒ Sell failed on both paths for ${mint} (${reason})`);
     return;
   }
 
-  console.log(`✅ SELL (${reason}):`, mint, sig);
+  console.log(`âœ… SELL (${reason}):`, mint, sig);
 
   const soldFraction = amount / pos.remainingAmount;
   const costBasisSold = pos.costBasisLamports * soldFraction;
@@ -1015,7 +1171,7 @@ async function executeSell(mint: string, amount: number, reason: string) {
   });
 
   await sendTelegramAlert(
-    `✅ <b>SELL EXECUTED</b> (${reason})\n` +
+    `âœ… <b>SELL EXECUTED</b> (${reason})\n` +
     `Mint: <code>${mint}</code>\n` +
     `Market Cap: ${fmtMC(marketCapUSD)}\n` +
     `PnL (this portion): ${pnlPercent >= 0 ? "+" : ""}${pnlPercent.toFixed(1)}%\n` +
@@ -1132,7 +1288,7 @@ async function processRetry(signature: string) {
   if (!entry) return;
   retryQueue.delete(signature);
 
-  console.log(`🔄 Retry #${entry.attempts} for ${signature}`);
+  console.log(`ðŸ”„ Retry #${entry.attempts} for ${signature}`);
   try {
     const tx = await getTransactionWithRetry(signature, 4, 500);
     if (tx?.meta) {
@@ -1145,9 +1301,9 @@ async function processRetry(signature: string) {
     const timer = setTimeout(() => processRetry(signature), 3000);
     retryQueue.set(signature, { attempts: entry.attempts + 1, timer });
   } else {
-    console.log(`❌ PERMANENTLY MISSED TRADE: ${signature}`);
+    console.log(`âŒ PERMANENTLY MISSED TRADE: ${signature}`);
     await sendTelegramAlert(
-      `🚨 <b>POSSIBLE MISSED TRADE</b>\nSignature: <code>${signature}</code>\nUnable to fetch after 5 retries. Check Solscan manually.`
+      `ðŸš¨ <b>POSSIBLE MISSED TRADE</b>\nSignature: <code>${signature}</code>\nUnable to fetch after 5 retries. Check Solscan manually.`
     );
   }
 }
@@ -1169,7 +1325,7 @@ async function handleTxInternal(tx: any, signature: string): Promise<boolean> {
       if (postAmount < preAmount) {
         const held = positions.get(pre.mint);
         if (held && held.remainingAmount > 0) {
-          console.log("🚨 TARGET EXITED — dumping:", pre.mint);
+          console.log("ðŸš¨ TARGET EXITED â€” dumping:", pre.mint);
           executeSell(pre.mint, held.remainingAmount, "TARGET_EXITED");
           return true;
         }
@@ -1187,14 +1343,14 @@ async function handleTxInternal(tx: any, signature: string): Promise<boolean> {
       const postAmount = Number(post.uiTokenAmount.uiAmount);
       if (postAmount > preAmount) {
         foundAny = true;
-        console.log("🔥 DETECTED buy:", post.mint);
+        console.log("ðŸ”¥ DETECTED buy:", post.mint);
         executeBuy(post.mint, delayedMarketCapSnapshot(post.mint));
         return true;
       }
     }
 
     if (!foundAny) {
-      console.log("ℹ️ No token increase for target — not a buy we can copy.");
+      console.log("â„¹ï¸ No token increase for target â€” not a buy we can copy.");
     }
     return false;
   } catch (e: any) {
@@ -1213,7 +1369,7 @@ async function handleTx(signature: string) {
     // the first available response instead of waiting a full half-second.
     const tx = await getTransactionWithRetry(signature, 12, 350);
     if (!tx?.meta) {
-      console.log("❌ Could not fetch tx for", signature, "— queueing for retry");
+      console.log("âŒ Could not fetch tx for", signature, "â€” queueing for retry");
       queueForRetry(signature);
       return;
     }
@@ -1230,7 +1386,7 @@ function onWalletLog(log: Logs) {
   const signature = log.signature;
   if (seenSignatures.has(signature)) return;
 
-  console.log(`👀 Activity: https://solscan.io/tx/${signature}`);
+  console.log(`ðŸ‘€ Activity: https://solscan.io/tx/${signature}`);
 
   const fast = tryFastDecode(log.logs);
   const isTargetTrade = fast && (() => {
@@ -1238,27 +1394,32 @@ function onWalletLog(log: Logs) {
   })();
 
   if (isTargetTrade && fast.isBuy && fast.solAmount >= MIN_BUY_SOL) {
-    console.log(`⚡ IDL FAST-PATH BUY: ${fast.mint}`);
+    console.log(`âš¡ IDL FAST-PATH BUY: ${fast.mint}`);
     seenSignatures.add(signature);
-    executeBuy(fast.mint, delayedMarketCapSnapshot(fast.mint));
+    // Fire and forget - don't await executeBuy to minimize latency
+    executeBuy(fast.mint, delayedMarketCapSnapshot(fast.mint)).catch(e =>
+      console.log("âš ï¸ executeBuy error (non-blocking):", e.message)
+    );
     return;
   }
   if (isTargetTrade && !fast.isBuy) {
     const held = positions.get(fast.mint);
     if (held && held.remainingAmount > 0) {
-      console.log("🚨 Fast-path: target SOLD a token we hold — dumping:", fast.mint);
+      console.log("ðŸš¨ Fast-path: target SOLD a token we hold â€” dumping:", fast.mint);
       seenSignatures.add(signature);
-      executeSell(fast.mint, held.remainingAmount, "TARGET_EXITED");
+      executeSell(fast.mint, held.remainingAmount, "TARGET_EXITED").catch(e =>
+        console.log("âš ï¸ executeSell error (non-blocking):", e.message)
+      );
       return;
     }
   }
 
   if (fast && !isTargetTrade) {
-    console.log("↪️ Pump.fun trade event belongs to another wallet — racing RPC transaction fetch");
+    console.log("â†ªï¸ Pump.fun trade event belongs to another wallet â€” racing RPC transaction fetch");
   } else if (fast && fast.isBuy && fast.solAmount < MIN_BUY_SOL) {
-    console.log("↪️ Pump.fun buy is below MIN_BUY_SOL — racing RPC transaction fetch");
+    console.log("â†ªï¸ Pump.fun buy is below MIN_BUY_SOL â€” racing RPC transaction fetch");
   } else {
-    console.log("↪️ No direct Pump.fun TradeEvent — racing RPC transaction fetch");
+    console.log("â†ªï¸ No direct Pump.fun TradeEvent â€” racing RPC transaction fetch");
   }
   handleTx(signature);
 }
@@ -1278,12 +1439,12 @@ function rotateSubscriptions() {
       const subId = conn.onLogs(TARGET_WALLET, onWalletLog, "processed");
       fresh.push({ conn, subId });
     } catch (e: any) {
-      console.log("⚠️ Failed to open detection channel:", e.message);
+      console.log("âš ï¸ Failed to open detection channel:", e.message);
     }
   }
 
   if (fresh.length === 0) {
-    console.log("⚠️ Rotation produced no channels — keeping the old ones alive");
+    console.log("âš ï¸ Rotation produced no channels â€” keeping the old ones alive");
     return;
   }
 
@@ -1303,7 +1464,7 @@ function rotateSubscriptions() {
     }, 3000);
   }
 
-  console.log(`✅ ${fresh.length} detection channel(s) rotated onto fresh websockets`);
+  console.log(`âœ… ${fresh.length} detection channel(s) rotated onto fresh websockets`);
 }
 
 /* ================= PUMPPORTAL CHANNEL ================= */
@@ -1326,9 +1487,9 @@ async function resolveWebSocketCtor(): Promise<any> {
 async function startPumpPortal() {
   const WS = await resolveWebSocketCtor();
   if (!WS) {
-    console.log("⚠️ PumpPortal channel DISABLED — no WebSocket support. Set NODE_VERSION=22 on Render, or run: npm i ws");
+    console.log("âš ï¸ PumpPortal channel DISABLED â€” no WebSocket support. Set NODE_VERSION=22 on Render, or run: npm i ws");
     await sendTelegramAlert(
-      "⚠️ <b>PumpPortal channel is OFF</b>\nThis Node version has no WebSocket support. Set NODE_VERSION=22 in Render environment settings (or npm i ws) — this is your fastest detection channel."
+      "âš ï¸ <b>PumpPortal channel is OFF</b>\nThis Node version has no WebSocket support. Set NODE_VERSION=22 in Render environment settings (or npm i ws) â€” this is your fastest detection channel."
     );
     return;
   }
@@ -1344,47 +1505,92 @@ async function startPumpPortal() {
 
     ws.onopen = () => {
       pumpPortalConnected = true;
-      console.log("✅ PumpPortal channel connected");
+      console.log("âœ… PumpPortal channel connected");
       ws.send(JSON.stringify({ method: "subscribeAccountTrade", keys: [TARGET_WALLET.toString()] }));
     };
 
-    ws.onmessage = (ev: any) => {
-      try {
-        const raw = typeof ev.data === "string" ? ev.data : ev.data.toString();
-        const msg = JSON.parse(raw);
-        if (!msg?.signature || !msg?.mint || !msg.traderPublicKey) return;
+     ws.onmessage = (ev: any) => {
+       try {
+         const raw = typeof ev.data === "string" ? ev.data : ev.data.toString();
+         const msg = JSON.parse(raw);
+         if (!msg?.signature || !msg?.mint || !msg.traderPublicKey) return;
 
-        if (msg.traderPublicKey !== TARGET_WALLET.toString()) return;
-        if (seenSignatures.has(msg.signature)) return;
+         if (msg.traderPublicKey !== TARGET_WALLET.toString()) return;
+         if (seenSignatures.has(msg.signature)) return;
 
-        if (msg.txType === "sell") {
-          const held = positions.get(msg.mint);
-          if (held && held.remainingAmount > 0) {
-            console.log("🚨 PumpPortal: target SOLD a token we hold — dumping:", msg.mint);
-            seenSignatures.add(msg.signature);
-            executeSell(msg.mint, held.remainingAmount, "TARGET_EXITED");
+         if (msg.txType === "sell") {
+           const held = positions.get(msg.mint);
+           if (held && held.remainingAmount > 0) {
+             console.log("ðŸš¨ PumpPortal: target SOLD a token we hold â€” dumping:", msg.mint);
+             seenSignatures.add(msg.signature);
+             executeSell(msg.mint, held.remainingAmount, "TARGET_EXITED");
+           }
+           return;
+         }
+         if (msg.txType !== "buy") return;
+
+         const lamports = Number(msg.solAmount ?? 0) * 1e9;
+         if (lamports < MIN_BUY_SOL) {
+           console.log(`â­ï¸ PumpPortal: buy below threshold (${Number(msg.solAmount).toFixed(4)} SOL) â€” ignoring`);
+           return;
+         }
+
+         console.log("âš¡ PUMPPORTAL detected buy:", msg.mint);
+         seenSignatures.add(msg.signature);
+
+          // Prime bonding curve cache from PumpPortal event (if present)
+          // PumpPortal sometimes includes bonding curve account in the trade event
+          if (msg.bondingCurve && msg.associatedBondingCurve) {
+            try {
+              const bondingCurveKey = new PublicKey(msg.bondingCurve);
+              const associatedBondingCurveKey = new PublicKey(msg.associatedBondingCurve);
+              // Fetch and cache asynchronously, don't block the hot path
+              (async () => {
+                try {
+                  const [bcAccount, abcAccount, feeConfig] = await Promise.all([
+                    pumpSdkConnection.getAccountInfo(bondingCurveKey, "processed"),
+                    pumpSdkConnection.getAccountInfo(associatedBondingCurveKey, "processed"),
+                    pumpSdkForBuild.fetchFeeConfig(),
+                  ]);
+                  if (bcAccount && abcAccount && feeConfig) {
+                    // Parse bonding curve state (ASCII layout from Pump.fun)
+                    const data = bcAccount.data;
+                    if (data.length >= 8 + 8 + 8 + 8 + 8 + 8) {
+                      // Discriminator (8) + virtualQuoteReserves (8) + virtualTokenReserves (8) + realQuoteReserves (8) + realTokenReserves (8) + totalSupply (8)
+                      const virtualQuoteReserves = new BN(data.subarray(8, 16).readBigUInt64LE(0).toString());
+                      const virtualTokenReserves = new BN(data.subarray(16, 24).readBigUInt64LE(0).toString());
+                      const realQuoteReserves = new BN(data.subarray(24, 32).readBigUInt64LE(0).toString());
+                      const realTokenReserves = new BN(data.subarray(32, 40).readBigUInt64LE(0).toString());
+                      bondingCurveCache.set(msg.mint, {
+                        bondingCurve: bondingCurveKey,
+                        associatedBondingCurve: associatedBondingCurveKey,
+                        virtualQuoteReserves,
+                        virtualTokenReserves,
+                        realQuoteReserves,
+                        realTokenReserves,
+                        timestamp: Date.now(),
+                      });
+                      console.log("ðŸ’¾ Cached bonding curve for", msg.mint);
+                    }
+                  }
+                } catch (e: any) {
+                  console.log("âš ï¸ Bonding curve cache prime failed:", e.message);
+                }
+              })();
+            } catch {}
           }
-          return;
-        }
-        if (msg.txType !== "buy") return;
 
-        const lamports = Number(msg.solAmount ?? 0) * 1e9;
-        if (lamports < MIN_BUY_SOL) {
-          console.log(`⏭️ PumpPortal: buy below threshold (${Number(msg.solAmount).toFixed(4)} SOL) — ignoring`);
-          return;
-        }
-
-        console.log("⚡ PUMPPORTAL detected buy:", msg.mint);
-        seenSignatures.add(msg.signature);
-        executeBuy(msg.mint, delayedMarketCapSnapshot(msg.mint));
-      } catch {
-        // non-JSON frame, ignore
-      }
-    };
+         executeBuy(msg.mint, delayedMarketCapSnapshot(msg.mint)).catch(e =>
+            console.log("âš ï¸ executeBuy error (non-blocking):", e.message)
+          );
+       } catch {
+         // non-JSON frame, ignore
+       }
+     };
 
     ws.onclose = () => {
       pumpPortalConnected = false;
-      console.log("⚠️ PumpPortal channel closed — reconnecting in 3s");
+      console.log("âš ï¸ PumpPortal channel closed â€” reconnecting in 3s");
       setTimeout(connect, 3000);
     };
 
@@ -1407,10 +1613,10 @@ async function initPollingCursor() {
     const sigs = await connection.getSignaturesForAddress(TARGET_WALLET, { limit: 1 }, "confirmed");
     if (sigs.length > 0 && sigs[0]) {
       lastPolledSignature = sigs[0].signature;
-      console.log("✅ Polling cursor initialized at:", lastPolledSignature);
+      console.log("âœ… Polling cursor initialized at:", lastPolledSignature);
     }
   } catch (e: any) {
-    console.log("⚠️ Could not initialize polling cursor:", e.message);
+    console.log("âš ï¸ Could not initialize polling cursor:", e.message);
   }
 }
 
@@ -1427,7 +1633,7 @@ async function pollForMissedTrades() {
     for (const sigInfo of ordered) {
       if (sigInfo.err) continue;
       if (seenSignatures.has(sigInfo.signature)) continue;
-      console.log("🔎 POLL found unprocessed signature:", sigInfo.signature);
+      console.log("ðŸ”Ž POLL found unprocessed signature:", sigInfo.signature);
       handleTx(sigInfo.signature);
     }
 
@@ -1455,16 +1661,18 @@ app.listen(PORT, () => console.log(`Keep-alive server on port ${PORT}`));
 /* ================= START ================= */
 
 async function start() {
-  console.log("🚀 Copy-trade bot starting. Target:", TARGET_WALLET.toString());
+  console.log("ðŸš€ Copy-trade bot starting. Target:", TARGET_WALLET.toString());
 
   logFeeSizingWarning();
 
-  await Promise.all([loadPositions(), initPumpDecoder(), initPollingCursor(), refreshBlockhash()]);
+  await Promise.all([loadPositions(), initPumpDecoder(), initPollingCursor()]);
+
+  // Start background blockhash refresher (replaces old 25s interval)
+  startBlockhashRefresher();
 
   rotateSubscriptions();
   setInterval(rotateSubscriptions, 60 * 1000);
   setInterval(pollForMissedTrades, POLL_INTERVAL_MS);
-  setInterval(refreshBlockhash, 25_000);
   setInterval(checkWalletBalance, 60 * 1000);
   setInterval(pollTelegramCommands, 3000);
 
@@ -1476,10 +1684,10 @@ async function start() {
 
   await checkWalletBalance();
 
-  console.log("✅ Bot fully running (rotating WS + PumpPortal + polling + PumpPortal-built buys)");
+  console.log("âœ… Bot fully running (rotating WS + PumpPortal + polling + PumpPortal-built buys)");
   await sendTelegramAlert(
-    `🟢 <b>V25 Engine Online</b>\nTarget: <code>${TARGET_WALLET.toString()}</code>\n` +
-    `Buy path: local Pump SDK → PumpPortal (pump pool) → Jupiter\n` +
+    `ðŸŸ¢ <b>V25 Engine Online</b>\nTarget: <code>${TARGET_WALLET.toString()}</code>\n` +
+    `Buy path: PumpPortal (trade-local) â†’ local Pump SDK â†’ Jupiter\n` +
     `Exit: TARGET-EXIT mirror + TP 700/1100/1500% + time net 15/25/40s\n` +
     `Channels: ${DETECTION_URLS.length} rotating WS + ${PUMPPORTAL_ENABLED ? "PumpPortal" : "no PumpPortal"} + polling\n` +
     `Commands: /pause /resume /status`
@@ -1487,3 +1695,22 @@ async function start() {
 }
 
 start();
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
