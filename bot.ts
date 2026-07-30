@@ -1648,8 +1648,7 @@ function rotateSubscriptions() {
     } catch {}
     try {
       // Force close the underlying WebSocket
-      (ch.conn as any)._rpcWebSocket?.close();
-      (ch.conn as any)._rpcWebSocket = null;
+      (ch.conn as any)._rpcWebSocket?.close?.();
     } catch {}
   }
 
@@ -1687,8 +1686,21 @@ async function startPumpPortal() {
   const connect = () => {
     let ws: any;
     try {
+      // Validate WS is a callable constructor
+      if (typeof WS !== "function") {
+        console.log("âš ï¸ PumpPortal: WS is not a function, skipping reconnect");
+        setTimeout(connect, 30000);
+        return;
+      }
       ws = new WS(PUMPPORTAL_WS);
-    } catch {
+    } catch (e: any) {
+      console.log("âš ï¸ PumpPortal WS creation failed:", e.message);
+      setTimeout(connect, 5000);
+      return;
+    }
+
+    if (!ws) {
+      console.log("âš ï¸ PumpPortal WS returned null/undefined, retrying in 5s");
       setTimeout(connect, 5000);
       return;
     }
@@ -1784,7 +1796,8 @@ async function startPumpPortal() {
       setTimeout(connect, 3000);
     };
 
-    ws.onerror = () => {
+    ws.onerror = (err: any) => {
+      console.log("âš ï¸ PumpPortal WS error:", err?.message ?? String(err));
       try {
         ws.close();
       } catch {}
