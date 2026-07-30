@@ -1,0 +1,397 @@
+ðŸš€ Copy-trade bot starting. Target: E7T1Vs7aCLkN7TyFg382rhG7yVM5cWvjuwhfQkWPiSEH
+ðŸ’¸ Fee sizing: Jito tip + priority fee â‰ˆ 0.0010 SOL (~20.0% of 0.0050 SOL buy)
+ðŸŽ¯ Effective slippage: 30% (retry 50%) â€” if this is not 30/50, a SLIPPAGE_BPS env var on Render is overriding the code
+âš ï¸ Pre-build cache refresh failed: HTTP 530
+âœ… Pump.fun fast-path decoder ready
+âœ… Blockhash background refresher started (10s interval)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âœ… Bot fully running (rotating WS + PumpPortal + polling + PumpPortal-built buys)
+â¸ï¸ Bot PAUSED via Telegram command
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+Polling error: 429 Too Many Requests: {"jsonrpc":"2.0","error":{"code":-32429,"message":"rate limited"}}
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+Polling error: 429 Too Many Requests: {"jsonrpc":"2.0","error":{"code":-32429,"message":"rate limited"}}
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+â¸ï¸ Bot PAUSED via Telegram command
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+Polling error: 429 Too Many Requests: {"jsonrpc":"2.0","error":{"code":-32429,"message":"rate limited"}}
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+Polling error: 429 Too Many Requests: {"jsonrpc":"2.0","error":{"code":-32429,"message":"rate limited"}}
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš ï¸ Pre-build cache refresh failed: HTTP 530
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+Polling error: fetch failed
+Balance check failed: failed to get balance of account GBZHvuZHoYd9syMzugZmkgExFmw8V9MgUESJa2Ttk3Mq: TypeError: fetch failed
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: getaddrinfo ENOTFOUND api.telegram.org
+Polling error: fetch failed
+Polling error: fetch failed
+Polling error: fetch failed
+Polling error: fetch failed
+Polling error: fetch failed
+Polling error: fetch failed
+Polling error: fetch failed
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: getaddrinfo ENOTFOUND api.telegram.org
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: getaddrinfo ENOTFOUND api.telegram.org
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: getaddrinfo ENOTFOUND api.telegram.org
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: getaddrinfo ENOTFOUND api.telegram.org
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: getaddrinfo ENOTFOUND api.telegram.org
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: getaddrinfo ENOTFOUND api.telegram.org
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: getaddrinfo ENOTFOUND api.telegram.org
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: getaddrinfo ENOTFOUND api.telegram.org
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: getaddrinfo ENOTFOUND api.telegram.org
+Polling error: fetch failed
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: getaddrinfo ENOTFOUND api.telegram.org
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: getaddrinfo ENOTFOUND api.telegram.org
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: getaddrinfo ENOTFOUND api.telegram.org
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: getaddrinfo ENOTFOUND api.telegram.org
+Polling error: fetch failed
+Polling error: fetch failed
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: getaddrinfo ENOTFOUND api.telegram.org
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: getaddrinfo ENOTFOUND api.telegram.org
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: getaddrinfo ENOTFOUND api.telegram.org
+Polling error: fetch failed
+Polling error: fetch failed
+Polling error: fetch failed
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: getaddrinfo ENOTFOUND api.telegram.org
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: getaddrinfo ENOTFOUND api.telegram.org
+Polling error: fetch failed
+Balance check failed: failed to get balance of account GBZHvuZHoYd9syMzugZmkgExFmw8V9MgUESJa2Ttk3Mq: TypeError: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: getaddrinfo ENOTFOUND api.telegram.org
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: getaddrinfo ENOTFOUND api.telegram.org
+Polling error: fetch failed
+Polling error: fetch failed
+Polling error: fetch failed
+Polling error: fetch failed
+Polling error: fetch failed
+Polling error: fetch failed
+Polling error: fetch failed
+Polling error: fetch failed
+Polling error: fetch failed
+Polling error: fetch failed
+Polling error: fetch failed
+Polling error: fetch failed
+Polling error: fetch failed
+Polling error: fetch failed
+Polling error: fetch failed
+Polling error: fetch failed
+Polling error: fetch failed
+Polling error: fetch failed
+Polling error: fetch failed
+Polling error: fetch failed
+Polling error: fetch failed
+Polling error: fetch failed
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+Polling error: fetch failed
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Polling error: fetch failed
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Polling error: fetch failed
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Polling error: fetch failed
+Balance check failed: failed to get balance of account GBZHvuZHoYd9syMzugZmkgExFmw8V9MgUESJa2Ttk3Mq: TypeError: fetch failed
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Polling error: fetch failed
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Polling error: fetch failed
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Polling error: fetch failed
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Polling error: fetch failed
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Polling error: fetch failed
+Polling error: fetch failed
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Balance check failed: failed to get balance of account GBZHvuZHoYd9syMzugZmkgExFmw8V9MgUESJa2Ttk3Mq: TypeError: fetch failed
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Polling error: fetch failed
+Polling error: fetch failed
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Polling error: fetch failed
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+Polling error: fetch failed
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Polling error: fetch failed
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Polling error: fetch failed
+Balance check failed: failed to get balance of account GBZHvuZHoYd9syMzugZmkgExFmw8V9MgUESJa2Ttk3Mq: TypeError: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Polling error: fetch failed
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Polling error: fetch failed
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Polling error: fetch failed
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Polling error: fetch failed
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Polling error: fetch failed
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Polling error: fetch failed
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Polling error: fetch failed
+Polling error: fetch failed
+Polling error: fetch failed
+Polling error: fetch failed
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Balance check failed: failed to get balance of account GBZHvuZHoYd9syMzugZmkgExFmw8V9MgUESJa2Ttk3Mq: TypeError: fetch failed
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Polling error: fetch failed
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Polling error: fetch failed
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: connect EACCES 149.154.166.110:443
+Polling error: fetch failed
+Polling error: fetch failed
+Polling error: fetch failed
+Polling error: 429 Too Many Requests: {"jsonrpc":"2.0","error":{"code":-32429,"message":"rate limited"}}
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš ï¸ Pre-build cache refresh failed: HTTP 530
+Polling error: fetch failed
+Polling error: fetch failed
+Balance check failed: failed to get balance of account GBZHvuZHoYd9syMzugZmkgExFmw8V9MgUESJa2Ttk3Mq: TypeError: fetch failed
+Polling error: fetch failed
+Polling error: fetch failed
+Telegram poll error: request to https://api.telegram.org/bot8643675722:AAGAqKTpbhJqyNL1vFhNtYhlTX59s460U_s/getUpdates?offset=975160547&timeout=0 failed, reason: getaddrinfo ENOTFOUND api.telegram.org
+Polling error: fetch failed
+Polling error: fetch failed
+Polling error: fetch failed
+Polling error: fetch failed
+Polling error: fetch failed
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+Polling error: 429 Too Many Requests: {"jsonrpc":"2.0","error":{"code":-32429,"message":"rate limited"}}
+Polling error: 429 Too Many Requests: {"jsonrpc":"2.0","error":{"code":-32429,"message":"rate limited"}}
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+Polling error: 429 Too Many Requests: {"jsonrpc":"2.0","error":{"code":-32429,"message":"rate limited"}}
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+Polling error: 429 Too Many Requests: {"jsonrpc":"2.0","error":{"code":-32429,"message":"rate limited"}}
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+Polling error: 429 Too Many Requests: {"jsonrpc":"2.0","error":{"code":-32429,"message":"rate limited"}}
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+Polling error: 429 Too Many Requests: {"jsonrpc":"2.0","error":{"code":-32429,"message":"rate limited"}}
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+Polling error: 429 Too Many Requests: {"jsonrpc":"2.0","error":{"code":-32429,"message":"rate limited"}}
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+Polling error: 429 Too Many Requests: {"jsonrpc":"2.0","error":{"code":-32429,"message":"rate limited"}}
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+Polling error: 429 Too Many Requests: {"jsonrpc":"2.0","error":{"code":-32429,"message":"rate limited"}}
+Polling error: 429 Too Many Requests: {"jsonrpc":"2.0","error":{"code":-32429,"message":"rate limited"}}
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+Polling error: 429 Too Many Requests: {"jsonrpc":"2.0","error":{"code":-32429,"message":"rate limited"}}
+Polling error: 429 Too Many Requests: {"jsonrpc":"2.0","error":{"code":-32429,"message":"rate limited"}}
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš ï¸ Pre-build cache refresh failed: HTTP 530
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+Polling error: 429 Too Many Requests: {"jsonrpc":"2.0","error":{"code":-32429,"message":"rate limited"}}
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)
+âš™ï¸ Dynamic priority fee updated: 0 lamports (P95: 0)

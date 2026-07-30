@@ -77,7 +77,8 @@ const BUY_AMOUNT = BUY_AMOUNT_SOL * 1e9;
 const BASE_PRIORITY_FEE = Number(process.env.PRIORITY_FEE_LAMPORTS ?? 500_000);
 const SLIPPAGE_BPS = Number(process.env.SLIPPAGE_BPS ?? 3000);
 const RETRY_SLIPPAGE_BPS = Number(process.env.RETRY_SLIPPAGE_BPS ?? 5000);
-const MIN_BUY_SOL = Number(process.env.MIN_BUY_SOL ?? 0.01) * 1e9;
+const MIN_BUY_SOL = Number(process.env.MIN_BUY_SOL ?? 19) * 1e9;  // Only copy buys >= 19 SOL
+const MAX_ENTRY_MARKET_CAP = Number(process.env.MAX_ENTRY_MARKET_CAP ?? 10000); // Don't buy if MC > 10k
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS ?? 2500);
 
 const MAX_PRICE_IMPACT = Number(process.env.MAX_PRICE_IMPACT ?? 0.15);
@@ -303,13 +304,13 @@ async function sendTelegramAlert(message: string) {
 /* ================= CRASH ALERTS ================= */
 
 process.on("uncaughtException", async (err) => {
-  console.log("ðŸ’¥ UNCAUGHT EXCEPTION:", err.message);
-  await sendTelegramAlert(`ðŸ’¥ <b>BOT CRASHED</b>\n${err.message}\nRender should auto-restart it.`);
+  console.log("❌ UNCAUGHT EXCEPTION:", err.message);
+  await sendTelegramAlert(`❌ <b>BOT CRASHED</b>\n${err.message}\nRender should auto-restart it.`);
 });
 
 process.on("unhandledRejection", async (reason: any) => {
-  console.log("ðŸ’¥ UNHANDLED REJECTION:", reason);
-  await sendTelegramAlert(`ðŸ’¥ <b>BOT ERROR</b>\n${String(reason).slice(0, 200)}`);
+  console.log("❌ UNHANDLED REJECTION:", reason);
+  await sendTelegramAlert(`❌ <b>BOT ERROR</b>\n${String(reason).slice(0, 200)}`);
 });
 
 /* ================= PUMP.FUN FAST-PATH DECODER ================= */
@@ -1163,6 +1164,20 @@ async function executeBuy(
     if (positions.has(mint) || inFlight.has(mint)) return;
     inFlight.add(mint);
 
+    // Market cap filter - skip if entry MC > MAX_ENTRY_MARKET_CAP
+    try {
+      const mcSnapshot = await delayedMarketCapSnapshot(mint, 0);
+      const targetMC = mcSnapshot.marketCapUSD;
+      if (targetMC && targetMC > MAX_ENTRY_MARKET_CAP) {
+        console.log(`⏸ Buy skipped — entry MC $${targetMC.toLocaleString()} > ${MAX_ENTRY_MARKET_CAP}:`, mint);
+        inFlight.delete(mint);
+        return;
+      }
+      console.log(`✅ MC check passed: $${(targetMC ?? 0).toLocaleString()} for ${mint}`);
+    } catch (e: any) {
+      console.log("⚠️ MC check failed, proceeding anyway:", e.message);
+    }
+
     const buyStartMs = Date.now();
 
     try {
@@ -1896,12 +1911,13 @@ async function start() {
 
   await checkWalletBalance();
 
-  console.log("âœ… Bot fully running (rotating WS + PumpPortal + polling + PumpPortal-built buys)");
+  console.log("✅ Bot fully running (rotating WS + polling + Pump SDK buys)");
   await sendTelegramAlert(
-    `ðŸŸ¢ <b>V25 Engine Online</b>\nTarget: <code>${TARGET_WALLET.toString()}</code>\n` +
-    `Buy path: PumpPortal (trade-local) â†’ local Pump SDK â†’ Jupiter\n` +
-    `Exit: TARGET-EXIT mirror + TP 700/1100/1500% + time net 15/25/40s\n` +
-    `Channels: ${DETECTION_URLS.length} rotating WS + ${PUMPPORTAL_ENABLED ? "PumpPortal" : "no PumpPortal"} + polling\n` +
+    `✅ <b>Bot Active</b>\nTarget: <code>${TARGET_WALLET.toString()}</code>\n` +
+    `Buy: ${BUY_AMOUNT_SOL} SOL | Min copied buy: ${MIN_BUY_SOL / 1e9} SOL | Max entry MC: $${MAX_ENTRY_MARKET_CAP.toLocaleString()}\n` +
+    `Buy path: Pump SDK → Jupiter\n` +
+    `Channels: ${DETECTION_URLS.length} rotating WS + polling\n` +
+    `Filters: min 19 SOL buy, max 10k MC entry\n` +
     `Commands: /pause /resume /status`
   );
 }
