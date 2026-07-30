@@ -686,6 +686,13 @@ async function pollTelegramCommands() {
       const msg = update.message;
       if (!msg || String(msg.chat?.id) !== String(TELEGRAM_CHAT_ID)) continue;
 
+      // Ignore stale updates (older than 30s) — prevents reprocessing on restart
+      const msgAgeSec = Math.floor(Date.now() / 1000) - (msg.date ?? 0);
+      if (msgAgeSec > 30) {
+        console.log(`⏩ Skipping stale Telegram update (${msgAgeSec}s old): ${msg.text}`);
+        continue;
+      }
+
       const text = (msg.text ?? "").trim().toLowerCase();
       if (text === "/pause") {
         botPaused = true;
