@@ -663,6 +663,7 @@ let pumpPortalConnected = false;
 
 let botPaused = false;
 let telegramUpdateOffset = 0;
+const processedUpdateIds = new Set<number>();
 
 async function pollTelegramCommands() {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
@@ -672,7 +673,16 @@ async function pollTelegramCommands() {
     if (!data?.result) return;
 
     for (const update of data.result) {
-      telegramUpdateOffset = update.update_id + 1;
+      const updateId = update.update_id;
+      if (updateId == null || processedUpdateIds.has(updateId)) continue;
+      processedUpdateIds.add(updateId);
+      if (processedUpdateIds.size > 1000) {
+        // Keep set from growing unbounded
+        const first = processedUpdateIds.values().next().value;
+        if (first !== undefined) processedUpdateIds.delete(first);
+      }
+
+      telegramUpdateOffset = updateId + 1;
       const msg = update.message;
       if (!msg || String(msg.chat?.id) !== String(TELEGRAM_CHAT_ID)) continue;
 
@@ -695,7 +705,7 @@ async function pollTelegramCommands() {
           `Open positions: ${positions.size}\n` +
           `Wallet: ${balanceStr}\n` +
           `WS channels: ${DETECTION_URLS.length}\n` +
-          `PumpPortal: ${pumpPortalConnected ? "âœ… connected" : "âŒ NOT connected"}`
+          `PumpPortal: ${pumpPortalConnected ? "\u{2705} connected" : "\u{274C} NOT connected"}`
         );
       }
     }
