@@ -1190,16 +1190,24 @@ async function executeBuy(
 
     // Market cap filter - skip if entry MC > MAX_ENTRY_MARKET_CAP
     try {
-      const mcSnapshot = await delayedMarketCapSnapshot(mint, 0);
+      // Wait briefly for Jupiter to index new tokens; if still unknown, skip (conservative)
+      const mcSnapshot = await delayedMarketCapSnapshot(mint, 1500);
       const targetMC = mcSnapshot.marketCapUSD;
-      if (targetMC && targetMC > MAX_ENTRY_MARKET_CAP) {
+      if (targetMC == null) {
+        console.log(`⏸ Buy skipped — MC unknown (token too new for Jupiter):`, mint);
+        inFlight.delete(mint);
+        return;
+      }
+      if (targetMC > MAX_ENTRY_MARKET_CAP) {
         console.log(`⏸ Buy skipped — entry MC $${targetMC.toLocaleString()} > ${MAX_ENTRY_MARKET_CAP}:`, mint);
         inFlight.delete(mint);
         return;
       }
-      console.log(`✅ MC check passed: $${(targetMC ?? 0).toLocaleString()} for ${mint}`);
+      console.log(`✅ MC check passed: $${targetMC.toLocaleString()} for ${mint}`);
     } catch (e: any) {
-      console.log("⚠️ MC check failed, proceeding anyway:", e.message);
+      console.log("⚠️ MC check failed, skipping:", e.message);
+      inFlight.delete(mint);
+      return;
     }
 
     const buyStartMs = Date.now();
