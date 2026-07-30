@@ -1155,7 +1155,8 @@ async function submitJupiterBuy(mint: string) {
 
 async function executeBuy(
     mint: string,
-    targetSnapshotPromise?: Promise<{ tokenPriceUSD: number | null; marketCapUSD: number | null }>
+    targetSnapshotPromise?: Promise<{ tokenPriceUSD: number | null; marketCapUSD: number | null }>,
+    skipMcCheck: boolean = false
   ) {
     // Atomic duplicate guard — must be first, before any async
     if (positions.has(mint) || inFlight.has(mint)) {
@@ -1188,26 +1189,38 @@ async function executeBuy(
       return;
     }
 
-    // Market cap filter - skip if entry MC > MAX_ENTRY_MARKET_CAP
-    try {
-      // Wait briefly for Jupiter to index new tokens; if still unknown, skip (conservative)
-      const mcSnapshot = await delayedMarketCapSnapshot(mint, 1500);
-      const targetMC = mcSnapshot.marketCapUSD;
-      if (targetMC == null) {
-        console.log(`⏸ Buy skipped — MC unknown (token too new for Jupiter):`, mint);
+    // Market cap filter — skip if disabled (fast path) or MC > limit
+    if (!skipMcCheck) {
+      try {
+        const mcSnapshot = await delayedMarketCapSnapshot(mint, 0);
+        let targetMC = mcSnapshot.marketCapUSD;
+
+        // If unknown, do ONE short wait (500ms) for Jupiter to index
+        if (targetMC == null) {
+          const retrySnap = await delayedMarketCapSnapshot(mint, 500);
+          targetMC = retrySnap.marketCapUSD;
+        }
+
+        // Still unknown? Token too new — skip (conservative: don't buy blind)
+        if (targetMC == null) {
+          console.log(`⏸ Buy skipped — MC unknown after retry (token too new):`, mint);
+          inFlight.delete(mint);
+          return;
+        }
+
+        if (targetMC > MAX_ENTRY_MARKET_CAP) {
+          console.log(`⏸ Buy skipped — entry MC $${targetMC.toLocaleString()} > ${MAX_ENTRY_MARKET_CAP}:`, mint);
+          inFlight.delete(mint);
+          return;
+        }
+        console.log(`✅ MC check passed: $${targetMC.toLocaleString()} for ${mint}`);
+      } catch (e: any) {
+        console.log("⚠️ MC check error, skipping:", e.message);
         inFlight.delete(mint);
         return;
       }
-      if (targetMC > MAX_ENTRY_MARKET_CAP) {
-        console.log(`⏸ Buy skipped — entry MC $${targetMC.toLocaleString()} > ${MAX_ENTRY_MARKET_CAP}:`, mint);
-        inFlight.delete(mint);
-        return;
-      }
-      console.log(`✅ MC check passed: $${targetMC.toLocaleString()} for ${mint}`);
-    } catch (e: any) {
-      console.log("⚠️ MC check failed, skipping:", e.message);
-      inFlight.delete(mint);
-      return;
+    } else {
+      console.log(`⚡ Fast path: skipping MC check for ${mint}`);
     }
 
     const buyStartMs = Date.now();
@@ -1634,11 +1647,11 @@ function onWalletLog(log: Logs) {
   })();
 
   if (isTargetTrade && fast.isBuy && fast.solAmount >= MIN_BUY_SOL) {
-    console.log(`âš¡ IDL FAST-PATH BUY: ${fast.mint}`);
+    console.log(`⚡ IDL FAST-PATH BUY: ${fast.mint}`);
     seenSignatures.add(signature);
     // Fire and forget - don't await executeBuy to minimize latency
-    executeBuy(fast.mint, delayedMarketCapSnapshot(fast.mint)).catch(e =>
-      console.log("âš ï¸ executeBuy error (non-blocking):", e.message)
+    executeBuy(fast.mint, delayedMarketCapSnapshot(fast.mint), true).catch(e =>
+      console.log("⚠️ executeBuy error (non-blocking):", e.message)
     );
     return;
   }
