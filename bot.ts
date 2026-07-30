@@ -1641,22 +1641,19 @@ function rotateSubscriptions() {
     return;
   }
 
-  const old = activeChannels;
-  activeChannels = fresh;
-
-  if (old.length > 0) {
-    setTimeout(() => {
-      for (const ch of old) {
-        ch.conn.removeOnLogsListener(ch.subId).catch(() => {});
-        setTimeout(() => {
-          try {
-            (ch.conn as any)._rpcWebSocket?.close();
-          } catch {}
-        }, 2000);
-      }
-    }, 3000);
+  // Immediately clean up old channels to prevent memory leaks
+  for (const ch of activeChannels) {
+    try {
+      ch.conn.removeOnLogsListener(ch.subId);
+    } catch {}
+    try {
+      // Force close the underlying WebSocket
+      (ch.conn as any)._rpcWebSocket?.close();
+      (ch.conn as any)._rpcWebSocket = null;
+    } catch {}
   }
 
+  activeChannels = fresh;
   console.log(`âœ… ${fresh.length} detection channel(s) rotated onto fresh websockets`);
 }
 
@@ -1872,6 +1869,15 @@ async function start() {
   setInterval(() => {
     fetch("https://api.jup.ag/", { agent } as any).catch(() => {});
   }, 45_000);
+
+  // Memory monitor - alert if heap exceeds 1.3GB (Node limit ~1.4GB with --max-old-space-size=1536)
+  setInterval(() => {
+    const used = process.memoryUsage().heapUsed / 1024 / 1024;
+    if (used > 1200) {
+      console.log(`âš ï¸ HIGH MEMORY: ${used.toFixed(0)} MB heap used`);
+      sendTelegramAlert(`âš ï¸ <b>HIGH MEMORY</b>\n${used.toFixed(0)} MB heap used\nConsider restart if climbing.`);
+    }
+  }, 30_000);
 
   if (PUMPPORTAL_ENABLED) await startPumpPortal();
 

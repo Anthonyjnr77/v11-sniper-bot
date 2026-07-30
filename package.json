@@ -4,7 +4,8 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "start": "tsx bot.ts"
+    "start": "node --max-old-space-size=1536 --enable-source-maps node_modules/.bin/tsx bot.ts",
+    "dryrun": "DRY_RUN=true node --max-old-space-size=1536 --enable-source-maps node_modules/.bin/tsx bot.ts"
   },
   "keywords": [],
   "author": "",
