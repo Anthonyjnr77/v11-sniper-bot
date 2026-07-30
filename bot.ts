@@ -122,8 +122,8 @@ function recordStopLoss() {
   recentStopLosses.push(now);
   if (recentStopLosses.length >= CIRCUIT_BREAKER_MAX_LOSSES) {
     circuitBreakerUntil = now + CIRCUIT_BREAKER_COOLDOWN_MS;
-    console.log(`ðŸš« CIRCUIT BREAKER TRIGGERED â€” pausing new buys for ${CIRCUIT_BREAKER_COOLDOWN_MS / 60000} min (${recentStopLosses.length} stop-losses in window)`);
-    sendTelegramAlert(`ðŸš« <b>CIRCUIT BREAKER</b>\n${recentStopLosses.length} stop-losses in ${CIRCUIT_BREAKER_WINDOW_MS / 60000} min\nPausing buys for ${CIRCUIT_BREAKER_COOLDOWN_MS / 60000} min`);
+    console.log(`\u{1F6AB} CIRCUIT BREAKER TRIGGERED — pausing new buys for ${CIRCUIT_BREAKER_COOLDOWN_MS / 60000} min (${recentStopLosses.length} stop-losses in window)`);
+    sendTelegramAlert(`\u{1F6AB} <b>CIRCUIT BREAKER</b>\n${recentStopLosses.length} stop-losses in ${CIRCUIT_BREAKER_WINDOW_MS / 60000} min\nPausing buys for ${CIRCUIT_BREAKER_COOLDOWN_MS / 60000} min`);
   }
 }
 
@@ -139,10 +139,10 @@ const DRY_RUN = (process.env.DRY_RUN ?? "false") === "true";
 const DRY_RUN_LOG_INTERVAL_MS = Number(process.env.DRY_RUN_LOG_INTERVAL_MS ?? 60_000);
 let dryRunStats = { buys: 0, sells: 0, totalLatencyMs: 0, pnlSol: 0 };
 if (DRY_RUN) {
-  console.log("ðŸ§Œ DRY-RUN MODE ENABLED — no real transactions will be sent");
+  console.log("\u{1F9EA} DRY-RUN MODE ENABLED — no real transactions will be sent");
   setInterval(() => {
     if (dryRunStats.buys > 0) {
-      console.log(`ðŸŸ¢ DRY-RUN STATS: buys=${dryRunStats.buys}, avgLatency=${(dryRunStats.totalLatencyMs / dryRunStats.buys).toFixed(0)}ms, estPnL=${dryRunStats.pnlSol.toFixed(4)} SOL`);
+      console.log(`\u{1F7E2} DRY-RUN STATS: buys=${dryRunStats.buys}, avgLatency=${(dryRunStats.totalLatencyMs / dryRunStats.buys).toFixed(0)}ms, estPnL=${dryRunStats.pnlSol.toFixed(4)} SOL`);
     }
   }, DRY_RUN_LOG_INTERVAL_MS);
 }
@@ -193,7 +193,7 @@ async function refreshPrebuildCache() {
     const tokens = await res.json();
     const mints = tokens.map((t: any) => t.mint).filter((m: string) => m);
 
-    console.log(`ðŸ§¨ Pre-building cache for ${mints.length} top Pump tokens...`);
+    console.log(`\u{1F4A8} Pre-building cache for ${mints.length} top Pump tokens...`);
     let cached = 0;
     for (const mint of mints) {
       try {
@@ -501,9 +501,9 @@ async function checkWalletBalance() {
       const now = Date.now();
       if (now - lastLowBalanceAlertAt > LOW_BALANCE_ALERT_COOLDOWN_MS) {
         lastLowBalanceAlertAt = now;
-        console.log(`âš ï¸ Wallet balance low: ${sol.toFixed(4)} SOL`);
+        console.log(`\u{26A0} Wallet balance low: ${sol.toFixed(4)} SOL`);
         await sendTelegramAlert(
-          `âš ï¸ <b>LOW WALLET BALANCE</b>\nCurrent: ${sol.toFixed(4)} SOL\nThreshold: ${MIN_WALLET_BALANCE_SOL} SOL`
+          `\u{26A0} <b>LOW WALLET BALANCE</b>\nCurrent: ${sol.toFixed(4)} SOL\nThreshold: ${MIN_WALLET_BALANCE_SOL} SOL`
         );
       }
     }
@@ -679,18 +679,18 @@ async function pollTelegramCommands() {
       const text = (msg.text ?? "").trim().toLowerCase();
       if (text === "/pause") {
         botPaused = true;
-        console.log("â¸ï¸ Bot PAUSED via Telegram command");
-        await sendTelegramAlert("â¸ï¸ <b>Bot paused.</b> No new buys will be taken. Existing positions still monitored/sold normally. Send /resume to continue.");
+        console.log("\u{23F8} Bot PAUSED via Telegram command");
+        await sendTelegramAlert("\u{23F8} <b>Bot paused.</b> No new buys will be taken. Existing positions still monitored/sold normally. Send /resume to continue.");
       } else if (text === "/resume") {
         botPaused = false;
-        console.log("â–¶ï¸ Bot RESUMED via Telegram command");
-        await sendTelegramAlert("â–¶ï¸ <b>Bot resumed.</b> New buys re-enabled.");
+        console.log("\u{25B6} Bot RESUMED via Telegram command");
+        await sendTelegramAlert("\u{25B6} <b>Bot resumed.</b> New buys re-enabled.");
       } else if (text === "/status") {
         const balanceStr = lastKnownBalanceLamports !== null
           ? `${(lastKnownBalanceLamports / 1e9).toFixed(4)} SOL`
           : "unknown";
         await sendTelegramAlert(
-          `ðŸ“Š <b>Status</b>\n` +
+          `\u{1F4E2} <b>Status</b>\n` +
           `Paused: ${botPaused ? "YES" : "no"}\n` +
           `Open positions: ${positions.size}\n` +
           `Wallet: ${balanceStr}\n` +
@@ -1140,8 +1140,16 @@ async function executeBuy(
     mint: string,
     targetSnapshotPromise?: Promise<{ tokenPriceUSD: number | null; marketCapUSD: number | null }>
   ) {
+    // Atomic duplicate guard — must be first, before any async
+    if (positions.has(mint) || inFlight.has(mint)) {
+      console.log("⏸ Buy skipped — already holding or in-flight:", mint);
+      return;
+    }
+    inFlight.add(mint);
+
     if (botPaused) {
       console.log("⏸ Buy skipped — bot is paused:", mint);
+      inFlight.delete(mint);
       return;
     }
 
@@ -1149,6 +1157,7 @@ async function executeBuy(
     if (isCircuitBreakerActive()) {
       const remaining = getCircuitBreakerRemainingMs();
       console.log(`🚫 Buy skipped — circuit breaker active (${(remaining / 1000).toFixed(0)}s remaining):`, mint);
+      inFlight.delete(mint);
       return;
     }
 
@@ -1158,11 +1167,9 @@ async function executeBuy(
         `\⏸ Buy skipped — wallet ${(lastKnownBalanceLamports / 1e9).toFixed(4)} SOL below required ~${(requiredLamports / 1e9).toFixed(4)} SOL:`,
         mint
       );
+      inFlight.delete(mint);
       return;
     }
-
-    if (positions.has(mint) || inFlight.has(mint)) return;
-    inFlight.add(mint);
 
     // Market cap filter - skip if entry MC > MAX_ENTRY_MARKET_CAP
     try {
@@ -1252,7 +1259,7 @@ async function executeBuy(
       }
       if (!sig) {
         await sendTelegramAlert(
-          `âŒ <b>BUY FAILED ON-CHAIN</b>\nMint: <code>${mint}</code>\n` +
+          `❌ <b>BUY FAILED ON-CHAIN</b>\nMint: <code>${mint}</code>\n` +
           `Primary tx failed; rebuild and Jupiter fallback were unavailable.\n` +
           `<a href="https://solscan.io/tx/${failedPrimarySig}">View failed transaction</a>`
         );
@@ -1263,8 +1270,8 @@ async function executeBuy(
       confirmation = await confirmationPromise;
       if (confirmation === "failed") {
         await sendTelegramAlert(
-          `âŒ <b>BUY FAILED ON-CHAIN</b>\nMint: <code>${mint}</code>\n` +
-          `Retry also failed â€” the exact program error is in the Render logs.\n` +
+          `❌ <b>BUY FAILED ON-CHAIN</b>\nMint: <code>${mint}</code>\n` +
+          `Retry also failed — the exact program error is in the Render logs.\n` +
           `<a href="https://solscan.io/tx/${sig}">View transaction</a>`
         );
         return;
@@ -1272,9 +1279,9 @@ async function executeBuy(
     }
     if (actual <= 0) {
       const state = confirmation === "confirmed" ? "confirmed transaction, but no token balance" : "transaction still pending and no token balance";
-      console.log(`âš ï¸ Could not confirm ${state} for`, mint, sig);
+      console.log(`⚠️ Could not confirm ${state} for`, mint, sig);
       await sendTelegramAlert(
-        `âš ï¸ <b>BALANCE WARNING</b>\n${state} for <code>${mint}</code>.\n` +
+        `⚠️ <b>BALANCE WARNING</b>\n${state} for <code>${mint}</code>.\n` +
         `<a href="https://solscan.io/tx/${sig}">View transaction</a>`
       );
       return;
@@ -1310,7 +1317,7 @@ async function executeBuy(
     });
 
     await sendTelegramAlert(
-      `ðŸš€ <b>BUY EXECUTED</b>\n` +
+      `\u{1F680} <b>BUY EXECUTED</b>\n` +
       `Mint: <code>${mint}</code>\n` +
       `Amount: ${(BUY_AMOUNT / 1e9).toFixed(3)} SOL\n` +
       `<b>The Man's entry MC:</b> ${fmtMC(targetSnapshot.marketCapUSD)}\n` +
@@ -1378,7 +1385,7 @@ async function executeSell(mint: string, amount: number, reason: string) {
   });
 
   await sendTelegramAlert(
-    `âœ… <b>SELL EXECUTED</b> (${reason})\n` +
+    `\u{2705} <b>SELL EXECUTED</b> (${reason})\n` +
     `Mint: <code>${mint}</code>\n` +
     `Market Cap: ${fmtMC(marketCapUSD)}\n` +
     `PnL (this portion): ${pnlPercent >= 0 ? "+" : ""}${pnlPercent.toFixed(1)}%\n` +
@@ -1691,9 +1698,9 @@ async function resolveWebSocketCtor(): Promise<any> {
 async function startPumpPortal() {
   const WS = await resolveWebSocketCtor();
   if (!WS) {
-    console.log("âš ï¸ PumpPortal channel DISABLED â€” no WebSocket support. Set NODE_VERSION=22 on Render, or run: npm i ws");
+    console.log("\u{26A0} PumpPortal channel DISABLED — no WebSocket support. Set NODE_VERSION=22 on Render, or run: npm i ws");
     await sendTelegramAlert(
-      "âš ï¸ <b>PumpPortal channel is OFF</b>\nThis Node version has no WebSocket support. Set NODE_VERSION=22 in Render environment settings (or npm i ws) â€” this is your fastest detection channel."
+      "\u{26A0} <b>PumpPortal channel is OFF</b>\nThis Node version has no WebSocket support. Set NODE_VERSION=22 in Render environment settings (or npm i ws) — this is your fastest detection channel."
     );
     return;
   }
@@ -1902,8 +1909,8 @@ async function start() {
   setInterval(() => {
     const used = process.memoryUsage().heapUsed / 1024 / 1024;
     if (used > 1200) {
-      console.log(`âš ï¸ HIGH MEMORY: ${used.toFixed(0)} MB heap used`);
-      sendTelegramAlert(`âš ï¸ <b>HIGH MEMORY</b>\n${used.toFixed(0)} MB heap used\nConsider restart if climbing.`);
+      console.log(`\u{26A0} HIGH MEMORY: ${used.toFixed(0)} MB heap used`);
+      sendTelegramAlert(`\u{26A0} <b>HIGH MEMORY</b>\n${used.toFixed(0)} MB heap used\nConsider restart if climbing.`);
     }
   }, 30_000);
 
