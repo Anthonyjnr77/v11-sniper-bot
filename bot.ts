@@ -1962,7 +1962,7 @@ async function start() {
     `Buy: ${BUY_AMOUNT_SOL} SOL | Min copied buy: ${MIN_BUY_SOL / 1e9} SOL | Max entry MC: $${MAX_ENTRY_MARKET_CAP.toLocaleString()}\n` +
     `Buy path: Pump SDK → Jupiter\n` +
     `Channels: ${DETECTION_URLS.length} rotating WS + polling\n` +
-    `Filters: min 19 SOL buy, max 10k MC entry\n` +
+    `Filters: min 9 SOL buy, max 10k MC entry\n` +
     `Commands: /pause /resume /status`
   );
 }
