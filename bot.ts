@@ -1910,13 +1910,19 @@ async function pollForMissedTrades() {
 
 const app = express();
 app.get("/", (_req, res) => res.send("Engine Active"));
-app.get("/health", (_req, res) => res.json({
-  status: "ok",
-  positions: positions.size,
-  paused: botPaused,
-  pumpPortal: pumpPortalConnected,
-  uptime: process.uptime(),
-}));
+app.get("/health", (_req, res) => {
+  const mem = process.memoryUsage().heapUsed / 1024 / 1024;
+  const wsStatus = pumpPortalConnected ? "connected" : "disconnected";
+  res.json({
+    status: "ok",
+    positions: positions.size,
+    paused: botPaused,
+    pumpPortal: wsStatus,
+    uptime: process.uptime(),
+    memoryMB: Math.round(mem),
+    timestamp: Date.now(),
+  });
+});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Keep-alive server on port ${PORT}`));
