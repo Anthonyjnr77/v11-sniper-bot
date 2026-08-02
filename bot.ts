@@ -867,6 +867,16 @@ const submissionConnections = SUBMISSION_RPCS.map(url =>
   new Connection(url, { commitment: "processed", httpAgent: agent })
 );
 
+// Priority fee sampling RPCs (only use ones that support getRecentPrioritizationFees)
+const PRIORITY_FEE_RPCS = [
+  process.env.BUY_EXEC_RPC_URL,
+  process.env.RPC_URL,
+].filter((v): v is string => Boolean(v));
+
+const priorityFeeConnections = PRIORITY_FEE_RPCS.map(url =>
+  new Connection(url, { commitment: "processed", httpAgent: agent })
+);
+
 // Dynamic priority fee cache (refreshed every 15s)
 let dynamicPriorityFeeLamports = BASE_PRIORITY_FEE;
 let lastPriorityFeeUpdate = 0;
@@ -874,9 +884,9 @@ const PRIORITY_FEE_TTL_MS = 15_000;
 
 async function refreshPriorityFee() {
   try {
-    // Fetch recent prioritization fees from multiple RPCs, use 95th percentile
+    // Fetch recent prioritization fees from Helius RPCs only (others return 0)
     const fees = await Promise.allSettled(
-      submissionConnections.slice(0, 3).map(c => c.getRecentPrioritizationFees())
+      priorityFeeConnections.map(c => c.getRecentPrioritizationFees())
     );
     const allFees: number[] = [];
     for (const f of fees) {
@@ -884,7 +894,10 @@ async function refreshPriorityFee() {
         allFees.push(...f.value.map(x => x.prioritizationFee));
       }
     }
-    if (allFees.length === 0) return;
+    if (allFees.length === 0) {
+      console.log("⚠️ No priority fee data from Helius, using base fee");
+      return;
+    }
     allFees.sort((a, b) => a - b);
     const p95 = allFees[Math.floor(allFees.length * 0.95)] ?? BASE_PRIORITY_FEE;
     // Add 20% buffer, cap at 5x base
