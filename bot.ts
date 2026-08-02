@@ -891,7 +891,10 @@ async function refreshPriorityFee() {
     const allFees: number[] = [];
     for (const f of fees) {
       if (f.status === "fulfilled" && f.value) {
+        console.log(`[PriorityFee] RPC returned ${f.value.length} fee samples`);
         allFees.push(...f.value.map(x => x.prioritizationFee));
+      } else if (f.status === "rejected") {
+        console.log(`[PriorityFee] RPC error:`, f.reason?.message);
       }
     }
     if (allFees.length === 0) {
@@ -903,9 +906,9 @@ async function refreshPriorityFee() {
     // Add 20% buffer, cap at 5x base
     dynamicPriorityFeeLamports = Math.min(Math.ceil(p95 * 1.2), BASE_PRIORITY_FEE * 5);
     lastPriorityFeeUpdate = Date.now();
-    console.log(`âš™ï¸ Dynamic priority fee updated: ${dynamicPriorityFeeLamports} lamports (P95: ${p95})`);
+    console.log(`⚡ Dynamic priority fee updated: ${dynamicPriorityFeeLamports} lamports (P95: ${p95}, samples: ${allFees.length})`);
   } catch (e: any) {
-    console.log("âš ï¸ Priority fee refresh failed:", e.message);
+    console.log("⚠️ Priority fee refresh failed:", e.message);
   }
 }
 
