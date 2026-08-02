@@ -16,6 +16,7 @@
     "@pump-fun/pump-sdk": "^1.36.0",
     "@solana/spl-token": "^0.4.15",
     "@solana/web3.js": "^1.91.0",
+    "@triton-one/yellowstone-grpc": "^5.0.9",
     "@types/node": "^20.0.0",
     "bs58": "^6.0.0",
     "cross-env": "^10.1.0",

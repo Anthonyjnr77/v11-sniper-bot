@@ -8,6 +8,7 @@ import {
   Transaction,
   TransactionMessage,
   ComputeBudgetProgram,
+  type SimulatedTransactionResponse,
 } from "@solana/web3.js";
 import type { Logs } from "@solana/web3.js";
 import { Program, AnchorProvider, BorshEventCoder } from "@coral-xyz/anchor";
@@ -18,6 +19,17 @@ import fetch from "node-fetch";
 import bs58 from "bs58";
 import https from "https";
 import express from "express";
+
+export interface GrpcTradeEvent {
+  type: "buy" | "sell";
+  mint: string;
+  user: string;
+  solAmount: number;
+  tokenAmount: number;
+  signature: string;
+  slot: number;
+  timestamp: number;
+}
 
 /* ================= CONFIG ================= */
 
@@ -70,7 +82,20 @@ const BROADCAST_RPC_URL = process.env.BROADCAST_RPC_URL ?? "https://api.mainnet-
 const broadcastConnection = makeConnection(BROADCAST_RPC_URL);
 
 const wallet = Keypair.fromSecretKey(bs58.decode(requireEnv("PRIVATE_KEY")));
-const TARGET_WALLET = new PublicKey(requireEnv("TARGET_WALLET"));
+
+// Multi-target wallet support: comma-separated list
+const TARGET_WALLETS = (process.env.TARGET_WALLETS ?? process.env.TARGET_WALLET ?? "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean)
+  .map((s) => new PublicKey(s));
+
+if (TARGET_WALLETS.length === 0) {
+  throw new Error("Missing required env var: TARGET_WALLETS (or TARGET_WALLET)");
+}
+
+// Backwards compatibility: first wallet is primary
+const TARGET_WALLET = TARGET_WALLETS[0]!;
 
 const BUY_AMOUNT_SOL = Number(process.env.BUY_AMOUNT_SOL);
 const BUY_AMOUNT = BUY_AMOUNT_SOL * 1e9;
@@ -80,6 +105,31 @@ const RETRY_SLIPPAGE_BPS = Number(process.env.RETRY_SLIPPAGE_BPS ?? 5000);
 const MIN_BUY_SOL = Number(process.env.MIN_BUY_SOL ?? 19) * 1e9;  // Only copy buys >= 19 SOL
 const MAX_ENTRY_MARKET_CAP = Number(process.env.MAX_ENTRY_MARKET_CAP ?? 10000); // Don't buy if MC > 10k
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS ?? 2500);
+
+// Jito configuration
+const JITO_BLOCK_ENGINE_URL = process.env.JITO_URL ?? "https://mainnet.block-engine.jito.wtf/api/v1/bundles";
+const JITO_TIP_ACCOUNTS: string[] = [
+  "9n3d1K5YD2vECAbRFhFFGYNNjiXtHXJWn9F31t89vsAV",
+  "aTtUk2DHgLhKZRDjePq6eiHRKC1XXFMBiSUfQ2JNDbN",
+  "B1mrQSpdeMU9gCvkJ6VsXVVoYjRGkNA7TtjMyqxrhecH",
+  "9ttgPBBhRYFuQccdR1DSnb7hydsWANoDsV3P9kaGMCEh",
+  "4xgEmT58RwTNsF5xm2RMYCnR1EVukdK8a1i2qFjnJFu3",
+  "EoW3SUQap7ZeynXQ2QJ847aerhxbPVr843uMeTfc9dxM",
+  "E2eSqe33tuhAHKTrwky5uEjaVqnb2T9ns6nHHUrN8588",
+  "ARTtviJkLLt6cHGQDydfo1Wyk6M4VGZdKZ2ZhdnJL336",
+];
+const JITO_TIP_BPS = Number(process.env.JITO_TIP_BPS ?? 2000); // 20% of position
+
+function randomTipAccount(): PublicKey {
+  const idx = Math.floor(Math.random() * JITO_TIP_ACCOUNTS.length);
+  const addr = JITO_TIP_ACCOUNTS[idx] ?? JITO_TIP_ACCOUNTS[0];
+  return new PublicKey(addr as string);
+}
+
+// gRPC Detection (Shyft Yellowstone)
+const GRPC_ENDPOINT = process.env.GRPC_ENDPOINT ?? "https://grpc.shyft.to";
+const GRPC_TOKEN = process.env.GRPC_TOKEN;
+const GRPC_ENABLED = !!GRPC_TOKEN;
 
 const MAX_PRICE_IMPACT = Number(process.env.MAX_PRICE_IMPACT ?? 0.15);
 const ONLY_DIRECT_ROUTES = (process.env.ONLY_DIRECT_ROUTES ?? "true") === "true";
@@ -91,6 +141,11 @@ const SOL_MINT = "So11111111111111111111111111111111111111112";
 
 const JUP_BASE = "https://api.jup.ag/swap/v1";
 const JUP_API_KEY = process.env.JUP_API_KEY;
+
+// bloXroute (free tier)
+const BLOXROUTE_AUTH = process.env.BLOXROUTE_AUTH;
+const BLOXROUTE_ENABLED = !!BLOXROUTE_AUTH;
+const BLOXROUTE_ENDPOINT = "https://api.bloxroute.com/solana/v1/tx/submit";
 
 const TP_TIERS = [
   { tp: 7.0, sellFraction: 0.5 },
@@ -381,40 +436,68 @@ function tryFastDecode(logs: string[]): PumpTradeEvent | null {
   return null;
 }
 
-/* ================= JITO ================= */
+/* ================= DYNAMIC COMPUTE UNITS ================= */
 
-const JITO_BLOCK_ENGINE_URL =
-  process.env.JITO_URL ?? "https://mainnet.block-engine.jito.wtf/api/v1/bundles";
+async function simulateAndGetComputeUnits(
+  connection: Connection,
+  instructions: any[],
+  payer: PublicKey
+): Promise<number> {
+  try {
+    const message = new TransactionMessage({
+      payerKey: payer,
+      recentBlockhash: (await connection.getLatestBlockhash("processed")).blockhash,
+      instructions: [
+        ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }), // max for simulation
+        ...instructions,
+      ],
+    }).compileToV0Message();
 
-const JITO_TIP_ACCOUNTS: string[] = [
-  "9n3d1K5YD2vECAbRFhFFGYNNjiXtHXJWn9F31t89vsAV",
-  "aTtUk2DHgLhKZRDjePq6eiHRKC1XXFMBiSUfQ2JNDbN",
-  "B1mrQSpdeMU9gCvkJ6VsXVVoYjRGkNA7TtjMyqxrhecH",
-  "9ttgPBBhRYFuQccdR1DSnb7hydsWANoDsV3P9kaGMCEh",
-  "4xgEmT58RwTNsF5xm2RMYCnR1EVukdK8a1i2qFjnJFu3",
-  "EoW3SUQap7ZeynXQ2QJ847aerhxbPVr843uMeTfc9dxM",
-  "E2eSqe33tuhAHKTrwky5uEjaVqnb2T9ns6nHHUrN8588",
-  "ARTtviJkLLt6cHGQDydfo1Wyk6M4VGZdKZ2ZhdnJL336",
-];
-const JITO_TIP_BPS = Number(process.env.JITO_TIP_BPS ?? 2000); // 20% of position
-const JITO_TIP_LAMPORTS = Math.floor(BUY_AMOUNT * JITO_TIP_BPS / 10000);
+    const tx = new VersionedTransaction(message);
+    tx.sign([wallet]);
 
-function randomTipAccount(): PublicKey {
-  const idx = Math.floor(Math.random() * JITO_TIP_ACCOUNTS.length);
-  const addr = JITO_TIP_ACCOUNTS[idx] ?? JITO_TIP_ACCOUNTS[0];
-  return new PublicKey(addr as string);
+    const simResult = await connection.simulateTransaction(tx, {
+      replaceRecentBlockhash: true,
+      sigVerify: false,
+    });
+
+    if (simResult.value.err) {
+      throw new Error(`Simulation failed: ${JSON.stringify(simResult.value.err)}`);
+    }
+
+    const unitsConsumed = simResult.value.unitsConsumed ?? 0;
+    if (unitsConsumed > 0) {
+      // Add 15% buffer, cap at 1.4M
+      return Math.min(Math.ceil(unitsConsumed * 1.15), 1_400_000);
+    }
+  } catch (e: any) {
+    console.log("⚠️ Simulation failed, using default CU:", e.message);
+  }
+  return LOCAL_PUMP_COMPUTE_UNITS; // fallback to fixed 200k
+}
+
+/* ================= JITO TIP FLOOR ================= */
+
+function getJitoTipLamports(buyAmountLamports: number): number {
+  const calculatedTip = Math.floor(buyAmountLamports * (JITO_TIP_BPS / 10000));
+  const minTip = 1_000_000; // 0.001 SOL minimum
+  return Math.max(calculatedTip, minTip);
+}
+
+function JITO_TIP_LAMPORTS(buyAmountLamports: number = BUY_AMOUNT): number {
+  return getJitoTipLamports(buyAmountLamports);
 }
 
 function logFeeSizingWarning() {
   const currentPriorityFee = getDynamicPriorityFee();
-  const totalFeeLamports = JITO_TIP_LAMPORTS + currentPriorityFee;
+  const totalFeeLamports = JITO_TIP_LAMPORTS() + currentPriorityFee;
   const pctOfBuy = (totalFeeLamports / BUY_AMOUNT) * 100;
   console.log(
-    `ðŸ’¸ Fee sizing: Jito tip + priority fee â‰ˆ ${(totalFeeLamports / 1e9).toFixed(4)} SOL ` +
+    `💸 Fee sizing: Jito tip + priority fee ≈ ${(totalFeeLamports / 1e9).toFixed(4)} SOL ` +
     `(~${pctOfBuy.toFixed(1)}% of ${(BUY_AMOUNT / 1e9).toFixed(4)} SOL buy)`
   );
   console.log(
-    `ðŸŽ¯ Effective slippage: ${(SLIPPAGE_BPS / 100).toFixed(0)}% (retry ${(RETRY_SLIPPAGE_BPS / 100).toFixed(0)}%) â€” ` +
+    `🎯 Effective slippage: ${(SLIPPAGE_BPS / 100).toFixed(0)}% (retry ${(RETRY_SLIPPAGE_BPS / 100).toFixed(0)}%) — ` +
     `if this is not 30/50, a SLIPPAGE_BPS env var on Render is overriding the code`
   );
 }
@@ -854,8 +937,9 @@ async function submitSignedTransaction(rawBytes: Uint8Array, useJito = BUY_AMOUN
   if (useJito) {
     jitoAttempt = (async () => {
       const blockhash = await getBlockhashFast();
+      const tipLamports = JITO_TIP_LAMPORTS();
       const tipTx = new Transaction({ feePayer: wallet.publicKey, recentBlockhash: blockhash }).add(
-        SystemProgram.transfer({ fromPubkey: wallet.publicKey, toPubkey: randomTipAccount(), lamports: JITO_TIP_LAMPORTS })
+        SystemProgram.transfer({ fromPubkey: wallet.publicKey, toPubkey: randomTipAccount(), lamports: tipLamports })
       );
       tipTx.sign(wallet);
       const res = await fetchJson(JITO_BLOCK_ENGINE_URL, {
@@ -869,10 +953,37 @@ async function submitSignedTransaction(rawBytes: Uint8Array, useJito = BUY_AMOUN
     jitoAttempt = Promise.resolve(null);
   }
 
+  // bloXroute submission (free tier) - 3rd path
+  let bloxrouteAttempt: Promise<string | null> = Promise.resolve(null);
+  if (BLOXROUTE_ENABLED) {
+    bloxrouteAttempt = (async () => {
+      try {
+        const res = await fetch(BLOXROUTE_ENDPOINT, {
+          agent,
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": BLOXROUTE_AUTH!,
+          },
+          body: JSON.stringify({
+            transaction: bs58.encode(rawBytes),
+            skip_preflight: true,
+          }),
+        });
+        const data = await res.json();
+        if (data?.result?.signature) return "bloXroute";
+        throw new Error("bloXroute submit failed");
+      } catch (e: any) {
+        console.log("⚠️ bloXroute submit error:", e.message);
+        return null;
+      }
+    })();
+  }
+
   scheduleRebroadcasts(rawBytes);
   try {
-    // Race all RPC attempts + Jito, first non-null wins
-    const allAttempts = [...rpcAttempts, jitoAttempt];
+    // Race all RPC attempts + Jito + bloXroute, first non-null wins
+    const allAttempts = [...rpcAttempts, jitoAttempt, bloxrouteAttempt];
     const via = await Promise.race(allAttempts.filter(p => p !== null));
     if (!via) throw new Error("All submission paths failed");
     console.log(`ðŸ“¤ Transaction submitted via ${via}:`, signature);
@@ -996,12 +1107,13 @@ async function sendRawTransactionDual(rawTx: Uint8Array): Promise<string | null>
        tokenProgram,
      });
      const dynamicFee = getDynamicPriorityFee();
-    const priorityMicroLamports = Math.ceil((dynamicFee * 1_000_000) / LOCAL_PUMP_COMPUTE_UNITS);
+    const dynamicComputeUnits = await simulateAndGetComputeUnits(pumpSdkConnection, instructions, wallet.publicKey);
+    const priorityMicroLamports = Math.ceil((dynamicFee * 1_000_000) / dynamicComputeUnits);
      const message = new TransactionMessage({
        payerKey: wallet.publicKey,
         recentBlockhash: latest.blockhash,
        instructions: [
-         ComputeBudgetProgram.setComputeUnitLimit({ units: LOCAL_PUMP_COMPUTE_UNITS }),
+         ComputeBudgetProgram.setComputeUnitLimit({ units: dynamicComputeUnits }),
          ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityMicroLamports }),
          ...instructions,
        ],
@@ -1179,7 +1291,7 @@ async function executeBuy(
       return;
     }
 
-    const requiredLamports = BUY_AMOUNT + JITO_TIP_LAMPORTS + 3_000_000;
+    const requiredLamports = BUY_AMOUNT + JITO_TIP_LAMPORTS() + 3_000_000;
     if (lastKnownBalanceLamports !== null && lastKnownBalanceLamports < requiredLamports) {
       console.log(
         `\⏸ Buy skipped — wallet ${(lastKnownBalanceLamports / 1e9).toFixed(4)} SOL below required ~${(requiredLamports / 1e9).toFixed(4)} SOL:`,
@@ -1929,8 +2041,29 @@ app.listen(PORT, () => console.log(`Keep-alive server on port ${PORT}`));
 
 /* ================= START ================= */
 
+// gRPC Detection Manager (Yellowstone/Shyft) - optional
+let createGrpcDetectionManager: ((endpoint: string, token: string, targetWallets: string[]) => {
+  setTradeHandler: (handler: (event: GrpcTradeEvent) => void) => void;
+  setStatusHandler: (handler: (status: string) => void) => void;
+  start: () => Promise<void>;
+  stop: () => Promise<void>;
+  addTargetWallet: (wallet: string) => void;
+  removeTargetWallet: (wallet: string) => void;
+  getStatus: () => boolean;
+}) | null = null;
+
+let grpcManager: {
+  setTradeHandler: (handler: (event: GrpcTradeEvent) => void) => void;
+  setStatusHandler: (handler: (status: string) => void) => void;
+  start: () => Promise<void>;
+  stop: () => Promise<void>;
+  addTargetWallet: (wallet: string) => void;
+  removeTargetWallet: (wallet: string) => void;
+  getStatus: () => boolean;
+} | null = null;
+
 async function start() {
-  console.log("ðŸš€ Copy-trade bot starting. Target:", TARGET_WALLET.toString());
+  console.log("ðŸš€ Copy-trade bot starting. Targets:", TARGET_WALLETS.map(w => w.toString()).join(", "));
 
   logFeeSizingWarning();
 
@@ -1938,6 +2071,32 @@ async function start() {
 
   // Start background blockhash refresher (replaces old 25s interval)
   startBlockhashRefresher();
+
+  // Initialize gRPC detection if enabled - dynamically load module
+  if (GRPC_ENABLED) {
+    try {
+      const mod = await import("./grpc-detection.js");
+      createGrpcDetectionManager = mod.createGrpcDetectionManager;
+      grpcManager = createGrpcDetectionManager(GRPC_ENDPOINT, GRPC_TOKEN, TARGET_WALLETS.map(w => w.toString()));
+      grpcManager.setTradeHandler(handleGrpcTradeEvent);
+      grpcManager.setStatusHandler((status) => {
+        console.log(`[gRPC] Status: ${status}`);
+      });
+      await grpcManager.start();
+      console.log("✅ gRPC detection connected");
+    } catch (err: any) {
+      if (err.message?.includes("Cannot find native binding") || err.code === "ERR_MODULE_NOT_FOUND") {
+        console.log("⚠️ gRPC detection unavailable (native binding missing - expected on Windows local dev):", err.message);
+        console.log("   gRPC will work on Render (Linux). Falling back to WebSocket detection.");
+      } else {
+        console.error("❌ gRPC detection failed to start:", err.message);
+      }
+      createGrpcDetectionManager = null;
+      grpcManager = null;
+    }
+  } else {
+    console.log("⚠️ gRPC detection disabled (no GRPC_TOKEN set)");
+  }
 
   rotateSubscriptions();
   setInterval(rotateSubscriptions, 60 * 1000);
@@ -1962,15 +2121,46 @@ async function start() {
 
   await checkWalletBalance();
 
-  console.log("✅ Bot fully running (rotating WS + polling + Pump SDK buys)");
+  const targetList = TARGET_WALLETS.map(w => `<code>${w.toString()}</code>`).join("\n");
+  console.log("✅ Bot fully running (rotating WS + polling + gRPC + Pump SDK buys)");
   await sendTelegramAlert(
-    `✅ <b>Bot Active</b>\nTarget: <code>${TARGET_WALLET.toString()}</code>\n` +
+    `✅ <b>Bot Active</b>\nTargets:\n${targetList}\n` +
     `Buy: ${BUY_AMOUNT_SOL} SOL | Min copied buy: ${MIN_BUY_SOL / 1e9} SOL | Max entry MC: $${MAX_ENTRY_MARKET_CAP.toLocaleString()}\n` +
     `Buy path: Pump SDK → Jupiter\n` +
-    `Channels: ${DETECTION_URLS.length} rotating WS + polling\n` +
+    `Channels: ${DETECTION_URLS.length} rotating WS + polling + gRPC\n` +
     `Filters: min 9 SOL buy, max 10k MC entry\n` +
     `Commands: /pause /resume /status`
   );
+}
+
+// Handle gRPC trade events
+async function handleGrpcTradeEvent(event: GrpcTradeEvent) {
+  try {
+    console.log(`🚀 [gRPC] ${event.type.toUpperCase()} detected: ${event.mint} by ${event.user} (${event.solAmount / 1e9} SOL)`);
+
+    if (event.type === "buy") {
+      // Check minimum buy threshold
+      if (event.solAmount >= MIN_BUY_SOL) {
+        // Fire and forget - don't await executeBuy to minimize latency
+        executeBuy(event.mint, delayedMarketCapSnapshot(event.mint), true).catch(e =>
+          console.log("⚠️ executeBuy error (non-blocking):", e.message)
+        );
+      } else {
+        console.log(`⏭️ [gRPC] Buy below threshold (${event.solAmount / 1e9} SOL < ${MIN_BUY_SOL / 1e9} SOL): ${event.mint}`);
+      }
+    } else if (event.type === "sell") {
+      // Check if we hold this token and target sold
+      const held = positions.get(event.mint);
+      if (held && held.remainingAmount > 0) {
+        console.log("🚨 [gRPC] Target SOLD a token we hold — dumping:", event.mint);
+        executeSell(event.mint, held.remainingAmount, "TARGET_EXITED").catch(e =>
+          console.log("⚠️ executeSell error (non-blocking):", e.message)
+        );
+      }
+    }
+  } catch (err: any) {
+    console.error("[gRPC] Event handler error:", err.message);
+  }
 }
 
 start();
