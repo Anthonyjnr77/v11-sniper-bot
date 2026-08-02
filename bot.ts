@@ -59,9 +59,16 @@ const pumpPortalAgent = new https.Agent({
 });
 
 function makeConnection(url: string): Connection {
-  return new Connection(url, {
+  if (!url || typeof url !== "string") {
+    throw new Error(`Invalid URL: "${url}"`);
+  }
+  const trimmed = url.trim();
+  if (!trimmed.startsWith("http://") && !trimmed.startsWith("https://")) {
+    throw new Error(`Endpoint URL must start with http: or https:: "${trimmed}"`);
+  }
+  return new Connection(trimmed, {
     commitment: "processed",
-    wsEndpoint: url.replace("https", "wss"),
+    wsEndpoint: trimmed.replace("https", "wss"),
     httpAgent: agent,
   });
 }
@@ -1804,7 +1811,7 @@ function rotateSubscriptions() {
       const subId = conn.onLogs(TARGET_WALLET, onWalletLog, "processed");
       fresh.push({ conn, subId });
     } catch (e: any) {
-      console.log("âš ï¸ Failed to open detection channel:", e.message);
+      console.log("âš ï¸ Failed to open detection channel for URL:", url, "->", e.message);
     }
   }
 
