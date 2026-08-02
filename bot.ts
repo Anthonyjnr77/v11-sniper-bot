@@ -903,6 +903,11 @@ async function refreshPriorityFee() {
     }
     allFees.sort((a, b) => a - b);
     const p95 = allFees[Math.floor(allFees.length * 0.95)] ?? BASE_PRIORITY_FEE;
+    // If P95 is 0 (Helius free tier limitation), use base fee
+    if (p95 === 0) {
+      console.log("⚠️ P95 priority fee is 0 (RPC limitation), using base fee");
+      return;
+    }
     // Add 20% buffer, cap at 5x base
     dynamicPriorityFeeLamports = Math.min(Math.ceil(p95 * 1.2), BASE_PRIORITY_FEE * 5);
     lastPriorityFeeUpdate = Date.now();
