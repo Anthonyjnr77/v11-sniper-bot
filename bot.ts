@@ -75,15 +75,21 @@ function makeConnection(url: string): Connection {
 
 const connection = makeConnection(RPC_URL);
 
-const WS_FANOUT = Math.max(1, Math.min(2, Number(process.env.WS_FANOUT ?? 2)));
-const EXTRA_WS_URLS = (process.env.EXTRA_WS_URLS ?? "https://api.mainnet-beta.solana.com")
+const WS_FANOUT = Math.max(1, Math.min(1, Number(process.env.WS_FANOUT ?? 1))); // Force 1 for Helius free tier
+const EXTRA_WS_URLS = (process.env.EXTRA_WS_URLS ?? "")
   .split(",")
   .map((s) => s.trim())
-  .filter(Boolean);
+  .filter((s) => s.startsWith("http://") || s.startsWith("https://"));
 
 const DETECTION_URLS: string[] = [];
 for (let i = 0; i < WS_FANOUT; i++) DETECTION_URLS.push(RPC_URL);
 DETECTION_URLS.push(...EXTRA_WS_URLS);
+
+// Deduplicate URLs to avoid multiple connections to same endpoint
+const uniqueDetectionUrls = [...new Set(DETECTION_URLS)];
+if (uniqueDetectionUrls.length !== DETECTION_URLS.length) {
+  console.log(`⚠️ Deduplicated detection URLs: ${DETECTION_URLS.length} -> ${uniqueDetectionUrls.length}`);
+}
 
 const BROADCAST_RPC_URL = process.env.BROADCAST_RPC_URL ?? "https://api.mainnet-beta.solana.com";
 const broadcastConnection = makeConnection(BROADCAST_RPC_URL);
@@ -1010,19 +1016,30 @@ async function submitSignedTransaction(rawBytes: Uint8Array, useJito = BUY_AMOUN
 
   scheduleRebroadcasts(rawBytes);
   try {
-    // Race all RPC attempts + Jito + bloXroute, first non-null wins
-    const allAttempts = [...rpcAttempts, jitoAttempt, bloxrouteAttempt];
-    const via = await Promise.race(allAttempts.filter(p => p !== null));
-    if (!via) throw new Error("All submission paths failed");
-    console.log(`ðŸ“¤ Transaction submitted via ${via}:`, signature);
+    // Race all RPC attempts + Jito + bloXroute, first successful non-null path wins
+    const allAttempts = [...rpcAttempts];
+    if (useJito) allAttempts.push(jitoAttempt);
+    if (BLOXROUTE_ENABLED) allAttempts.push(bloxrouteAttempt);
+
+    const via = await Promise.any(
+      allAttempts.map(async (attempt) => {
+        const result = await attempt;
+        if (!result) throw new Error("no successful submission path");
+        return result;
+      })
+    );
+
+    console.log(`💡 Transaction submitted via ${via}:`, signature);
     return signature;
   } catch {
     // Final fallback: retry on dedicated RPC with retries
     try {
       await buyExecConnection.sendRawTransaction(rawBytes, { skipPreflight: true, maxRetries: 2 });
-      console.log(`ðŸ“¤ Transaction submitted via RPC (retry):`, signature);
+      console.log(`💡 Transaction submitted via RPC (retry):`, signature);
       return signature;
-    } catch { return null; }
+    } catch {
+      return null;
+    }
   }
 }
 
@@ -1823,37 +1840,46 @@ interface DetectionChannel {
 }
 
 let activeChannels: DetectionChannel[] = [];
+let consecutive429s = 0;
 
 function rotateSubscriptions() {
+  const urls = uniqueDetectionUrls.length > 0 ? uniqueDetectionUrls : DETECTION_URLS;
   const fresh: DetectionChannel[] = [];
-  for (const url of DETECTION_URLS) {
+  for (const url of urls) {
     try {
       const conn = makeConnection(url);
       const subId = conn.onLogs(TARGET_WALLET, onWalletLog, "processed");
       fresh.push({ conn, subId });
     } catch (e: any) {
-      console.log("âš ï¸ Failed to open detection channel for URL:", url, "->", e.message);
+      const msg = e.message ?? String(e);
+      console.log("⚠️ Failed to open detection channel for URL:", url, "->", msg);
+      if (msg.includes("429")) consecutive429s++;
     }
   }
 
   if (fresh.length === 0) {
-    console.log("âš ï¸ Rotation produced no channels â€” keeping the old ones alive");
+    console.log("⚠️ Rotation produced no channels — keeping the old ones alive");
+    if (consecutive429s > 2) {
+      console.log("🐌 Too many 429s, extending next rotation to 5 minutes");
+      setTimeout(rotateSubscriptions, 5 * 60 * 1000);
+      return;
+    }
     return;
   }
 
-  // Immediately clean up old channels to prevent memory leaks
+  consecutive429s = 0;
+
   for (const ch of activeChannels) {
     try {
       ch.conn.removeOnLogsListener(ch.subId);
     } catch {}
     try {
-      // Force close the underlying WebSocket
       (ch.conn as any)._rpcWebSocket?.close?.();
     } catch {}
   }
 
   activeChannels = fresh;
-  console.log(`âœ… ${fresh.length} detection channel(s) rotated onto fresh websockets`);
+  console.log(`✅ ${fresh.length} detection channel(s) rotated onto fresh websockets`);
 }
 
 /* ================= PUMPPORTAL CHANNEL ================= */

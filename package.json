@@ -4,8 +4,8 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "start": "cross-env node --max-old-space-size=1536 --enable-source-maps tsx bot.ts",
-    "dryrun": "cross-env DRY_RUN=true node --max-old-space-size=1536 --enable-source-maps tsx bot.ts"
+    "start": "cross-env node --max-old-space-size=1536 --enable-source-maps ./node_modules/tsx/dist/cli.js bot.ts",
+    "dryrun": "cross-env DRY_RUN=true node --max-old-space-size=1536 --enable-source-maps ./node_modules/tsx/dist/cli.js bot.ts"
   },
   "keywords": [],
   "author": "",
