@@ -14,6 +14,7 @@ import type { Logs } from "@solana/web3.js";
 import { Program, AnchorProvider, BorshEventCoder } from "@coral-xyz/anchor";
 import { getMint, getAssociatedTokenAddress, TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID } from "@solana/spl-token";
 import { OnlinePumpSdk, PUMP_SDK, getBuyTokenAmountFromSolAmount, bondingCurvePda } from "@pump-fun/pump-sdk";
+import { OnlinePumpAmmSdk, PUMP_AMM_SDK, canonicalPumpPoolPda } from "@pump-fun/pump-swap-sdk";
 import BN from "bn.js";
 import fetch from "node-fetch";
 import bs58 from "bs58";
@@ -114,7 +115,6 @@ const BUY_AMOUNT_SOL = Number(process.env.BUY_AMOUNT_SOL);
 const BUY_AMOUNT = BUY_AMOUNT_SOL * 1e9;
 const BASE_PRIORITY_FEE = Number(process.env.PRIORITY_FEE_LAMPORTS ?? 500_000);
 const SLIPPAGE_BPS = Number(process.env.SLIPPAGE_BPS ?? 3000);
-const RETRY_SLIPPAGE_BPS = Number(process.env.RETRY_SLIPPAGE_BPS ?? 5000);
 const MIN_BUY_SOL = Number(process.env.MIN_BUY_SOL ?? 19) * 1e9;  // Only copy buys >= 19 SOL
 const MAX_ENTRY_MARKET_CAP = Number(process.env.MAX_ENTRY_MARKET_CAP ?? 10000); // Don't buy if MC > 10k
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS ?? 2500);
@@ -321,6 +321,7 @@ const pumpSdkConnection = new Connection(PUMP_SDK_RPC_URL, {
   httpAgent: agent,
 });
 const pumpSdkForBuild = new OnlinePumpSdk(pumpSdkConnection);
+const pumpAmmSdkForBuild = new OnlinePumpAmmSdk(pumpSdkConnection);
 
 /* ================= DEDICATED BUY EXECUTION RPC ================= */
 // Low-latency RPC for transaction submission only (no WS)
@@ -510,8 +511,8 @@ function logFeeSizingWarning() {
     `(~${pctOfBuy.toFixed(1)}% of ${(BUY_AMOUNT / 1e9).toFixed(4)} SOL buy)`
   );
   console.log(
-    `🎯 Effective slippage: ${(SLIPPAGE_BPS / 100).toFixed(0)}% (retry ${(RETRY_SLIPPAGE_BPS / 100).toFixed(0)}%) — ` +
-    `if this is not 30/50, a SLIPPAGE_BPS env var on Render is overriding the code`
+    `🎯 Effective slippage: ${(SLIPPAGE_BPS / 100).toFixed(0)}% — ` +
+    `if this is not 30, a SLIPPAGE_BPS env var on Render is overriding the code`
   );
 }
 
@@ -1032,14 +1033,7 @@ async function submitSignedTransaction(rawBytes: Uint8Array, useJito = BUY_AMOUN
     console.log(`💡 Transaction submitted via ${via}:`, signature);
     return signature;
   } catch {
-    // Final fallback: retry on dedicated RPC with retries
-    try {
-      await buyExecConnection.sendRawTransaction(rawBytes, { skipPreflight: true, maxRetries: 2 });
-      console.log(`💡 Transaction submitted via RPC (retry):`, signature);
-      return signature;
-    } catch {
-      return null;
-    }
+    return null;
   }
 }
 
@@ -1051,6 +1045,26 @@ async function sendSwapDual(txBase64: string): Promise<string | null> {
 
 async function sendRawTransactionDual(rawTx: Uint8Array): Promise<string | null> {
   return submitSignedTransaction(rawTx);
+}
+
+async function validateBuyTransaction(rawTx: Uint8Array): Promise<boolean> {
+  try {
+    const tx = VersionedTransaction.deserialize(rawTx);
+    const result = await buyExecConnection.simulateTransaction(tx, {
+      commitment: "processed",
+      replaceRecentBlockhash: true,
+      sigVerify: false,
+    });
+    if (result.value.err) {
+      const logs = result.value.logs?.filter(Boolean).join(" | ") ?? "no simulation logs";
+      console.log("Buy candidate simulation failed:", JSON.stringify(result.value.err), logs);
+      return false;
+    }
+    return true;
+  } catch (error: any) {
+    console.log("Buy candidate simulation unavailable:", error.message);
+    return false;
+  }
 }
 
  /* ================= PUMPPORTAL-BUILT TRANSACTIONS ================= */
@@ -1070,75 +1084,27 @@ async function sendRawTransactionDual(rawTx: Uint8Array): Promise<string | null>
        throw new Error("unsupported token program");
      }
 
-      // Check bonding curve cache first to avoid "zero tokens" on fresh tokens
-      let cachedCurve = bondingCurveCache.get(mint);
-      if (cachedCurve && Date.now() - cachedCurve.timestamp < BONDING_CURVE_TTL_MS) {
-        console.log("âš¡ Using cached bonding curve for", mint);
-      } else {
-        // Fall back to pre-build cache for top tokens
-        const prebuilt = prebuildCache.get(mint);
-        if (prebuilt && Date.now() - prebuilt.timestamp < PREBUILD_CACHE_TTL_MS) {
-          console.log("ðŸ§¨ Using pre-built bonding curve for", mint);
-          cachedCurve = prebuilt;
-        } else {
-          cachedCurve = undefined;
-        }
-      }
-
       const [buyState, mintState, feeConfig] = await Promise.all([
         pumpSdkForBuild.fetchBuyState(mintKey, wallet.publicKey, tokenProgram), // dedicated SDK RPC
         getMint(pumpSdkConnection, mintKey, "processed", tokenProgram), // dedicated SDK RPC
         pumpSdkForBuild.fetchFeeConfig(), // dedicated SDK RPC
       ]);
      const solAmount = new BN(BUY_AMOUNT);
-
-      // buyState.bondingCurve is the bonding curve account address (PublicKey).
-      // getBuyTokenAmountFromSolAmount requires a BondingCurve object with reserves.
-      // If we have cached reserves (from PumpPortal), use them. Otherwise fetch and parse the account.
-      let bondingCurveData: any;
-      if (cachedCurve) {
-        bondingCurveData = {
-          virtualTokenReserves: cachedCurve.virtualTokenReserves,
-          virtualQuoteReserves: cachedCurve.virtualQuoteReserves,
-          realTokenReserves: cachedCurve.realTokenReserves,
-          realQuoteReserves: cachedCurve.realQuoteReserves,
-          tokenTotalSupply: (typeof mintState.supply === "bigint" ? new BN(mintState.supply.toString()) : mintState.supply),
-          complete: false,
-          creator: new PublicKey("11111111111111111111111111111111"),
-          isMayhemMode: false,
-          isCashbackCoin: false,
-          quoteMint: new PublicKey(SOL_MINT),
-        };
-      } else {
-        // Fetch bonding curve account data and parse reserves
-        const bondingCurveAddress = bondingCurvePda(mintKey);
-        const bcAccount = await pumpSdkConnection.getAccountInfo(bondingCurveAddress, "processed");
-        if (!bcAccount || bcAccount.data.length < 8 + 8 + 8 + 8 + 8 + 8) {
-          throw new Error("Failed to fetch bonding curve account data");
-        }
-        const data = bcAccount.data;
-        // Pump.fun bonding curve layout: discriminator(8) + virtualSolReserves(8) + virtualTokenReserves(8) + realSolReserves(8) + realTokenReserves(8) + totalSupply(8)
-        bondingCurveData = {
-          virtualTokenReserves: new BN(data.subarray(16, 24).readBigUInt64LE(0).toString()),
-          virtualQuoteReserves: new BN(data.subarray(8, 16).readBigUInt64LE(0).toString()),
-          realTokenReserves: new BN(data.subarray(32, 40).readBigUInt64LE(0).toString()),
-          realQuoteReserves: new BN(data.subarray(24, 32).readBigUInt64LE(0).toString()),
-          tokenTotalSupply: (typeof mintState.supply === "bigint" ? new BN(mintState.supply.toString()) : mintState.supply),
-          complete: data[48] === 1,
-          creator: new PublicKey("11111111111111111111111111111111"),
-          isMayhemMode: false,
-          isCashbackCoin: false,
-          quoteMint: new PublicKey(SOL_MINT),
-        };
+      const bondingCurve = buyState.bondingCurve as any;
+      if (bondingCurve.complete || new BN(bondingCurve.realTokenReserves).isZero()) {
+        throw new Error("bonding curve is complete; PumpSwap route required");
       }
-     const tokenAmount = getBuyTokenAmountFromSolAmount({
-       global,
-       feeConfig,
-       mintSupply: (typeof mintState.supply === "bigint" ? new BN(mintState.supply.toString()) : mintState.supply),
-       bondingCurve: bondingCurveData,
-       amount: solAmount,
-       quoteMint: new PublicKey(SOL_MINT),
-     });
+      if (bondingCurve.quoteMint && !new PublicKey(bondingCurve.quoteMint).equals(new PublicKey(SOL_MINT))) {
+        throw new Error(`unsupported quote mint: ${bondingCurve.quoteMint.toString()}`);
+      }
+      const tokenAmount = getBuyTokenAmountFromSolAmount({
+        global,
+        feeConfig,
+        mintSupply: (typeof mintState.supply === "bigint" ? new BN(mintState.supply.toString()) : mintState.supply),
+        bondingCurve,
+        amount: solAmount,
+        quoteMint: new PublicKey(SOL_MINT),
+      });
      if (tokenAmount.isZero()) throw new Error("bonding curve returned zero tokens");
 
      const instructions = await PUMP_SDK.buyInstructions({
@@ -1171,6 +1137,41 @@ async function sendRawTransactionDual(rawTx: Uint8Array): Promise<string | null>
      return null;
    }
  }
+
+async function buildLocalPumpSwapBuyTx(mint: string, slippageBps = SLIPPAGE_BPS): Promise<Uint8Array | null> {
+  try {
+    const mintKey = new PublicKey(mint);
+    const latest = await pumpSdkConnection.getLatestBlockhash("processed");
+    const poolKey = canonicalPumpPoolPda(mintKey, new PublicKey(SOL_MINT));
+    const swapState = await pumpAmmSdkForBuild.swapSolanaState(poolKey, wallet.publicKey);
+    if (!swapState.pool.quoteMint.equals(new PublicKey(SOL_MINT))) {
+      throw new Error(`unsupported PumpSwap quote mint: ${swapState.pool.quoteMint.toString()}`);
+    }
+    const instructions = await PUMP_AMM_SDK.buyQuoteInput(
+      swapState,
+      new BN(BUY_AMOUNT),
+      slippageBps / 100
+    );
+    const dynamicFee = getDynamicPriorityFee();
+    const dynamicComputeUnits = await simulateAndGetComputeUnits(pumpSdkConnection, instructions, wallet.publicKey);
+    const priorityMicroLamports = Math.ceil((dynamicFee * 1_000_000) / dynamicComputeUnits);
+    const message = new TransactionMessage({
+      payerKey: wallet.publicKey,
+      recentBlockhash: latest.blockhash,
+      instructions: [
+        ComputeBudgetProgram.setComputeUnitLimit({ units: dynamicComputeUnits }),
+        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityMicroLamports }),
+        ...instructions,
+      ],
+    }).compileToV0Message();
+    const tx = new VersionedTransaction(message);
+    tx.sign([wallet]);
+    return tx.serialize();
+  } catch (error: any) {
+    console.log("PumpSwap local build unavailable:", error.message);
+    return null;
+  }
+}
 
 // PumpPortal builds the current, correct Pump.fun transaction server-side â€”
 // they maintain the account layouts through every Pump.fun breaking change,
@@ -1409,37 +1410,41 @@ async function executeBuy(
         // Mock PnL estimation (random walk for demo)
         dryRunStats.pnlSol += (Math.random() - 0.45) * 0.01;
       } else {
-        // ===== PHASE 2: PARALLEL BUILDER RACE =====
-        // Fire all builders simultaneously; first valid signed tx wins.
-        // This eliminates the sequential wait that was adding 300-800ms latency.
-        async function buildAndSend(builderName: string, buildFn: () => Promise<Uint8Array | null>): Promise<string | null> {
+        // Build candidates in order, then submit only the first valid transaction.
+        async function buildCandidate(builderName: string, buildFn: () => Promise<Uint8Array | null>): Promise<Uint8Array | null> {
           try {
             const tx = await buildFn();
-            if (tx) {
-              const s = await sendRawTransactionDual(tx);
-              if (s) {
-                console.log(`ðŸš€ BUY submitted (${builderName}):`, mint, s);
-                return s;
-              }
-            }
+            if (tx) return tx;
           } catch (e: any) {
             console.log(`âš ï¸ ${builderName} build error:`, e.message);
           }
           return null;
         }
 
-        const [sigPumpPortal, sigLocal, sigJupiter] = await Promise.allSettled([
-          buildAndSend("PumpPortal-trade-local", () => buildPumpPortalTx("buy", mint, BUY_AMOUNT / 1e9, true, SLIPPAGE_BPS, "pump")),
-          buildAndSend("local Pump SDK",     () => buildLocalPumpBuyTx(mint, SLIPPAGE_BPS)),
-          buildAndSend("Jupiter",            () => buildJupiterBuyTx(mint)),
-        ]);
+        const candidates: Array<[string, () => Promise<Uint8Array | null>]> = [
+          ["PumpPortal-trade-local", () => buildPumpPortalTx("buy", mint, BUY_AMOUNT / 1e9, true, SLIPPAGE_BPS, "pump")],
+          ["local Pump SDK", () => buildLocalPumpBuyTx(mint, SLIPPAGE_BPS)],
+          ["local PumpSwap SDK", () => buildLocalPumpSwapBuyTx(mint, SLIPPAGE_BPS)],
+          ["Jupiter", () => buildJupiterBuyTx(mint)],
+        ];
+        let selectedBuilder = "";
+        let rawTx: Uint8Array | null = null;
+        for (const [builderName, buildFn] of candidates) {
+          const candidate = await buildCandidate(builderName, buildFn);
+          if (candidate && await validateBuyTransaction(candidate)) {
+            rawTx = candidate;
+            selectedBuilder = builderName;
+            break;
+          }
+        }
 
-        sig = (sigPumpPortal.status === "fulfilled" ? sigPumpPortal.value : null) ?? (sigLocal.status === "fulfilled" ? sigLocal.value : null) ?? (sigJupiter.status === "fulfilled" ? sigJupiter.value : null) ?? null;
-
-        if (!sig) {
+        if (!rawTx) {
           console.log("âŒ Buy aborted — all builders failed for", mint);
           return;
         }
+        sig = await sendRawTransactionDual(rawTx);
+        if (sig) console.log(`ðŸš€ BUY submitted (${selectedBuilder}):`, mint, sig);
+        if (!sig) return;
       }
 
       const myMcPromise = delayedMarketCapSnapshot(mint, 2000);
