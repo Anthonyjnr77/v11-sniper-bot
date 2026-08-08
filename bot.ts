@@ -1251,6 +1251,7 @@ async function waitForConfirmation(signature: string, attempts = 20, delayMs = 5
       if (status) {
         if (status.err) {
           console.log("âŒ Buy transaction failed on-chain:", signature, JSON.stringify(status.err));
+          await logFailedTransaction(signature);
           return "failed";
         }
         if (status.confirmationStatus === "confirmed" || status.confirmationStatus === "finalized") return "confirmed";
@@ -1259,6 +1260,19 @@ async function waitForConfirmation(signature: string, attempts = 20, delayMs = 5
     if (i < attempts - 1) await new Promise((r) => setTimeout(r, delayMs));
   }
   return "pending";
+}
+
+async function logFailedTransaction(signature: string): Promise<void> {
+  try {
+    const tx = await connection.getTransaction(signature, {
+      commitment: "confirmed",
+      maxSupportedTransactionVersion: 0,
+    });
+    const logs = tx?.meta?.logMessages?.filter(Boolean) ?? [];
+    if (logs.length > 0) console.log("On-chain program logs:", logs.join(" | "));
+  } catch (error: any) {
+    console.log("Could not fetch failed transaction logs:", error.message);
+  }
 }
 
 async function waitForBalance(mint: string, attempts = 20, delayMs = 500): Promise<number> {
@@ -1435,43 +1449,13 @@ async function executeBuy(
       let confirmation = await confirmationPromise;
 
       if (confirmation === "failed") {
-        // Rebuild ONCE with completely fresh state at higher slippage. Local
-        // SDK first (derived accounts, current price), then PumpPortal.
-        // Jupiter last — it usually cannot even quote a seconds-old token.
-        console.log(`↪️ Buy failed on-chain — rebuilding fresh at ${RETRY_SLIPPAGE_BPS / 100}% slippage:`, mint);
-      const failedPrimarySig = sig;
-      sig = null;
-      let retryTx = await buildLocalPumpBuyTx(mint, RETRY_SLIPPAGE_BPS);
-      if (!retryTx) retryTx = await buildPumpPortalTx("buy", mint, BUY_AMOUNT / 1e9, true, RETRY_SLIPPAGE_BPS, "pump");
-      if (!retryTx) retryTx = await buildPumpPortalTx("buy", mint, BUY_AMOUNT / 1e9, true, RETRY_SLIPPAGE_BPS, "auto");
-      if (retryTx) {
-        sig = await sendRawTransactionDual(retryTx);
-        if (sig) console.log("ðŸš€ BUY retry submitted (fresh build, higher slippage):", mint, sig);
-      }
-      if (!sig) {
-        console.log("â†ªï¸ Rebuild unavailable â€” trying Jupiter for", mint);
-        sig = await submitJupiterBuy(mint);
-      }
-      if (!sig) {
         await sendTelegramAlert(
           `❌ <b>BUY FAILED ON-CHAIN</b>\nMint: <code>${mint}</code>\n` +
-          `Primary tx failed; rebuild and Jupiter fallback were unavailable.\n` +
-          `<a href="https://solscan.io/tx/${failedPrimarySig}">View failed transaction</a>`
-        );
-        return;
-      }
-      confirmationPromise = waitForConfirmation(sig);
-      actual = await waitForBalance(mint);
-      confirmation = await confirmationPromise;
-      if (confirmation === "failed") {
-        await sendTelegramAlert(
-          `❌ <b>BUY FAILED ON-CHAIN</b>\nMint: <code>${mint}</code>\n` +
-          `Retry also failed — the exact program error is in the Render logs.\n` +
+          `The single submitted transaction failed; no retry was sent.\n` +
           `<a href="https://solscan.io/tx/${sig}">View transaction</a>`
         );
         return;
       }
-    }
     if (actual <= 0) {
       const state = confirmation === "confirmed" ? "confirmed transaction, but no token balance" : "transaction still pending and no token balance";
       console.log(`⚠️ Could not confirm ${state} for`, mint, sig);
@@ -1796,14 +1780,13 @@ function onWalletLog(log: Logs) {
   const signature = log.signature;
   if (seenSignatures.has(signature)) return;
 
-  console.log(`ðŸ‘€ Activity: https://solscan.io/tx/${signature}`);
-
   const fast = tryFastDecode(log.logs);
   const isTargetTrade = fast && (() => {
     try { return new PublicKey(fast.user).equals(TARGET_WALLET); } catch { return false; }
   })();
 
   if (isTargetTrade && fast.isBuy && fast.solAmount >= MIN_BUY_SOL) {
+    console.log(`Target wallet activity: https://solscan.io/tx/${signature}`);
     console.log(`⚡ IDL FAST-PATH BUY: ${fast.mint}`);
     seenSignatures.add(signature);
     // Fire and forget - don't await executeBuy to minimize latency
@@ -1813,6 +1796,7 @@ function onWalletLog(log: Logs) {
     return;
   }
   if (isTargetTrade && !fast.isBuy) {
+    console.log(`Target wallet activity: https://solscan.io/tx/${signature}`);
     const held = positions.get(fast.mint);
     if (held && held.remainingAmount > 0) {
       console.log("ðŸš¨ Fast-path: target SOLD a token we hold â€” dumping:", fast.mint);
@@ -1824,13 +1808,7 @@ function onWalletLog(log: Logs) {
     }
   }
 
-  if (fast && !isTargetTrade) {
-    console.log("â†ªï¸ Pump.fun trade event belongs to another wallet â€” racing RPC transaction fetch");
-  } else if (fast && fast.isBuy && fast.solAmount < MIN_BUY_SOL) {
-    console.log("â†ªï¸ Pump.fun buy is below MIN_BUY_SOL â€” racing RPC transaction fetch");
-  } else {
-    console.log("â†ªï¸ No direct Pump.fun TradeEvent â€” racing RPC transaction fetch");
-  }
+  if (fast && !isTargetTrade) return;
   handleTx(signature);
 }
 
