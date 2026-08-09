@@ -1549,6 +1549,10 @@ async function executeSell(mint: string, amount: number, reason: string) {
   );
 }
 
+function targetExitSellAmount(position: Position): number {
+  return Math.floor(position.remainingAmount * 0.9);
+}
+
 /* ================= MONITOR ================= */
 
 async function monitor() {
@@ -1697,7 +1701,8 @@ async function handleTxInternal(tx: any, signature: string): Promise<boolean> {
         const held = positions.get(pre.mint);
         if (held && held.remainingAmount > 0) {
           console.log("ðŸš¨ TARGET EXITED â€” dumping:", pre.mint);
-          executeSell(pre.mint, held.remainingAmount, "TARGET_EXITED");
+          const sellAmount = targetExitSellAmount(held);
+          if (sellAmount > 0) executeSell(pre.mint, sellAmount, "TARGET_EXITED");
           return true;
         }
       }
@@ -1778,7 +1783,8 @@ function onWalletLog(log: Logs) {
     if (held && held.remainingAmount > 0) {
       console.log("ðŸš¨ Fast-path: target SOLD a token we hold â€” dumping:", fast.mint);
       seenSignatures.add(signature);
-      executeSell(fast.mint, held.remainingAmount, "TARGET_EXITED").catch(e =>
+      const sellAmount = targetExitSellAmount(held);
+      if (sellAmount > 0) executeSell(fast.mint, sellAmount, "TARGET_EXITED").catch(e =>
         console.log("âš ï¸ executeSell error (non-blocking):", e.message)
       );
       return;
@@ -1906,7 +1912,8 @@ async function startPumpPortal() {
            if (held && held.remainingAmount > 0) {
              console.log("ðŸš¨ PumpPortal: target SOLD a token we hold â€” dumping:", msg.mint);
              seenSignatures.add(msg.signature);
-             executeSell(msg.mint, held.remainingAmount, "TARGET_EXITED");
+             const sellAmount = targetExitSellAmount(held);
+             if (sellAmount > 0) executeSell(msg.mint, sellAmount, "TARGET_EXITED");
            }
            return;
          }
@@ -2162,7 +2169,8 @@ async function handleGrpcTradeEvent(event: GrpcTradeEvent) {
       const held = positions.get(event.mint);
       if (held && held.remainingAmount > 0) {
         console.log("🚨 [gRPC] Target SOLD a token we hold — dumping:", event.mint);
-        executeSell(event.mint, held.remainingAmount, "TARGET_EXITED").catch(e =>
+        const sellAmount = targetExitSellAmount(held);
+        if (sellAmount > 0) executeSell(event.mint, sellAmount, "TARGET_EXITED").catch(e =>
           console.log("⚠️ executeSell error (non-blocking):", e.message)
         );
       }
