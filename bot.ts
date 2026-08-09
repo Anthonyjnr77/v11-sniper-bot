@@ -1361,39 +1361,8 @@ async function executeBuy(
       return;
     }
 
-    // Market cap filter — skip if disabled (fast path) or MC > limit
-    if (!skipMcCheck) {
-      try {
-        const mcSnapshot = await delayedMarketCapSnapshot(mint, 0);
-        let targetMC = mcSnapshot.marketCapUSD;
-
-        // If unknown, do ONE short wait (500ms) for Jupiter to index
-        if (targetMC == null) {
-          const retrySnap = await delayedMarketCapSnapshot(mint, 500);
-          targetMC = retrySnap.marketCapUSD;
-        }
-
-        // Still unknown? Token too new — skip (conservative: don't buy blind)
-        if (targetMC == null) {
-          console.log(`⏸ Buy skipped — MC unknown after retry (token too new):`, mint);
-          inFlight.delete(mint);
-          return;
-        }
-
-        if (targetMC > MAX_ENTRY_MARKET_CAP) {
-          console.log(`⏸ Buy skipped — entry MC $${targetMC.toLocaleString()} > ${MAX_ENTRY_MARKET_CAP}:`, mint);
-          inFlight.delete(mint);
-          return;
-        }
-        console.log(`✅ MC check passed: $${targetMC.toLocaleString()} for ${mint}`);
-      } catch (e: any) {
-        console.log("⚠️ MC check error, skipping:", e.message);
-        inFlight.delete(mint);
-        return;
-      }
-    } else {
-      console.log(`⚡ Fast path: skipping MC check for ${mint}`);
-    }
+    // Buy immediately. Market cap is measured after execution for reporting.
+    console.log(`⚡ Immediate copy-buy path: ${mint}`);
 
     const buyStartMs = Date.now();
 
@@ -1410,32 +1379,35 @@ async function executeBuy(
         // Mock PnL estimation (random walk for demo)
         dryRunStats.pnlSol += (Math.random() - 0.45) * 0.01;
       } else {
-        // Build candidates in order, then submit only the first valid transaction.
-        async function buildCandidate(builderName: string, buildFn: () => Promise<Uint8Array | null>): Promise<Uint8Array | null> {
-          try {
-            const tx = await buildFn();
-            if (tx) return tx;
-          } catch (e: any) {
-            console.log(`âš ï¸ ${builderName} build error:`, e.message);
-          }
-          return null;
-        }
-
         const candidates: Array<[string, () => Promise<Uint8Array | null>]> = [
-          ["PumpPortal-trade-local", () => buildPumpPortalTx("buy", mint, BUY_AMOUNT / 1e9, true, SLIPPAGE_BPS, "pump")],
+          ["PumpPortal-trade-local", () => buildPumpPortalTx("buy", mint, BUY_AMOUNT / 1e9, true, SLIPPAGE_BPS, "auto")],
           ["local Pump SDK", () => buildLocalPumpBuyTx(mint, SLIPPAGE_BPS)],
           ["local PumpSwap SDK", () => buildLocalPumpSwapBuyTx(mint, SLIPPAGE_BPS)],
           ["Jupiter", () => buildJupiterBuyTx(mint)],
         ];
+
+        // Build and validate every route concurrently. The first valid route wins,
+        // so a slow or unavailable Pump.fun route cannot delay PumpSwap/Jupiter.
+        const racedCandidates = candidates.map(async ([builderName, buildFn]) => {
+          try {
+            const candidate = await buildFn();
+            if (candidate && await validateBuyTransaction(candidate)) {
+              return { builderName, rawTx: candidate };
+            }
+          } catch (e: any) {
+            console.log(`âš ï¸ ${builderName} build error:`, e.message);
+          }
+          throw new Error(`${builderName} unavailable`);
+        });
+
         let selectedBuilder = "";
         let rawTx: Uint8Array | null = null;
-        for (const [builderName, buildFn] of candidates) {
-          const candidate = await buildCandidate(builderName, buildFn);
-          if (candidate && await validateBuyTransaction(candidate)) {
-            rawTx = candidate;
-            selectedBuilder = builderName;
-            break;
-          }
+        try {
+          const winner = await Promise.any(racedCandidates);
+          selectedBuilder = winner.builderName;
+          rawTx = winner.rawTx;
+        } catch {
+          // Every builder failed or produced a transaction rejected by simulation.
         }
 
         if (!rawTx) {
@@ -1991,7 +1963,7 @@ async function startPumpPortal() {
             } catch {}
           }
 
-         executeBuy(msg.mint, delayedMarketCapSnapshot(msg.mint)).catch(e =>
+         executeBuy(msg.mint, delayedMarketCapSnapshot(msg.mint), true).catch(e =>
             console.log("âš ï¸ executeBuy error (non-blocking):", e.message)
           );
        } catch {
