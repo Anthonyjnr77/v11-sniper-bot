@@ -2131,13 +2131,13 @@ async function start() {
   await checkWalletBalance();
 
   const targetList = TARGET_WALLETS.map(w => `<code>${w.toString()}</code>`).join("\n");
-  console.log("✅ Bot fully running (rotating WS + polling + gRPC + Pump SDK buys)");
+  console.log("✅ Bot fully running (immediate copy-buy mode)");
   await sendTelegramAlert(
     `✅ <b>Bot Active</b>\nTargets:\n${targetList}\n` +
-    `Buy: ${BUY_AMOUNT_SOL} SOL | Min copied buy: ${MIN_BUY_SOL / 1e9} SOL | Max entry MC: $${MAX_ENTRY_MARKET_CAP.toLocaleString()}\n` +
-    `Buy path: Pump SDK → Jupiter\n` +
+    `Buy: ${BUY_AMOUNT_SOL} SOL | Minimum copied buy: ${MIN_BUY_SOL / 1e9} SOL\n` +
+    `Buy path: concurrent PumpPortal / Pump SDK / PumpSwap / Jupiter\n` +
     `Channels: ${DETECTION_URLS.length} rotating WS + polling + gRPC\n` +
-    `Filters: min 9 SOL buy, max 10k MC entry\n` +
+    `Pre-buy MC filter: disabled\n` +
     `Commands: /pause /resume /status`
   );
 }
