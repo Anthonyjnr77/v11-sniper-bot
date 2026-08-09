@@ -115,8 +115,6 @@ const BUY_AMOUNT_SOL = Number(process.env.BUY_AMOUNT_SOL);
 const BUY_AMOUNT = BUY_AMOUNT_SOL * 1e9;
 const BASE_PRIORITY_FEE = Number(process.env.PRIORITY_FEE_LAMPORTS ?? 500_000);
 const SLIPPAGE_BPS = Number(process.env.SLIPPAGE_BPS ?? 3000);
-const MIN_BUY_SOL = Number(process.env.MIN_BUY_SOL ?? 19) * 1e9;  // Only copy buys >= 19 SOL
-const MAX_ENTRY_MARKET_CAP = Number(process.env.MAX_ENTRY_MARKET_CAP ?? 10000); // Don't buy if MC > 10k
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS ?? 2500);
 
 // Jito configuration
@@ -159,23 +157,6 @@ const JUP_API_KEY = process.env.JUP_API_KEY;
 const BLOXROUTE_AUTH = process.env.BLOXROUTE_AUTH;
 const BLOXROUTE_ENABLED = !!BLOXROUTE_AUTH;
 const BLOXROUTE_ENDPOINT = "https://api.bloxroute.com/solana/v1/tx/submit";
-
-const TP_TIERS = [
-  { tp: 7.0, sellFraction: 0.5 },
-  { tp: 11.0, sellFraction: 0.3 },
-  { tp: 15.0, sellFraction: 0.2 },
-];
-
-const TIME_BASED_TP = [
-  { seconds: 15, sellFraction: 0.2 },
-  { seconds: 25, sellFraction: 0.3 },
-  { seconds: 40, sellFraction: 0.5 },
-];
-const TIME_BASED_TP_MAX_PNL = 3.0;
-
-const SL_PCT = -0.35;
-const TRAIL_DRAWDOWN = -0.2;
-const MAX_HOLD_MS = 5 * 60 * 1000;
 
 /* ================= CIRCUIT BREAKER & DRY-RUN ================= */
 const CIRCUIT_BREAKER_MAX_LOSSES = Number(process.env.CIRCUIT_BREAKER_MAX_LOSSES ?? 3);
@@ -731,8 +712,6 @@ interface Position {
   costBasisLamports: number;
   entryTime: number;
   highestValue: number;
-  tiersHit: boolean[];
-  timeTiersHit: boolean[];
   entryMarketCapUSD: number | null;
 }
 
@@ -1452,8 +1431,6 @@ async function executeBuy(
       costBasisLamports: BUY_AMOUNT,
       entryTime: Date.now(),
       highestValue: 0,
-      tiersHit: TP_TIERS.map(() => false),
-      timeTiersHit: TIME_BASED_TP.map(() => false),
       entryMarketCapUSD: mySnapshot.marketCapUSD,
     });
 
@@ -1552,77 +1529,6 @@ async function executeSell(mint: string, amount: number, reason: string) {
 function targetExitSellAmount(position: Position): number {
   return Math.floor(position.remainingAmount * 0.9);
 }
-
-/* ================= MONITOR ================= */
-
-async function monitor() {
-  for (const [mint, pos] of positions.entries()) {
-    if (pos.remainingAmount <= 0) continue;
-
-    const elapsedSeconds = (Date.now() - pos.entryTime) / 1000;
-
-    getQuote(mint, SOL_MINT, pos.remainingAmount, 1).then((quote) => {
-      if (!quote) return;
-
-      const value = Number(quote.outAmount);
-      const pnl = (value - pos.costBasisLamports) / pos.costBasisLamports;
-
-      if (pnl <= SL_PCT) {
-        recordStopLoss();
-        executeSell(mint, pos.remainingAmount, `SL ${(pnl * 100).toFixed(0)}%`);
-        return;
-      }
-      if (Date.now() - pos.entryTime > MAX_HOLD_MS) {
-        executeSell(mint, pos.remainingAmount, "MAX_TIME");
-        return;
-      }
-      if (value > pos.costBasisLamports) {
-        if (value > pos.highestValue) pos.highestValue = value;
-        const drawdown = (value - pos.highestValue) / pos.highestValue;
-        if (pos.highestValue > pos.costBasisLamports && drawdown < TRAIL_DRAWDOWN) {
-          executeSell(mint, pos.remainingAmount, "TRAILING_STOP");
-          return;
-        }
-      }
-
-      if (pnl < TIME_BASED_TP_MAX_PNL) {
-        for (let i = 0; i < TIME_BASED_TP.length; i++) {
-          if (pos.timeTiersHit[i]) continue;
-          const tier = TIME_BASED_TP[i];
-          if (!tier) continue;
-          if (elapsedSeconds >= tier.seconds) {
-            const sellAmount = Math.min(
-              Math.floor(pos.originalAmount * tier.sellFraction),
-              pos.remainingAmount
-            );
-            if (sellAmount > 0) {
-              executeSell(mint, sellAmount, `TIME-${tier.seconds}s (PnL: ${(pnl * 100).toFixed(0)}%)`);
-              pos.timeTiersHit[i] = true;
-            }
-          }
-        }
-      }
-
-      for (let i = 0; i < TP_TIERS.length; i++) {
-        if (pos.tiersHit[i]) continue;
-        const tier = TP_TIERS[i];
-        if (!tier) continue;
-        if (pnl >= tier.tp) {
-          const sellAmount = Math.min(
-            Math.floor(pos.originalAmount * tier.sellFraction),
-            pos.remainingAmount
-          );
-          if (sellAmount > 0) {
-            executeSell(mint, sellAmount, `TP${i + 1} +${(tier.tp * 100).toFixed(0)}%`);
-            pos.tiersHit[i] = true;
-          }
-        }
-      }
-    });
-  }
-}
-
-setInterval(monitor, 1500);
 
 /* ================= DETECTION ================= */
 
@@ -1767,7 +1673,7 @@ function onWalletLog(log: Logs) {
     try { return new PublicKey(fast.user).equals(TARGET_WALLET); } catch { return false; }
   })();
 
-  if (isTargetTrade && fast.isBuy && fast.solAmount >= MIN_BUY_SOL) {
+  if (isTargetTrade && fast.isBuy) {
     console.log(`Target wallet activity: https://solscan.io/tx/${signature}`);
     console.log(`⚡ IDL FAST-PATH BUY: ${fast.mint}`);
     seenSignatures.add(signature);
@@ -1918,12 +1824,6 @@ async function startPumpPortal() {
            return;
          }
          if (msg.txType !== "buy") return;
-
-         const lamports = Number(msg.solAmount ?? 0) * 1e9;
-         if (lamports < MIN_BUY_SOL) {
-           console.log(`â­ï¸ PumpPortal: buy below threshold (${Number(msg.solAmount).toFixed(4)} SOL) â€” ignoring`);
-           return;
-         }
 
          console.log("âš¡ PUMPPORTAL detected buy:", msg.mint);
          seenSignatures.add(msg.signature);
@@ -2141,7 +2041,7 @@ async function start() {
   console.log("✅ Bot fully running (immediate copy-buy mode)");
   await sendTelegramAlert(
     `✅ <b>Bot Active</b>\nTargets:\n${targetList}\n` +
-    `Buy: ${BUY_AMOUNT_SOL} SOL | Minimum copied buy: ${MIN_BUY_SOL / 1e9} SOL\n` +
+    `Buy: ${BUY_AMOUNT_SOL} SOL | Minimum copied buy: disabled\n` +
     `Buy path: concurrent PumpPortal / Pump SDK / PumpSwap / Jupiter\n` +
     `Channels: ${DETECTION_URLS.length} rotating WS + polling + gRPC\n` +
     `Pre-buy MC filter: disabled\n` +
@@ -2155,15 +2055,10 @@ async function handleGrpcTradeEvent(event: GrpcTradeEvent) {
     console.log(`🚀 [gRPC] ${event.type.toUpperCase()} detected: ${event.mint} by ${event.user} (${event.solAmount / 1e9} SOL)`);
 
     if (event.type === "buy") {
-      // Check minimum buy threshold
-      if (event.solAmount >= MIN_BUY_SOL) {
-        // Fire and forget - don't await executeBuy to minimize latency
-        executeBuy(event.mint, delayedMarketCapSnapshot(event.mint), true).catch(e =>
-          console.log("⚠️ executeBuy error (non-blocking):", e.message)
-        );
-      } else {
-        console.log(`⏭️ [gRPC] Buy below threshold (${event.solAmount / 1e9} SOL < ${MIN_BUY_SOL / 1e9} SOL): ${event.mint}`);
-      }
+      // Fire and forget - don't await executeBuy to minimize latency
+      executeBuy(event.mint, delayedMarketCapSnapshot(event.mint), true).catch(e =>
+        console.log("⚠️ executeBuy error (non-blocking):", e.message)
+      );
     } else if (event.type === "sell") {
       // Check if we hold this token and target sold
       const held = positions.get(event.mint);
