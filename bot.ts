@@ -2053,10 +2053,16 @@ async function start() {
   startBlockhashRefresher();
 
   // Enable the earliest available feed we can use from this runtime.
-  // This is a lightweight pending-signature listener, not a full
-  // validator-adjacent feed, but it still shortens the time from signature
-  // visibility to actioning the trade.
-  enablePendingSignatureFeed();
+  // The pending-signature listener can trigger on some RPC providers
+  // but many hosted endpoints (free Render, some public RPCs) reject
+  // `signatureSubscribe`. Enable it explicitly via env var to avoid
+  // noisy JSON-RPC errors on unsupported hosts.
+  const PENDING_SIGNATURE_ENABLED = (process.env.ENABLE_PENDING_SIGNATURE ?? "false") === "true";
+  if (PENDING_SIGNATURE_ENABLED) {
+    enablePendingSignatureFeed();
+  } else {
+    console.log("⚠️ Pending-signature feed disabled by env (ENABLE_PENDING_SIGNATURE=false)");
+  }
 
   // Initialize gRPC detection if enabled - dynamically load module
   if (GRPC_ENABLED) {
@@ -2109,11 +2115,14 @@ async function start() {
 
   const targetList = TARGET_WALLETS.map(w => `<code>${w.toString()}</code>`).join("\n");
   console.log("✅ Bot fully running (immediate copy-buy mode)");
+  let channelsDesc = `${DETECTION_URLS.length} rotating WS + polling`;
+  if (grpcManager) channelsDesc += " + gRPC";
+  if (PENDING_SIGNATURE_ENABLED) channelsDesc += " + pending-signature feed";
   await sendTelegramAlert(
     `✅ <b>Bot Active</b>\nTargets:\n${targetList}\n` +
     `Buy: ${BUY_AMOUNT_SOL} SOL | Minimum copied buy: disabled\n` +
     `Buy path: concurrent PumpPortal / Pump SDK / PumpSwap / Jupiter\n` +
-    `Channels: ${DETECTION_URLS.length} rotating WS + polling + gRPC + pending-signature feed\n` +
+    `Channels: ${channelsDesc}\n` +
     `Pre-buy MC filter: disabled\n` +
     `Commands: /pause /resume /status`
   );
