@@ -14,7 +14,7 @@ import type { Logs } from "@solana/web3.js";
 import { Program, AnchorProvider, BorshEventCoder } from "@coral-xyz/anchor";
 import { getMint, getAssociatedTokenAddress, TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID } from "@solana/spl-token";
 import { OnlinePumpSdk, PUMP_SDK, getBuyTokenAmountFromSolAmount, bondingCurvePda } from "@pump-fun/pump-sdk";
-import { OnlinePumpAmmSdk, PUMP_AMM_SDK, canonicalPumpPoolPda } from "@pump-fun/pump-swap-sdk";
+import { OnlinePumpAmmSdk, PUMP_AMM_PROGRAM_ID, PUMP_AMM_SDK, canonicalPumpPoolPda } from "@pump-fun/pump-swap-sdk";
 import BN from "bn.js";
 import fetch from "node-fetch";
 import bs58 from "bs58";
@@ -1121,7 +1121,33 @@ async function buildLocalPumpSwapBuyTx(mint: string, slippageBps = SLIPPAGE_BPS)
   try {
     const mintKey = new PublicKey(mint);
     const latest = await pumpSdkConnection.getLatestBlockhash("processed");
-    const poolKey = canonicalPumpPoolPda(mintKey, new PublicKey(SOL_MINT));
+    const canonicalPoolKey = canonicalPumpPoolPda(mintKey, new PublicKey(SOL_MINT));
+    let poolKey = canonicalPoolKey;
+    const canonicalPool = await pumpSdkConnection.getAccountInfo(canonicalPoolKey, "processed");
+
+    if (!canonicalPool) {
+      // A migrated token can use a noncanonical pool or arrive before the
+      // canonical pool is visible on the first RPC read.
+      const poolAccounts = await pumpSdkConnection.getProgramAccounts(PUMP_AMM_PROGRAM_ID, {
+        commitment: "processed",
+        filters: [{ memcmp: { offset: 43, bytes: mintKey.toBase58() } }],
+      });
+      for (const account of poolAccounts) {
+        try {
+          const pool = PUMP_AMM_SDK.decodePool(account.account);
+          if (pool.baseMint.equals(mintKey) && pool.quoteMint.equals(new PublicKey(SOL_MINT))) {
+            poolKey = account.pubkey;
+            break;
+          }
+        } catch {
+          // Ignore other Pump AMM accounts that happen to match the filter.
+        }
+      }
+    }
+
+    if (poolKey.equals(canonicalPoolKey) && !canonicalPool) {
+      throw new Error("PumpSwap pool not visible yet");
+    }
     const swapState = await pumpAmmSdkForBuild.swapSolanaState(poolKey, wallet.publicKey);
     if (!swapState.pool.quoteMint.equals(new PublicKey(SOL_MINT))) {
       throw new Error(`unsupported PumpSwap quote mint: ${swapState.pool.quoteMint.toString()}`);
