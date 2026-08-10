@@ -2092,9 +2092,25 @@ app.listen(PORT, () => console.log(`Keep-alive server on port ${PORT}`));
 /* ================= EARLY PENDING-TRANSACTION FEED ================= */
 
 let pendingSignatureSubscription: number | null = null;
+let pendingSignatureDisabled = false;
+let pendingSignatureWsErrorUnsubscribe: (() => void) | null = null;
+
+function disablePendingSignatureFeed(reason: string) {
+  pendingSignatureDisabled = true;
+  if (pendingSignatureSubscription !== null) {
+    try { (connection as any).removeSignatureListener(pendingSignatureSubscription); } catch {};
+    pendingSignatureSubscription = null;
+  }
+  if (pendingSignatureWsErrorUnsubscribe) {
+    try { pendingSignatureWsErrorUnsubscribe(); } catch {};
+    pendingSignatureWsErrorUnsubscribe = null;
+  }
+  try { (connection as any)._rpcWebSocket?.close?.(); } catch {};
+  console.log(`⚠️ Pending-signature feed disabled: ${reason}`);
+}
 
 function enablePendingSignatureFeed() {
-  if (pendingSignatureSubscription !== null) return;
+  if (pendingSignatureDisabled || pendingSignatureSubscription !== null) return;
 
   const anyConn = connection as any;
   if (typeof anyConn?.onSignature !== "function") {
@@ -2110,13 +2126,37 @@ function enablePendingSignatureFeed() {
         console.log("⚠️ Pending-signature feed handler error:", err?.message ?? err);
       });
     }, "processed");
+
+    const ws = anyConn._rpcWebSocket;
+    if (ws && typeof ws.on === "function") {
+      const onWsError = (err: any) => {
+        const msg = err?.message ?? String(err);
+        if (msg.includes("signatureSubscribe") || msg.includes("SignatureSubscribe")) {
+          disablePendingSignatureFeed("RPC provider does not support signatureSubscribe");
+        }
+      };
+      try {
+        ws.on("error", onWsError);
+      } catch {}
+      pendingSignatureWsErrorUnsubscribe = () => {
+        try { ws.off?.("error", onWsError); } catch {}
+        try { ws.removeEventListener?.("error", onWsError); } catch {}
+      };
+    }
+
     console.log("✅ Pending-signature feed enabled");
   } catch (err: any) {
     console.log("⚠️ Pending-signature feed setup failed:", err?.message ?? err);
+    disablePendingSignatureFeed("initial setup failure");
   }
 }
 
 async function probePendingSignatureSupport(): Promise<void> {
+  if (pendingSignatureDisabled) {
+    console.log("⚠️ Pending-signature probe skipped: pending-signature feed already disabled");
+    return;
+  }
+
   const anyConn = connection as any;
   if (typeof anyConn?.onSignature !== "function") {
     console.log("⚠️ Pending-signature probe skipped: onSignature not available");
@@ -2153,7 +2193,11 @@ async function probePendingSignatureSupport(): Promise<void> {
       enablePendingSignatureFeed();
     }
   } catch (err: any) {
-    console.log("⚠️ Pending-signature probe failed:", err?.message ?? String(err));
+    const msg = err?.message ?? String(err);
+    console.log("⚠️ Pending-signature probe failed:", msg);
+    if (msg.includes("signatureSubscribe") || msg.includes("SignatureSubscribe") || msg.includes("unsupported")) {
+      disablePendingSignatureFeed("probe detected unsupported signatureSubscribe");
+    }
   }
 }
 
