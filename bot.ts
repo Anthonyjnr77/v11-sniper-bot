@@ -144,8 +144,8 @@ const GRPC_TOKEN = process.env.GRPC_TOKEN;
 const GRPC_ENABLED = !!GRPC_TOKEN;
 
 const MAX_PRICE_IMPACT = Number(process.env.MAX_PRICE_IMPACT ?? 0.15);
-const ONLY_DIRECT_ROUTES = (process.env.ONLY_DIRECT_ROUTES ?? "true") === "true";
-const PUMPPORTAL_ENABLED = (process.env.PUMPPORTAL ?? "true") === "true";
+const ONLY_DIRECT_ROUTES = (process.env.ONLY_DIRECT_ROUTES ?? "true").toLowerCase() === "true";
+const PUMPPORTAL_ENABLED = (process.env.PUMPPORTAL ?? "true").toLowerCase() === "true";
 
 const MIN_WALLET_BALANCE_SOL = Number(process.env.MIN_WALLET_BALANCE_SOL ?? 0.02);
 
