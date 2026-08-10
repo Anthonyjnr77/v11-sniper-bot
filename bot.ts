@@ -306,6 +306,31 @@ const pumpSdkConnection = new Connection(PUMP_SDK_RPC_URL, {
 const pumpSdkForBuild = new OnlinePumpSdk(pumpSdkConnection);
 const pumpAmmSdkForBuild = new OnlinePumpAmmSdk(pumpSdkConnection);
 
+// Quick helper for readable timestamps
+function nowMs() { return Date.now(); }
+
+// Runtime check of Pump SDK RPC responsiveness so we can log an actionable
+// hint when the dedicated RPC is slow/unindexed for Pump accounts.
+async function verifyPumpSdkRpc(): Promise<void> {
+  try {
+    const started = nowMs();
+    // getVersion is lightweight; getSlot approximates latency too
+    const version = await pumpSdkConnection.getVersion();
+    const slot = await pumpSdkConnection.getSlot("processed");
+    const elapsed = nowMs() - started;
+    console.log(`âœ… Pump SDK RPC OK: ${PUMP_SDK_RPC_URL} (rt=${elapsed}ms) version=${JSON.stringify(version)}`);
+
+    if (elapsed > 400) {
+      console.log(`⚠️ Pump SDK RPC appears slow (>400ms). Consider using a premium/indexed RPC for PUMP_SDK_RPC_URL`);
+    }
+  } catch (err: any) {
+    console.log(`âš ï¸ Pump SDK RPC check failed: ${err?.message ?? String(err)} — PUMP_SDK_RPC_URL may be unreachable or not fully indexed`);
+  }
+}
+
+// Kick off a non-blocking probe
+verifyPumpSdkRpc().catch(() => {});
+
 /* ================= DEDICATED BUY EXECUTION RPC ================= */
 // Low-latency RPC for transaction submission only (no WS)
 // Set BUY_EXEC_RPC_URL to a premium endpoint (Helius paid, Triton, QuickNode, etc.)
@@ -937,7 +962,7 @@ function scheduleRebroadcasts(rawBytes: Uint8Array) {
   }, 500);
 }
 
-async function submitSignedTransaction(rawBytes: Uint8Array, useJito = BUY_AMOUNT >= 0.1 * 1e9): Promise<string | null> {
+async function submitSignedTransaction(rawBytes: Uint8Array, useJito = true): Promise<string | null> {
   const signed = VersionedTransaction.deserialize(rawBytes);
   const signature = bs58.encode(signed.signatures[0]!);
 
@@ -948,10 +973,10 @@ async function submitSignedTransaction(rawBytes: Uint8Array, useJito = BUY_AMOUN
       .catch(() => null)
   );
 
-  // Only use Jito for larger buys where MEV protection matters
-  let jitoAttempt: Promise<string | null>;
-  if (useJito) {
-    jitoAttempt = (async () => {
+  // Always attempt Jito bundle submission first. This offers the best chance for
+  // same-block or next-block inclusion compared to plain RPC.
+  let jitoAttempt: Promise<string | null> = (async () => {
+    try {
       const blockhash = await getBlockhashFast();
       const tipLamports = JITO_TIP_LAMPORTS();
       const tipTx = new Transaction({ feePayer: wallet.publicKey, recentBlockhash: blockhash }).add(
@@ -959,15 +984,20 @@ async function submitSignedTransaction(rawBytes: Uint8Array, useJito = BUY_AMOUN
       );
       tipTx.sign(wallet);
       const res = await fetchJson(JITO_BLOCK_ENGINE_URL, {
-        method: "POST", headers: { "Content-Type": "application/json" },
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "sendBundle", params: [[bs58.encode(rawBytes), bs58.encode(tipTx.serialize())]] }),
       });
-      if (!res?.result) throw new Error("Jito did not accept the bundle");
-      return "Jito";
-    })();
-  } else {
-    jitoAttempt = Promise.resolve(null);
-  }
+      if (res?.result) {
+        console.log(`âœ… Jito accepted bundle: ${signature}`);
+        return "Jito";
+      }
+      throw new Error(`Jito rejected bundle: ${JSON.stringify(res)}`);
+    } catch (e: any) {
+      console.log("⚠️ Jito submit error:", e?.message ?? String(e));
+      return null;
+    }
+  })();
 
   // bloXroute submission (free tier) - 3rd path
   let bloxrouteAttempt: Promise<string | null> = Promise.resolve(null);
@@ -987,10 +1017,13 @@ async function submitSignedTransaction(rawBytes: Uint8Array, useJito = BUY_AMOUN
           }),
         });
         const data = await res.json();
-        if (data?.result?.signature) return "bloXroute";
-        throw new Error("bloXroute submit failed");
+        if (data?.result?.signature) {
+          console.log(`âœ… bloXroute accepted tx: ${signature}`);
+          return "bloXroute";
+        }
+        throw new Error(`bloXroute submit failed: ${JSON.stringify(data)}`);
       } catch (e: any) {
-        console.log("⚠️ bloXroute submit error:", e.message);
+        console.log("⚠️ bloXroute submit error:", e?.message ?? String(e));
         return null;
       }
     })();
@@ -998,9 +1031,9 @@ async function submitSignedTransaction(rawBytes: Uint8Array, useJito = BUY_AMOUN
 
   scheduleRebroadcasts(rawBytes);
   try {
-    // Race all RPC attempts + Jito + bloXroute, first successful non-null path wins
-    const allAttempts = [...rpcAttempts];
-    if (useJito) allAttempts.push(jitoAttempt);
+    // Race Jito/bloXroute and all RPC endpoints simultaneously. If Jito accepts,
+    // it will usually win, but we still keep RPC as a hot fallback.
+    const allAttempts = [jitoAttempt, ...rpcAttempts];
     if (BLOXROUTE_ENABLED) allAttempts.push(bloxrouteAttempt);
 
     const via = await Promise.any(
@@ -1052,9 +1085,10 @@ async function validateBuyTransaction(rawTx: Uint8Array): Promise<boolean> {
  // Build direct Pump.fun buys locally from the official SDK. This avoids the
  // PumpPortal HTTP hop and uses the current bonding-curve accounts for the mint.
  async function buildLocalPumpBuyTx(mint: string, slippageBps = SLIPPAGE_BPS): Promise<Uint8Array | null> {
-   try {
-     const mintKey = new PublicKey(mint);
-     const latestBlockhash = await getBlockhashFast();
+  const startMs = nowMs();
+  try {
+    const mintKey = new PublicKey(mint);
+    const latestBlockhash = await getBlockhashFast();
       const [mintInfo, global] = await Promise.all([
         pumpSdkConnection.getAccountInfo(mintKey, "processed"),
         pumpSdkForBuild.fetchGlobal(), // dedicated SDK RPC
@@ -1120,14 +1154,18 @@ async function validateBuyTransaction(rawTx: Uint8Array): Promise<boolean> {
      }).compileToV0Message();
      const tx = new VersionedTransaction(message);
      tx.sign([wallet]);
-     return tx.serialize();
+    const elapsed = nowMs() - startMs;
+    console.log(`✅ Local Pump.fun build succeeded (${elapsed}ms): ${mint}`);
+    return tx.serialize();
    } catch (e: any) {
-     console.log("â†ªï¸ Local Pump.fun build unavailable:", e.message);
+    const elapsed = nowMs() - startMs;
+    console.log("â†ªï¸ Local Pump.fun build unavailable:", e?.stack ?? e?.message ?? String(e), `(${elapsed}ms)`, mint);
      return null;
    }
  }
 
 async function buildLocalPumpSwapBuyTx(mint: string, slippageBps = SLIPPAGE_BPS): Promise<Uint8Array | null> {
+  const startMs = nowMs();
   try {
     const mintKey = new PublicKey(mint);
     const latestBlockhash = await getBlockhashFast();
@@ -1181,9 +1219,12 @@ async function buildLocalPumpSwapBuyTx(mint: string, slippageBps = SLIPPAGE_BPS)
     }).compileToV0Message();
     const tx = new VersionedTransaction(message);
     tx.sign([wallet]);
+    const elapsed = nowMs() - startMs;
+    console.log(`✅ PumpSwap build succeeded (${elapsed}ms): ${mint}`);
     return tx.serialize();
   } catch (error: any) {
-    console.log("PumpSwap local build unavailable:", error.message);
+    const elapsed = nowMs() - startMs;
+    console.log("PumpSwap local build unavailable:", error?.stack ?? error?.message ?? String(error), `(${elapsed}ms)`, mint);
     return null;
   }
 }
@@ -1395,6 +1436,7 @@ async function executeBuy(
         dryRunStats.pnlSol += (Math.random() - 0.45) * 0.01;
       } else {
         const candidates: Array<[string, () => Promise<Uint8Array | null>]> = [
+          ["PumpPortal-trade-local-pump", () => buildPumpPortalTx("buy", mint, BUY_AMOUNT / 1e9, true, SLIPPAGE_BPS, "pump")],
           ["PumpPortal-trade-local", () => buildPumpPortalTx("buy", mint, BUY_AMOUNT / 1e9, true, SLIPPAGE_BPS, "auto")],
           ["local Pump SDK", () => buildLocalPumpBuyTx(mint, SLIPPAGE_BPS)],
           ["local PumpSwap SDK", () => buildLocalPumpSwapBuyTx(mint, SLIPPAGE_BPS)],
@@ -1405,15 +1447,28 @@ async function executeBuy(
         // Build and validate every route concurrently. The first valid route wins,
         // so a slow or unavailable Pump.fun route cannot delay PumpSwap/Jupiter.
         const racedCandidates = orderedCandidates.map(async ([builderName, buildFn]) => {
+          const bStart = nowMs();
           try {
+            console.log(`⏱ Builder start: ${builderName} for ${mint}`);
             const candidate = await buildFn();
-            if (candidate && await validateBuyTransaction(candidate)) {
-              return { builderName, rawTx: candidate };
+            const bElapsed = nowMs() - bStart;
+            if (!candidate) {
+              console.log(`â†ª ${builderName} returned null (${bElapsed}ms)`);
+              throw new Error(`${builderName} unavailable`);
             }
+            const validStart = nowMs();
+            const ok = await validateBuyTransaction(candidate);
+            const validElapsed = nowMs() - validStart;
+            if (!ok) {
+              console.log(`âš ï¸ ${builderName} simulation rejected (${bElapsed}ms build + ${validElapsed}ms sim)`);
+              throw new Error(`${builderName} simulation failed`);
+            }
+            console.log(`✅ Builder valid: ${builderName} (${bElapsed}ms build + ${validElapsed}ms sim)`);
+            return { builderName, rawTx: candidate };
           } catch (e: any) {
-            console.log(`âš ï¸ ${builderName} build error:`, e.message);
+            console.log(`âš ï¸ ${builderName} build error:`, e?.stack ?? e?.message ?? String(e));
+            throw new Error(`${builderName} unavailable`);
           }
-          throw new Error(`${builderName} unavailable`);
         });
 
         let selectedBuilder = "";
@@ -1989,6 +2044,48 @@ app.get("/health", (_req, res) => {
   });
 });
 
+// Simple HTTP endpoint to pre-warm a specific mint in the prebuild/buyState cache.
+// Example: POST /prewarm?mint=So....
+app.post('/prewarm', express.json(), async (req, res) => {
+  const mint = String(req.query.mint || req.body?.mint || "").trim();
+  if (!mint) return res.status(400).json({ error: 'missing mint query/body parameter' });
+  try {
+    await (async function prewarmMint(mintArg: string) {
+      try {
+        const m = new PublicKey(mintArg);
+        const [buyState, mintState, feeConfig, global] = await Promise.all([
+          pumpSdkForBuild.fetchBuyState(m, wallet.publicKey, TOKEN_PROGRAM_ID).catch((e: any) => { throw e; }),
+          getMint(pumpSdkConnection, m, 'processed', TOKEN_PROGRAM_ID).catch((e: any) => { throw e; }),
+          pumpSdkForBuild.fetchFeeConfig().catch((e: any) => { throw e; }),
+          pumpSdkForBuild.fetchGlobal().catch((e: any) => { throw e; }),
+        ]);
+        buyStateWarmCache.set(mintArg, { timestamp: Date.now(), buyState, mintState, feeConfig, global });
+        // Also prime prebuildCache bonding curve data if available
+        try {
+          const bondingCurveAddress = bondingCurvePda(m);
+          const bcAccount = await pumpSdkConnection.getAccountInfo(bondingCurveAddress, 'processed');
+          if (bcAccount?.data) {
+            prebuildCache.set(mintArg, {
+              bondingCurve: bondingCurveAddress,
+              associatedBondingCurve: bondingCurveAddress,
+              virtualQuoteReserves: new BN(0),
+              virtualTokenReserves: new BN(0),
+              realQuoteReserves: new BN(0),
+              realTokenReserves: new BN(0),
+              timestamp: Date.now(),
+            });
+          }
+        } catch {}
+      } catch (e: any) {
+        throw e;
+      }
+    })(mint);
+    res.json({ ok: true, mint });
+  } catch (e: any) {
+    res.status(500).json({ error: e?.message ?? String(e) });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Keep-alive server on port ${PORT}`));
 
@@ -2016,6 +2113,47 @@ function enablePendingSignatureFeed() {
     console.log("✅ Pending-signature feed enabled");
   } catch (err: any) {
     console.log("⚠️ Pending-signature feed setup failed:", err?.message ?? err);
+  }
+}
+
+async function probePendingSignatureSupport(): Promise<void> {
+  const anyConn = connection as any;
+  if (typeof anyConn?.onSignature !== "function") {
+    console.log("⚠️ Pending-signature probe skipped: onSignature not available");
+    return;
+  }
+
+  try {
+    let probeSub: number | null = null;
+    const probePromise = new Promise<void>((resolve, reject) => {
+      try {
+        probeSub = anyConn.onSignature((signature: string) => {
+          if (!signature) return;
+          // Don't actually process this probe signature, just use it to confirm support.
+          resolve();
+        }, "processed");
+      } catch (err: any) {
+        reject(err);
+      }
+    });
+
+    setTimeout(() => {
+      if (probeSub !== null) {
+        try { anyConn.removeSignatureListener(probeSub); } catch {};
+      }
+    }, 5000);
+
+    await Promise.race([
+      probePromise,
+      new Promise<void>((resolve) => setTimeout(resolve, 3000)),
+    ]);
+    if (probeSub !== null) {
+      try { anyConn.removeSignatureListener(probeSub); } catch {};
+      console.log("âœ… Pending-signature probe succeeded, enabling live feed");
+      enablePendingSignatureFeed();
+    }
+  } catch (err: any) {
+    console.log("⚠️ Pending-signature probe failed:", err?.message ?? String(err));
   }
 }
 
@@ -2057,9 +2195,10 @@ async function start() {
   // but many hosted endpoints (free Render, some public RPCs) reject
   // `signatureSubscribe`. Enable it explicitly via env var to avoid
   // noisy JSON-RPC errors on unsupported hosts.
-  const PENDING_SIGNATURE_ENABLED = (process.env.ENABLE_PENDING_SIGNATURE ?? "false") === "true";
+  const PENDING_SIGNATURE_ENABLED = (process.env.ENABLE_PENDING_SIGNATURE ?? "auto") !== "false";
   if (PENDING_SIGNATURE_ENABLED) {
-    enablePendingSignatureFeed();
+    console.log("⚡ Pending-signature feed auto-probing");
+    await probePendingSignatureSupport();
   } else {
     console.log("⚠️ Pending-signature feed disabled by env (ENABLE_PENDING_SIGNATURE=false)");
   }
