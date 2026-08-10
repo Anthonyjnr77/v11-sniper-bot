@@ -2118,37 +2118,8 @@ function enablePendingSignatureFeed() {
     return;
   }
 
-  try {
-    pendingSignatureSubscription = anyConn.onSignature((signature: string) => {
-      if (!signature || seenSignatures.has(signature)) return;
-      seenSignatures.add(signature);
-      handleTx(signature).catch((err: any) => {
-        console.log("⚠️ Pending-signature feed handler error:", err?.message ?? err);
-      });
-    }, "processed");
-
-    const ws = anyConn._rpcWebSocket;
-    if (ws && typeof ws.on === "function") {
-      const onWsError = (err: any) => {
-        const msg = err?.message ?? String(err);
-        if (msg.includes("signatureSubscribe") || msg.includes("SignatureSubscribe")) {
-          disablePendingSignatureFeed("RPC provider does not support signatureSubscribe");
-        }
-      };
-      try {
-        ws.on("error", onWsError);
-      } catch {}
-      pendingSignatureWsErrorUnsubscribe = () => {
-        try { ws.off?.("error", onWsError); } catch {}
-        try { ws.removeEventListener?.("error", onWsError); } catch {}
-      };
-    }
-
-    console.log("✅ Pending-signature feed enabled");
-  } catch (err: any) {
-    console.log("⚠️ Pending-signature feed setup failed:", err?.message ?? err);
-    disablePendingSignatureFeed("initial setup failure");
-  }
+  console.log("⚠️ Pending-signature feed is not supported by this bot with the installed web3.js API");
+  disablePendingSignatureFeed("pending-signature feed disabled due to unsupported onSignature API");
 }
 
 async function probePendingSignatureSupport(): Promise<void> {
@@ -2163,42 +2134,8 @@ async function probePendingSignatureSupport(): Promise<void> {
     return;
   }
 
-  try {
-    let probeSub: number | null = null;
-    const probePromise = new Promise<void>((resolve, reject) => {
-      try {
-        probeSub = anyConn.onSignature((signature: string) => {
-          if (!signature) return;
-          // Don't actually process this probe signature, just use it to confirm support.
-          resolve();
-        }, "processed");
-      } catch (err: any) {
-        reject(err);
-      }
-    });
-
-    setTimeout(() => {
-      if (probeSub !== null) {
-        try { anyConn.removeSignatureListener(probeSub); } catch {};
-      }
-    }, 5000);
-
-    await Promise.race([
-      probePromise,
-      new Promise<void>((resolve) => setTimeout(resolve, 3000)),
-    ]);
-    if (probeSub !== null) {
-      try { anyConn.removeSignatureListener(probeSub); } catch {};
-      console.log("âœ… Pending-signature probe succeeded, enabling live feed");
-      enablePendingSignatureFeed();
-    }
-  } catch (err: any) {
-    const msg = err?.message ?? String(err);
-    console.log("⚠️ Pending-signature probe failed:", msg);
-    if (msg.includes("signatureSubscribe") || msg.includes("SignatureSubscribe") || msg.includes("unsupported")) {
-      disablePendingSignatureFeed("probe detected unsupported signatureSubscribe");
-    }
-  }
+  console.log("⚠️ Pending-signature probe disabled: this web3.js version does not support wildcard signature subscriptions via onSignature");
+  disablePendingSignatureFeed("pending-signature probe disabled due to unsupported onSignature API");
 }
 
 /* ================= START ================= */
