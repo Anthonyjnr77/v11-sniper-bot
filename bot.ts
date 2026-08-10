@@ -20,6 +20,7 @@ import fetch from "node-fetch";
 import bs58 from "bs58";
 import https from "https";
 import express from "express";
+import { orderBuyBuilders } from "./hot-path.js";
 
 export interface GrpcTradeEvent {
   type: "buy" | "sell";
@@ -233,6 +234,7 @@ const PUMPFUN_GLOBAL_PDA = new PublicKey("4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4J
 const PREBUILD_CACHE_TTL_MS = 10 * 60 * 1000; // 10 min
 const PREBUILD_MAX_TOKENS = 500;
 const prebuildCache = new Map<string, CachedBondingCurve>();
+const buyStateWarmCache = new Map<string, { timestamp: number; buyState: any; mintState: any; feeConfig: any; global: any }>();
 
 async function refreshPrebuildCache() {
   try {
@@ -1052,7 +1054,7 @@ async function validateBuyTransaction(rawTx: Uint8Array): Promise<boolean> {
  async function buildLocalPumpBuyTx(mint: string, slippageBps = SLIPPAGE_BPS): Promise<Uint8Array | null> {
    try {
      const mintKey = new PublicKey(mint);
-      const latest = await pumpSdkConnection.getLatestBlockhash("processed");
+     const latestBlockhash = await getBlockhashFast();
       const [mintInfo, global] = await Promise.all([
         pumpSdkConnection.getAccountInfo(mintKey, "processed"),
         pumpSdkForBuild.fetchGlobal(), // dedicated SDK RPC
@@ -1063,11 +1065,19 @@ async function validateBuyTransaction(rawTx: Uint8Array): Promise<boolean> {
        throw new Error("unsupported token program");
      }
 
+      const cachedWarmState = buyStateWarmCache.get(mint);
       const [buyState, mintState, feeConfig] = await Promise.all([
-        pumpSdkForBuild.fetchBuyState(mintKey, wallet.publicKey, tokenProgram), // dedicated SDK RPC
+        cachedWarmState?.timestamp && Date.now() - cachedWarmState.timestamp < 30_000
+          ? Promise.resolve(cachedWarmState.buyState)
+          : pumpSdkForBuild.fetchBuyState(mintKey, wallet.publicKey, tokenProgram), // dedicated SDK RPC
         getMint(pumpSdkConnection, mintKey, "processed", tokenProgram), // dedicated SDK RPC
-        pumpSdkForBuild.fetchFeeConfig(), // dedicated SDK RPC
+        cachedWarmState?.timestamp && Date.now() - cachedWarmState.timestamp < 30_000
+          ? Promise.resolve(cachedWarmState.feeConfig)
+          : pumpSdkForBuild.fetchFeeConfig(), // dedicated SDK RPC
       ]);
+      if (!cachedWarmState || !cachedWarmState.global) {
+        buyStateWarmCache.set(mint, { timestamp: Date.now(), buyState, mintState, feeConfig, global });
+      }
      const solAmount = new BN(BUY_AMOUNT);
       const bondingCurve = buyState.bondingCurve as any;
       if (bondingCurve.complete || new BN(bondingCurve.realTokenReserves).isZero()) {
@@ -1101,7 +1111,7 @@ async function validateBuyTransaction(rawTx: Uint8Array): Promise<boolean> {
     const priorityMicroLamports = Math.ceil((dynamicFee * 1_000_000) / dynamicComputeUnits);
      const message = new TransactionMessage({
        payerKey: wallet.publicKey,
-        recentBlockhash: latest.blockhash,
+        recentBlockhash: latestBlockhash,
        instructions: [
          ComputeBudgetProgram.setComputeUnitLimit({ units: dynamicComputeUnits }),
          ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityMicroLamports }),
@@ -1120,7 +1130,7 @@ async function validateBuyTransaction(rawTx: Uint8Array): Promise<boolean> {
 async function buildLocalPumpSwapBuyTx(mint: string, slippageBps = SLIPPAGE_BPS): Promise<Uint8Array | null> {
   try {
     const mintKey = new PublicKey(mint);
-    const latest = await pumpSdkConnection.getLatestBlockhash("processed");
+    const latestBlockhash = await getBlockhashFast();
     const canonicalPoolKey = canonicalPumpPoolPda(mintKey, new PublicKey(SOL_MINT));
     let poolKey = canonicalPoolKey;
     const canonicalPool = await pumpSdkConnection.getAccountInfo(canonicalPoolKey, "processed");
@@ -1162,7 +1172,7 @@ async function buildLocalPumpSwapBuyTx(mint: string, slippageBps = SLIPPAGE_BPS)
     const priorityMicroLamports = Math.ceil((dynamicFee * 1_000_000) / dynamicComputeUnits);
     const message = new TransactionMessage({
       payerKey: wallet.publicKey,
-      recentBlockhash: latest.blockhash,
+      recentBlockhash: latestBlockhash,
       instructions: [
         ComputeBudgetProgram.setComputeUnitLimit({ units: dynamicComputeUnits }),
         ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityMicroLamports }),
@@ -1390,10 +1400,11 @@ async function executeBuy(
           ["local PumpSwap SDK", () => buildLocalPumpSwapBuyTx(mint, SLIPPAGE_BPS)],
           ["Jupiter", () => buildJupiterBuyTx(mint)],
         ];
+        const orderedCandidates = orderBuyBuilders(candidates.map(([name, build]) => ({ name, kind: name === "Jupiter" ? "fallback" : "direct", build }))).map(({ name, build }) => [name, build] as [string, () => Promise<Uint8Array | null>]);
 
         // Build and validate every route concurrently. The first valid route wins,
         // so a slow or unavailable Pump.fun route cannot delay PumpSwap/Jupiter.
-        const racedCandidates = candidates.map(async ([builderName, buildFn]) => {
+        const racedCandidates = orderedCandidates.map(async ([builderName, buildFn]) => {
           try {
             const candidate = await buildFn();
             if (candidate && await validateBuyTransaction(candidate)) {
@@ -1981,6 +1992,33 @@ app.get("/health", (_req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Keep-alive server on port ${PORT}`));
 
+/* ================= EARLY PENDING-TRANSACTION FEED ================= */
+
+let pendingSignatureSubscription: number | null = null;
+
+function enablePendingSignatureFeed() {
+  if (pendingSignatureSubscription !== null) return;
+
+  const anyConn = connection as any;
+  if (typeof anyConn?.onSignature !== "function") {
+    console.log("⚠️ Pending-signature feed unavailable on this RPC client");
+    return;
+  }
+
+  try {
+    pendingSignatureSubscription = anyConn.onSignature((signature: string) => {
+      if (!signature || seenSignatures.has(signature)) return;
+      seenSignatures.add(signature);
+      handleTx(signature).catch((err: any) => {
+        console.log("⚠️ Pending-signature feed handler error:", err?.message ?? err);
+      });
+    }, "processed");
+    console.log("✅ Pending-signature feed enabled");
+  } catch (err: any) {
+    console.log("⚠️ Pending-signature feed setup failed:", err?.message ?? err);
+  }
+}
+
 /* ================= START ================= */
 
 // gRPC Detection Manager (Yellowstone/Shyft) - optional
@@ -2013,6 +2051,12 @@ async function start() {
 
   // Start background blockhash refresher (replaces old 25s interval)
   startBlockhashRefresher();
+
+  // Enable the earliest available feed we can use from this runtime.
+  // This is a lightweight pending-signature listener, not a full
+  // validator-adjacent feed, but it still shortens the time from signature
+  // visibility to actioning the trade.
+  enablePendingSignatureFeed();
 
   // Initialize gRPC detection if enabled - dynamically load module
   if (GRPC_ENABLED) {
@@ -2069,7 +2113,7 @@ async function start() {
     `✅ <b>Bot Active</b>\nTargets:\n${targetList}\n` +
     `Buy: ${BUY_AMOUNT_SOL} SOL | Minimum copied buy: disabled\n` +
     `Buy path: concurrent PumpPortal / Pump SDK / PumpSwap / Jupiter\n` +
-    `Channels: ${DETECTION_URLS.length} rotating WS + polling + gRPC\n` +
+    `Channels: ${DETECTION_URLS.length} rotating WS + polling + gRPC + pending-signature feed\n` +
     `Pre-buy MC filter: disabled\n` +
     `Commands: /pause /resume /status`
   );
