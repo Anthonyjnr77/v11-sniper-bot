@@ -1255,7 +1255,7 @@ async function buildPumpPortalTx(
         action,
         mint,
         amount,
-        denominatedInSol: denominatedInSol ? "true" : "false",
+        denominatedInSol,
         slippage: slippageBps / 100,
         priorityFee: getDynamicPriorityFee() / 1e9,
         pool,
