@@ -650,10 +650,15 @@ function stopBlockhashRefresher() {
   }
 }
 
+function getFastestSubmissionConnection(): Connection {
+  return submissionConnections[0] ?? buyExecConnection;
+}
+
 async function refreshBlockhash() {
   try {
-    // Use buyExecConnection for faster response
-    const { blockhash } = await buyExecConnection.getLatestBlockhash("processed");
+    // Use the fastest submission RPC for lowest blockhash latency.
+    const fastest = getFastestSubmissionConnection();
+    const { blockhash } = await fastest.getLatestBlockhash("processed");
     cachedBlockhash = blockhash;
     cachedBlockhashAt = Date.now();
   } catch {
@@ -667,7 +672,8 @@ async function getBlockhashFast(): Promise<string> {
   // Fallback: synchronous refresh (should rarely hit this)
   await refreshBlockhash();
   if (cachedBlockhash && Date.now() - cachedBlockhashAt < 15_000) return cachedBlockhash;
-  return (await buyExecConnection.getLatestBlockhash("processed")).blockhash;
+  const fastest = getFastestSubmissionConnection();
+  return (await fastest.getLatestBlockhash("processed")).blockhash;
 }
 
 /* ================= WALLET BALANCE CHECK ================= */
@@ -1128,38 +1134,45 @@ async function submitSignedTransaction(rawBytes: Uint8Array, useJito = true): Pr
   const rpcAttempts = orderedPairs.map(({ url, conn }) =>
     conn.sendRawTransaction(rawBytes, { skipPreflight: true, maxRetries: 0 })
       .then(() => "RPC")
-      .catch((e) => {
-        // Penalize failing RPC endpoints so they are deprioritized briefly
+      .catch((err: any) => {
         submissionRpcPenalties.set(url, (submissionRpcPenalties.get(url) ?? 0) + 1);
+        console.log(`⚠️ RPC submit failure ${url}:`, err?.message ?? String(err));
         return null;
       })
   );
 
   // Always attempt Jito bundle submission first. This offers the best chance for
   // same-block or next-block inclusion compared to plain RPC.
-  let jitoAttempt: Promise<string | null> = (async () => {
-    try {
-      const blockhash = await getBlockhashFast();
-      const tipLamports = JITO_TIP_LAMPORTS();
-      const tipTx = new Transaction({ feePayer: wallet.publicKey, recentBlockhash: blockhash }).add(
-        SystemProgram.transfer({ fromPubkey: wallet.publicKey, toPubkey: randomTipAccount(), lamports: tipLamports })
-      );
-      tipTx.sign(wallet);
-      const res = await fetchJson(JITO_BLOCK_ENGINE_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "sendBundle", params: [[bs58.encode(rawBytes), bs58.encode(tipTx.serialize())]] }),
-      });
-      if (res?.result) {
-        console.log(`âœ… Jito accepted bundle: ${signature}`);
-        return "Jito";
+  let jitoAttempt: Promise<string | null> = Promise.resolve(null);
+  if (useJito && JITO_BLOCK_ENGINE_URL) {
+    jitoAttempt = (async () => {
+      try {
+        const blockhash = await getBlockhashFast();
+        const tipLamports = JITO_TIP_LAMPORTS();
+        const res = await fetchJson(JITO_BLOCK_ENGINE_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            transactions: [bs58.encode(rawBytes)],
+            aggregation: "none",
+            maxNumberOfTransactionsInBundle: 1,
+            bundleSigner: wallet.publicKey.toString(),
+            tip: tipLamports,
+            clientId: "solana-sniper-bot",
+            blockhash,
+          }),
+        });
+        if (res?.result) {
+          console.log(`✅ Jito accepted bundle: ${signature}`);
+          return "Jito";
+        }
+        throw new Error(`Jito rejected bundle: ${JSON.stringify(res)}`);
+      } catch (e: any) {
+        console.log("⚠️ Jito submit error:", e?.message ?? String(e));
+        return null;
       }
-      throw new Error(`Jito rejected bundle: ${JSON.stringify(res)}`);
-    } catch (e: any) {
-      console.log("⚠️ Jito submit error:", e?.message ?? String(e));
-      return null;
-    }
-  })();
+    })();
+  }
 
   // bloXroute submission (free tier) - 3rd path
   let bloxrouteAttempt: Promise<string | null> = Promise.resolve(null);
@@ -1409,7 +1422,7 @@ async function buildPumpPortalTx(
 ): Promise<Uint8Array | null> {
   try {
     const res: any = await fetch("https://pumpportal.fun/api/trade-local", {
-      agent,
+      agent: pumpPortalAgent,
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
