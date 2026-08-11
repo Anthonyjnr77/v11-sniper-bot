@@ -357,6 +357,17 @@ console.log = (...args: any[]) => {
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+const TELEGRAM_EXTENDED = (process.env.TELEGRAM_EXTENDED ?? "false").toLowerCase() === "true";
+const TELEGRAM_COOLDOWN_MS = Number(process.env.TELEGRAM_COOLDOWN_MS ?? 5000);
+const TELEGRAM_COOLDOWN_NOTIFY_MS = Number(process.env.TELEGRAM_COOLDOWN_NOTIFY_MS ?? 60_000);
+
+// Rate-limiting state per chat to avoid command floods
+const telegramLastCommandAt = new Map<string, number>();
+const telegramLastNotifyAt = new Map<string, number>();
+
+// Small cache for trade_journal to avoid repeated Upstash hits
+let telegramJournalCache: { ts: number; journal: any[] } | null = null;
+const TELEGRAM_JOURNAL_CACHE_TTL_MS = 5_000;
 
 async function sendTelegramAlert(message: string) {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
@@ -376,6 +387,75 @@ async function sendTelegramAlert(message: string) {
   } catch (e: any) {
     console.log("Telegram alert failed:", e.message);
   }
+}
+
+// Lightweight, safe Telegram helper responses (non-blocking, cached-friendly)
+async function getTelegramPositionsText(): Promise<string> {
+  if (positions.size === 0) return "No open positions.";
+  const lines: string[] = [];
+  let i = 0;
+  for (const [mint, pos] of positions.entries()) {
+    if (i++ >= 20) {
+      lines.push(`...and ${positions.size - 20} more`);
+      break;
+    }
+    const costSol = (pos.costBasisLamports / 1e9).toFixed(6);
+    const remaining = pos.remainingAmount;
+    const ageSec = Math.floor((Date.now() - pos.entryTime) / 1000);
+    lines.push(`${mint} — ${remaining} tokens — cost ${costSol} SOL — age ${ageSec}s`);
+  }
+  return `<b>Positions (${positions.size})</b>\n` + lines.join("\n");
+}
+
+async function getTelegramStatsText(): Promise<string> {
+  try {
+    let journal: any[] = [];
+    if (telegramJournalCache && Date.now() - telegramJournalCache.ts < TELEGRAM_JOURNAL_CACHE_TTL_MS) {
+      journal = telegramJournalCache.journal;
+    } else {
+      const raw = await redisGet("trade_journal");
+      journal = raw ? JSON.parse(raw) : [];
+      telegramJournalCache = { ts: Date.now(), journal };
+    }
+    const buys = journal.filter((e: any) => e.action === "BUY").length;
+    const sells = journal.filter((e: any) => e.action === "SELL").length;
+    const pnlPercentSum = journal.reduce((acc: number, e: any) => acc + (e.pnlPercent ?? 0), 0);
+    return (
+      `<b>Stats</b>\nOpen positions: ${positions.size}\nJournal entries: ${journal.length}\n` +
+      `Buys: ${buys} Sells: ${sells}\nApprox PnL% sum: ${pnlPercentSum.toFixed(2)}\n` +
+      `Dry-run: ${DRY_RUN ? "yes" : "no"}`
+    );
+  } catch (e: any) {
+    return `<b>Stats</b>\nOpen positions: ${positions.size}\nJournal: unavailable (${e.message})`;
+  }
+}
+
+async function getTelegramHistoryText(): Promise<string> {
+  try {
+    let journal: any[] = [];
+    if (telegramJournalCache && Date.now() - telegramJournalCache.ts < TELEGRAM_JOURNAL_CACHE_TTL_MS) {
+      journal = telegramJournalCache.journal;
+    } else {
+      const raw = await redisGet("trade_journal");
+      journal = raw ? JSON.parse(raw) : [];
+      telegramJournalCache = { ts: Date.now(), journal };
+    }
+    if (journal.length === 0) return "No trade history.";
+    const entries = journal.slice(-10).map((e: any) => {
+      const ts = new Date(e.timestamp).toISOString();
+      return `${ts} ${e.action} ${e.mint} ${(e.solAmount / 1e9).toFixed(4)} SOL ${e.signature ?? ""}`;
+    });
+    return `<b>History (last ${entries.length})</b>\n` + entries.join("\n");
+  } catch (e: any) {
+    return `History unavailable: ${e.message}`;
+  }
+}
+
+async function getTelegramSettingsText(): Promise<string> {
+  return (
+    `<b>Settings</b>\nBUY_AMOUNT_SOL: ${(BUY_AMOUNT / 1e9)}\nSLIPPAGE_BPS: ${SLIPPAGE_BPS}\n` +
+    `DRY_RUN: ${DRY_RUN}\nPUMPPORTAL: ${PUMPPORTAL_ENABLED}\nONLY_DIRECT_ROUTES: ${ONLY_DIRECT_ROUTES}`
+  );
 }
 
 /* ================= CRASH ALERTS ================= */
@@ -789,6 +869,22 @@ async function pollTelegramCommands() {
       const msg = update.message;
       if (!msg || String(msg.chat?.id) !== String(TELEGRAM_CHAT_ID)) continue;
 
+      // Rate-limit commands per chat
+      const chatId = String(msg.chat?.id);
+      const now = Date.now();
+      const last = telegramLastCommandAt.get(chatId) ?? 0;
+      if (now - last < TELEGRAM_COOLDOWN_MS) {
+        const lastNotify = telegramLastNotifyAt.get(chatId) ?? 0;
+        if (now - lastNotify > TELEGRAM_COOLDOWN_NOTIFY_MS) {
+          telegramLastNotifyAt.set(chatId, now);
+          try {
+            await sendTelegramAlert(`Please wait ${Math.ceil((TELEGRAM_COOLDOWN_MS - (now - last)) / 1000)}s before sending another command.`);
+          } catch {
+            // ignore notify failures
+          }
+        }
+        continue;
+      }
       // Ignore stale updates (older than 30s) — prevents reprocessing on restart
       const msgAgeSec = Math.floor(Date.now() / 1000) - (msg.date ?? 0);
       if (msgAgeSec > 30) {
@@ -798,14 +894,17 @@ async function pollTelegramCommands() {
 
       const text = (msg.text ?? "").trim().toLowerCase();
       if (text === "/pause") {
+        telegramLastCommandAt.set(chatId, Date.now());
         botPaused = true;
         console.log("\u{23F8} Bot PAUSED via Telegram command");
         await sendTelegramAlert("\u{23F8} <b>Bot paused.</b> No new buys will be taken. Existing positions still monitored/sold normally. Send /resume to continue.");
       } else if (text === "/resume") {
+        telegramLastCommandAt.set(chatId, Date.now());
         botPaused = false;
         console.log("\u{25B6} Bot RESUMED via Telegram command");
         await sendTelegramAlert("\u{25B6} <b>Bot resumed.</b> New buys re-enabled.");
       } else if (text === "/status") {
+        telegramLastCommandAt.set(chatId, Date.now());
         const balanceStr = lastKnownBalanceLamports !== null
           ? `${(lastKnownBalanceLamports / 1e9).toFixed(4)} SOL`
           : "unknown";
@@ -817,6 +916,18 @@ async function pollTelegramCommands() {
           `WS channels: ${DETECTION_URLS.length}\n` +
           `PumpPortal: ${pumpPortalConnected ? "\u{2705} connected" : "\u{274C} NOT connected"}`
         );
+      } else if (text === "/positions" && TELEGRAM_EXTENDED) {
+        telegramLastCommandAt.set(chatId, Date.now());
+        await sendTelegramAlert(await getTelegramPositionsText());
+      } else if (text === "/stats" && TELEGRAM_EXTENDED) {
+        telegramLastCommandAt.set(chatId, Date.now());
+        await sendTelegramAlert(await getTelegramStatsText());
+      } else if (text === "/history" && TELEGRAM_EXTENDED) {
+        telegramLastCommandAt.set(chatId, Date.now());
+        await sendTelegramAlert(await getTelegramHistoryText());
+      } else if (text === "/settings" && TELEGRAM_EXTENDED) {
+        telegramLastCommandAt.set(chatId, Date.now());
+        await sendTelegramAlert(await getTelegramSettingsText());
       }
     }
   } catch (e: any) {
