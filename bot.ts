@@ -147,6 +147,23 @@ const MAX_PRICE_IMPACT = Number(process.env.MAX_PRICE_IMPACT ?? 0.15);
 const ONLY_DIRECT_ROUTES = (process.env.ONLY_DIRECT_ROUTES ?? "true").toLowerCase() === "true";
 const PUMPPORTAL_ENABLED = (process.env.PUMPPORTAL ?? "true").toLowerCase() === "true";
 
+// Per-mint Pump-only fallback cache: when a mint returns Anchor error 6005
+// (BondingCurveComplete / migrated to AMM), we mark it so the bot will
+// skip PumpPortal attempts for that mint for a short TTL to avoid repeats.
+const PUMP_FALLBACK_TTL_MS = Number(process.env.PUMP_FALLBACK_TTL_MS ?? 600000); // 10m default
+const pumpFallbackCache = new Map<string, number>(); // mint -> expiresAt
+const pumpFirstFailureLogged = new Set<string>();
+
+function isPumpFallbackActive(mint: string): boolean {
+  const exp = pumpFallbackCache.get(mint);
+  if (!exp) return false;
+  if (Date.now() > exp) {
+    pumpFallbackCache.delete(mint);
+    return false;
+  }
+  return true;
+}
+
 const MIN_WALLET_BALANCE_SOL = Number(process.env.MIN_WALLET_BALANCE_SOL ?? 0.02);
 
 const SOL_MINT = "So11111111111111111111111111111111111111112";
@@ -1453,6 +1470,32 @@ async function buildPumpPortalTx(
       const buf = new Uint8Array(await res.arrayBuffer());
       const tx = VersionedTransaction.deserialize(buf);
       tx.sign([wallet]);
+
+      // Quick local simulation on our low-latency buy execution RPC to detect
+      // deterministic failures such as Anchor Custom:6005 (BondingCurveComplete).
+      try {
+        const sim = await buyExecConnection.simulateTransaction(tx, {
+          commitment: "processed",
+          replaceRecentBlockhash: true,
+          sigVerify: false,
+        });
+        if (sim.value?.err) {
+          const logs = sim.value.logs?.filter(Boolean).join(" | ") ?? "no simulation logs";
+          console.log("Buy candidate simulation failed (pumpportal-built):", JSON.stringify(sim.value.err), logs);
+          const l = logs.toLowerCase();
+          if (l.includes("6005") || l.includes("bondingcurvecomplete") || JSON.stringify(sim.value.err).includes("6005")) {
+            pumpFallbackCache.set(mint, Date.now() + PUMP_FALLBACK_TTL_MS);
+            if (!pumpFirstFailureLogged.has(mint)) {
+              pumpFirstFailureLogged.add(mint);
+              console.log(`⚠️ Marked mint ${mint} as pump-fallback for ${PUMP_FALLBACK_TTL_MS}ms (Anchor 6005 / BondingCurveComplete)`);
+            }
+            return null;
+          }
+        }
+      } catch (e: any) {
+        console.log("⚠️ pumpPortal simulation unavailable:", e?.message ?? String(e));
+      }
+
       return tx.serialize();
     } catch (e: any) {
       const message = e?.message ?? String(e);
@@ -1626,13 +1669,15 @@ async function executeBuy(
         // Mock PnL estimation (random walk for demo)
         dryRunStats.pnlSol += (Math.random() - 0.45) * 0.01;
       } else {
-        const candidates: Array<[string, () => Promise<Uint8Array | null>]> = [
-          ["PumpPortal-trade-local", () => buildPumpPortalTx("buy", mint, BUY_AMOUNT / 1e9, true, SLIPPAGE_BPS, "auto")],
-          ["PumpPortal-trade-local-pump", () => buildPumpPortalTx("buy", mint, BUY_AMOUNT / 1e9, true, SLIPPAGE_BPS, "pump")],
-          ["local Pump SDK", () => buildLocalPumpBuyTx(mint, SLIPPAGE_BPS)],
-          ["local PumpSwap SDK", () => buildLocalPumpSwapBuyTx(mint, SLIPPAGE_BPS)],
-          ["Jupiter", () => buildJupiterBuyTx(mint)],
-        ];
+        const candidates: Array<[string, () => Promise<Uint8Array | null>]> = [];
+        if (!isPumpFallbackActive(mint) && PUMPPORTAL_ENABLED) {
+          candidates.push(["PumpPortal-trade-local", () => buildPumpPortalTx("buy", mint, BUY_AMOUNT / 1e9, true, SLIPPAGE_BPS, "auto")]);
+        } else if (isPumpFallbackActive(mint)) {
+          console.log(`ℹ️ Skipping PumpPortal build for ${mint} due to recent Anchor 6005 failures`);
+        }
+        candidates.push(["local Pump SDK", () => buildLocalPumpBuyTx(mint, SLIPPAGE_BPS)]);
+        candidates.push(["local PumpSwap SDK", () => buildLocalPumpSwapBuyTx(mint, SLIPPAGE_BPS)]);
+        candidates.push(["Jupiter", () => buildJupiterBuyTx(mint)]);
         const orderedCandidates = orderBuyBuilders(candidates.map(([name, build]) => ({ name, kind: name === "Jupiter" ? "fallback" : "direct", build }))).map(({ name, build }) => [name, build] as [string, () => Promise<Uint8Array | null>]);
 
         // Build and validate every route concurrently. The first valid route wins,

@@ -6,7 +6,6 @@ export interface BuyBuilderCandidate<T = Uint8Array | null> {
 
 const DIRECT_BUILDER_ORDER = [
   "PumpPortal-trade-local",
-  "PumpPortal-trade-local-pump",
   "local Pump SDK",
   "local PumpSwap SDK",
 ];
