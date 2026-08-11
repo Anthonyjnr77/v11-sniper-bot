@@ -2346,6 +2346,7 @@ async function start() {
 
   const targetList = TARGET_WALLETS.map(w => `<code>${w.toString()}</code>`).join("\n");
   console.log("✅ Bot fully running (immediate copy-buy mode)");
+  console.log(`TELEGRAM_EXTENDED=${TELEGRAM_EXTENDED} TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN ? 'present' : 'missing'} TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID ? 'present' : 'missing'}`);
   let channelsDesc = `${DETECTION_URLS.length} rotating WS + polling`;
   if (grpcManager) channelsDesc += " + gRPC";
   if (PENDING_SIGNATURE_ENABLED) channelsDesc += " + pending-signature feed";
@@ -2355,7 +2356,7 @@ async function start() {
     `Buy path: concurrent PumpPortal / Pump SDK / PumpSwap / Jupiter\n` +
     `Channels: ${channelsDesc}\n` +
     `Pre-buy MC filter: disabled\n` +
-    `Commands: /pause /resume /status`
+    `Commands: /pause /resume /status${TELEGRAM_EXTENDED ? ' /positions /stats /history /settings' : ''}`
   );
 }
 
