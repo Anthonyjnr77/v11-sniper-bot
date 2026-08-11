@@ -987,9 +987,54 @@ const SUBMISSION_RPCS = [
   "https://api.mainnet-beta.solana.com",
 ].filter((v): v is string => Boolean(v));
 
-const submissionConnections = SUBMISSION_RPCS.map(url =>
-  new Connection(url, { commitment: "processed", httpAgent: agent })
-);
+// submissionConnections will be probed & ranked on startup
+let submissionConnections: Connection[] = [];
+let submissionPairs: { url: string; conn: Connection }[] = [];
+const submissionRpcPenalties = new Map<string, number>(); // higher = worse
+
+async function probeSubmissionConnections(): Promise<void> {
+  const probes = await Promise.allSettled(
+    SUBMISSION_RPCS.map(async (url) => {
+      const conn = new Connection(url, { commitment: "processed", httpAgent: agent });
+      const start = Date.now();
+      try {
+        await conn.getVersion();
+        const rt = Date.now() - start;
+        return { url, conn, ok: true, rt };
+      } catch (e: any) {
+        return { url, conn, ok: false, rt: Number.POSITIVE_INFINITY };
+      }
+    })
+  );
+
+  const results: { url: string; conn: Connection; ok: boolean; rt: number }[] = probes
+    .filter((p: any) => p.status === "fulfilled")
+    .map((p: any) => p.value)
+    .sort((a, b) => a.rt - b.rt);
+
+  submissionPairs = results.map(r => ({ url: r.url, conn: r.conn }));
+  submissionConnections = submissionPairs.map(p => p.conn);
+  console.log(`âœ… Submission RPCs ranked: ${results.map(r => `${r.url}(${r.ok ? r.rt + 'ms' : 'err'})`).join(', ')}`);
+}
+
+// Warm submission RPCs periodically to avoid cold TLS/RPC stalls
+function startSubmissionWarmup() {
+  setInterval(async () => {
+    for (const conn of submissionConnections) {
+      try {
+        await conn.getVersion();
+      } catch {
+        // ignore
+      }
+    }
+    // Decay penalties slowly so endpoints can recover
+    for (const [url, score] of submissionRpcPenalties.entries()) {
+      const next = Math.max(0, score - 1);
+      if (next === 0) submissionRpcPenalties.delete(url);
+      else submissionRpcPenalties.set(url, next);
+    }
+  }, 30_000);
+}
 
 // Priority fee sampling RPCs (only use ones that support getRecentPrioritizationFees)
 const PRIORITY_FEE_RPCS = [
@@ -1078,10 +1123,16 @@ async function submitSignedTransaction(rawBytes: Uint8Array, useJito = true): Pr
   const signature = bs58.encode(signed.signatures[0]!);
 
   // Parallel multi-RPC submit: fire to all endpoints simultaneously, first success wins
-  const rpcAttempts = submissionConnections.map(conn =>
+  // Order RPC attempts by adaptive penalty (lower penalty first)
+  const orderedPairs = [...submissionPairs].sort((a, b) => (submissionRpcPenalties.get(a.url) ?? 0) - (submissionRpcPenalties.get(b.url) ?? 0));
+  const rpcAttempts = orderedPairs.map(({ url, conn }) =>
     conn.sendRawTransaction(rawBytes, { skipPreflight: true, maxRetries: 0 })
       .then(() => "RPC")
-      .catch(() => null)
+      .catch((e) => {
+        // Penalize failing RPC endpoints so they are deprioritized briefly
+        submissionRpcPenalties.set(url, (submissionRpcPenalties.get(url) ?? 0) + 1);
+        return null;
+      })
   );
 
   // Always attempt Jito bundle submission first. This offers the best chance for
@@ -2326,6 +2377,10 @@ async function start() {
   setInterval(pollForMissedTrades, POLL_INTERVAL_MS);
   setInterval(checkWalletBalance, 60 * 1000);
   setInterval(pollTelegramCommands, 3000);
+
+  // Probe and rank submission RPCs, then warm them periodically
+  await probeSubmissionConnections().catch(() => {});
+  startSubmissionWarmup();
 
   setInterval(() => {
     fetch("https://api.jup.ag/", { agent } as any).catch(() => {});
