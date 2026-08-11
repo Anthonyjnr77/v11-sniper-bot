@@ -1025,19 +1025,25 @@ async function probeSubmissionConnections(): Promise<void> {
         const rt = Date.now() - start;
         return { url, conn, ok: true, rt };
       } catch (e: any) {
-        return { url, conn, ok: false, rt: Number.POSITIVE_INFINITY };
+        const errMsg = e?.message ?? String(e);
+        // Return the error message so we can log it for debugging
+        return { url, conn, ok: false, rt: Number.POSITIVE_INFINITY, err: errMsg } as any;
       }
     })
   );
 
-  const results: { url: string; conn: Connection; ok: boolean; rt: number }[] = probes
+  const results: { url: string; conn: Connection; ok: boolean; rt: number; err?: string }[] = probes
     .filter((p: any) => p.status === "fulfilled")
     .map((p: any) => p.value)
     .sort((a, b) => a.rt - b.rt);
 
   submissionPairs = results.map(r => ({ url: r.url, conn: r.conn }));
   submissionConnections = submissionPairs.map(p => p.conn);
-  console.log(`âœ… Submission RPCs ranked: ${results.map(r => `${r.url}(${r.ok ? r.rt + 'ms' : 'err'})`).join(', ')}`);
+  console.log(
+    `âœ… Submission RPCs ranked: ${results
+      .map(r => `${r.url}(${r.ok ? r.rt + 'ms' : 'err' + (r.err ? (': ' + r.err.slice(0,120)) : '')})`)
+      .join(', ')}`
+  );
 }
 
 // Warm submission RPCs periodically to avoid cold TLS/RPC stalls
