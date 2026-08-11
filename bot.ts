@@ -1420,35 +1420,51 @@ async function buildPumpPortalTx(
   slippageBps = SLIPPAGE_BPS,
   pool: "pump" | "auto" = "auto"
 ): Promise<Uint8Array | null> {
-  try {
-    const res: any = await fetch("https://pumpportal.fun/api/trade-local", {
-      agent: pumpPortalAgent,
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        publicKey: wallet.publicKey.toString(),
-        action,
-        mint,
-        amount,
-        denominatedInSol,
-        slippage: slippageBps / 100,
-        priorityFee: getDynamicPriorityFee() / 1e9,
-        pool,
-      }),
-    });
-    if (!res.ok) {
-      const errText = await res.text().catch(() => "");
-      console.log(`âš ï¸ trade-local ${action} build failed:`, String(errText).slice(0, 140));
+  const url = "https://pumpportal.fun/api/trade-local";
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const res: any = await fetch(url, {
+        agent: pumpPortalAgent,
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          publicKey: wallet.publicKey.toString(),
+          action,
+          mint,
+          amount,
+          denominatedInSol,
+          slippage: slippageBps / 100,
+          priorityFee: getDynamicPriorityFee() / 1e9,
+          pool,
+        }),
+      });
+
+      if (!res.ok) {
+        const errText = await res.text().catch(() => "");
+        const truncated = String(errText).slice(0, 240);
+        console.log(`✖ trade-local ${action} build failed (pool=${pool}, attempt=${attempt}): status=${res.status} body=${truncated}`);
+        if ((res.status >= 500 || res.status === 429 || res.status === 408) && attempt < 2) {
+          await new Promise((resolve) => setTimeout(resolve, 250));
+          continue;
+        }
+        return null;
+      }
+
+      const buf = new Uint8Array(await res.arrayBuffer());
+      const tx = VersionedTransaction.deserialize(buf);
+      tx.sign([wallet]);
+      return tx.serialize();
+    } catch (e: any) {
+      const message = e?.message ?? String(e);
+      console.log(`✖ trade-local ${action} error (pool=${pool}, attempt=${attempt}):`, message);
+      if (attempt < 2) {
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        continue;
+      }
       return null;
     }
-    const buf = new Uint8Array(await res.arrayBuffer());
-    const tx = VersionedTransaction.deserialize(buf);
-    tx.sign([wallet]);
-    return tx.serialize();
-  } catch (e: any) {
-    console.log(`âš ï¸ trade-local ${action} error:`, e.message);
-    return null;
   }
+  return null;
 }
 /* ================= BALANCE ================= */
 
@@ -1611,8 +1627,8 @@ async function executeBuy(
         dryRunStats.pnlSol += (Math.random() - 0.45) * 0.01;
       } else {
         const candidates: Array<[string, () => Promise<Uint8Array | null>]> = [
-          ["PumpPortal-trade-local-pump", () => buildPumpPortalTx("buy", mint, BUY_AMOUNT / 1e9, true, SLIPPAGE_BPS, "pump")],
           ["PumpPortal-trade-local", () => buildPumpPortalTx("buy", mint, BUY_AMOUNT / 1e9, true, SLIPPAGE_BPS, "auto")],
+          ["PumpPortal-trade-local-pump", () => buildPumpPortalTx("buy", mint, BUY_AMOUNT / 1e9, true, SLIPPAGE_BPS, "pump")],
           ["local Pump SDK", () => buildLocalPumpBuyTx(mint, SLIPPAGE_BPS)],
           ["local PumpSwap SDK", () => buildLocalPumpSwapBuyTx(mint, SLIPPAGE_BPS)],
           ["Jupiter", () => buildJupiterBuyTx(mint)],

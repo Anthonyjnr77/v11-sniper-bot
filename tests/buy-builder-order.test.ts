@@ -9,12 +9,13 @@ test("orders direct Pump builders ahead of Jupiter", () => {
     { name: "local PumpSwap SDK", kind: "direct", build: async () => null },
     { name: "PumpPortal-trade-local", kind: "direct", build: async () => null },
     { name: "local Pump SDK", kind: "direct", build: async () => null },
+    { name: "PumpPortal-trade-local-pump", kind: "direct", build: async () => null },
   ];
 
   const ordered = orderBuyBuilders(candidates);
 
   assert.deepEqual(
     ordered.map((candidate: BuyBuilderCandidate) => candidate.name),
-    ["PumpPortal-trade-local", "local Pump SDK", "local PumpSwap SDK", "Jupiter"]
+    ["PumpPortal-trade-local", "PumpPortal-trade-local-pump", "local Pump SDK", "local PumpSwap SDK", "Jupiter"]
   );
 });
