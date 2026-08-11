@@ -985,13 +985,13 @@ async function buildSwapTx(quoteResponse: any) {
 /* ================= DUAL-PATH SUBMISSION ================= */
 
 // Multi-RPC endpoints for parallel submission (first success wins)
-const SUBMISSION_RPCS = [
+const SUBMISSION_RPCS = [...new Set([
   process.env.BUY_EXEC_RPC_URL,
   process.env.RPC_URL,
   "https://rpc.ankr.com/solana",
   "https://solana-rpc.publicnode.com",
   "https://api.mainnet-beta.solana.com",
-].filter((v): v is string => Boolean(v));
+].filter((v): v is string => Boolean(v)))];
 
 // submissionConnections will be probed & ranked on startup
 let submissionConnections: Connection[] = [];
