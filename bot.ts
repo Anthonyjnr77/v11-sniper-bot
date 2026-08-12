@@ -2143,19 +2143,32 @@ async function startPumpPortal() {
     return;
   }
 
+  let reconnectDelayMs = 3000;
+  const RECONNECT_DELAY_MAX_MS = 120_000;
+  const RECONNECT_DELAY_MIN_MS = 3000;
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const scheduleReconnect = (delayMs: number) => {
+    if (reconnectTimer) return;
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      connect();
+    }, delayMs);
+  };
+
   const connect = () => {
     let ws: any;
     try {
       // Validate WS is a callable constructor
       if (typeof WS !== "function") {
         console.log("âš ï¸ PumpPortal: WS is not a function, skipping reconnect");
-        setTimeout(connect, 30000);
+        scheduleReconnect(30_000);
         return;
       }
       ws = new WS(PUMPPORTAL_WS);
     } catch (e: any) {
       console.log("âš ï¸ PumpPortal WS creation failed:", e.message);
-      setTimeout(connect, 5000);
+      scheduleReconnect(5000);
       return;
     }
 
@@ -2167,11 +2180,12 @@ async function startPumpPortal() {
 
     ws.onopen = () => {
       pumpPortalConnected = true;
+      reconnectDelayMs = RECONNECT_DELAY_MIN_MS;
       console.log("âœ… PumpPortal channel connected");
       ws.send(JSON.stringify({ method: "subscribeAccountTrade", keys: TARGET_WALLET_STRINGS }));
     };
 
-     ws.onmessage = (ev: any) => {
+    ws.onmessage = (ev: any) => {
        try {
          const raw = typeof ev.data === "string" ? ev.data : ev.data.toString();
          const msg = JSON.parse(raw);
@@ -2245,14 +2259,21 @@ async function startPumpPortal() {
        }
      };
 
-    ws.onclose = () => {
+    ws.onclose = (ev: any) => {
       pumpPortalConnected = false;
-      console.log("âš ï¸ PumpPortal channel closed â€” reconnecting in 3s");
-      setTimeout(connect, 3000);
+      const code = ev?.code ?? 0;
+      const reason = typeof ev?.reason === "string" ? ev.reason : "";
+      console.log(`âš ï¸ PumpPortal channel closed (code=${code}, reason=${reason}) â€” reconnecting in ${reconnectDelayMs / 1000}s`);
+      scheduleReconnect(reconnectDelayMs);
+      reconnectDelayMs = Math.min(reconnectDelayMs * 2, RECONNECT_DELAY_MAX_MS);
     };
 
     ws.onerror = (err: any) => {
-      console.log("âš ï¸ PumpPortal WS error:", err?.message ?? String(err));
+      const message = err?.message ?? String(err);
+      console.log("âš ï¸ PumpPortal WS error:", message);
+      if (message.includes("429") || message.includes("Too Many Requests")) {
+        reconnectDelayMs = Math.min(reconnectDelayMs * 2, RECONNECT_DELAY_MAX_MS);
+      }
       try {
         ws.close();
       } catch {}
