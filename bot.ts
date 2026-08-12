@@ -111,6 +111,16 @@ if (TARGET_WALLETS.length === 0) {
 
 // Backwards compatibility: first wallet is primary
 const TARGET_WALLET = TARGET_WALLETS[0]!;
+const TARGET_WALLET_STRINGS = TARGET_WALLETS.map((w) => w.toString());
+const TARGET_WALLET_SET = new Set(TARGET_WALLET_STRINGS);
+
+function isTargetWalletKey(key: PublicKey): boolean {
+  return TARGET_WALLETS.some((w) => w.equals(key));
+}
+
+function isTargetWalletAddress(address: string): boolean {
+  return TARGET_WALLET_SET.has(address);
+}
 
 const BUY_AMOUNT_SOL = Number(process.env.BUY_AMOUNT_SOL);
 const BUY_AMOUNT = BUY_AMOUNT_SOL * 1e9;
@@ -1005,7 +1015,6 @@ async function buildSwapTx(quoteResponse: any) {
 const SUBMISSION_RPCS = [...new Set([
   process.env.BUY_EXEC_RPC_URL,
   process.env.RPC_URL,
-  "https://rpc.ankr.com/solana",
   "https://solana-rpc.publicnode.com",
   "https://api.mainnet-beta.solana.com",
 ].filter((v): v is string => Boolean(v)))];
@@ -1926,13 +1935,13 @@ async function processRetry(signature: string) {
 async function handleTxInternal(tx: any, signature: string): Promise<boolean> {
   try {
     const keys = getResolvedAccountKeys(tx);
-    const targetIdx = keys.findIndex((k) => k.equals(TARGET_WALLET));
+    const targetIdx = keys.findIndex((k) => isTargetWalletKey(k));
     if (targetIdx === -1) return false;
 
     const preTok = tx.meta.preTokenBalances ?? [];
     const postTok = tx.meta.postTokenBalances ?? [];
     for (const pre of preTok) {
-      if (pre.owner !== TARGET_WALLET.toString()) continue;
+      if (!isTargetWalletAddress(pre.owner)) continue;
       if (!positions.has(pre.mint)) continue;
       const post = postTok.find((p: any) => p.owner === pre.owner && p.mint === pre.mint);
       const preAmount = Number(pre.uiTokenAmount.uiAmount ?? 0);
@@ -1952,7 +1961,7 @@ async function handleTxInternal(tx: any, signature: string): Promise<boolean> {
     const postBalances = tx.meta.postTokenBalances ?? [];
     let foundAny = false;
     for (const post of postBalances) {
-      if (post.owner !== TARGET_WALLET.toString()) continue;
+      if (!isTargetWalletAddress(post.owner)) continue;
       if (post.mint === SOL_MINT) continue;
       const pre = preBalances.find((p: any) => p.owner === post.owner && p.mint === post.mint);
       const preAmount = pre ? Number(pre.uiTokenAmount.uiAmount) : 0;
@@ -2004,7 +2013,7 @@ function onWalletLog(log: Logs) {
 
   const fast = tryFastDecode(log.logs);
   const isTargetTrade = fast && (() => {
-    try { return new PublicKey(fast.user).equals(TARGET_WALLET); } catch { return false; }
+    try { return isTargetWalletAddress(fast.user); } catch { return false; }
   })();
 
   if (isTargetTrade && fast.isBuy) {
@@ -2049,8 +2058,10 @@ function rotateSubscriptions() {
   for (const url of urls) {
     try {
       const conn = makeConnection(url);
-      const subId = conn.onLogs(TARGET_WALLET, onWalletLog, "processed");
-      fresh.push({ conn, subId });
+      for (const wallet of TARGET_WALLETS) {
+        const subId = conn.onLogs(wallet, onWalletLog, "processed");
+        fresh.push({ conn, subId });
+      }
     } catch (e: any) {
       const msg = e.message ?? String(e);
       console.log("⚠️ Failed to open detection channel for URL:", url, "->", msg);
@@ -2135,7 +2146,7 @@ async function startPumpPortal() {
     ws.onopen = () => {
       pumpPortalConnected = true;
       console.log("âœ… PumpPortal channel connected");
-      ws.send(JSON.stringify({ method: "subscribeAccountTrade", keys: [TARGET_WALLET.toString()] }));
+      ws.send(JSON.stringify({ method: "subscribeAccountTrade", keys: TARGET_WALLET_STRINGS }));
     };
 
      ws.onmessage = (ev: any) => {
@@ -2144,7 +2155,7 @@ async function startPumpPortal() {
          const msg = JSON.parse(raw);
          if (!msg?.signature || !msg?.mint || !msg.traderPublicKey) return;
 
-         if (msg.traderPublicKey !== TARGET_WALLET.toString()) return;
+         if (!isTargetWalletAddress(msg.traderPublicKey)) return;
          if (seenSignatures.has(msg.signature)) return;
 
          if (msg.txType === "sell") {
@@ -2231,14 +2242,18 @@ async function startPumpPortal() {
 
 /* ================= POLLING RECONCILIATION LOOP ================= */
 
-let lastPolledSignature: string | null = null;
+const lastPolledSignature = new Map<string, string | null>();
 
 async function initPollingCursor() {
   try {
-    const sigs = await connection.getSignaturesForAddress(TARGET_WALLET, { limit: 1 }, "confirmed");
-    if (sigs.length > 0 && sigs[0]) {
-      lastPolledSignature = sigs[0].signature;
-      console.log("âœ… Polling cursor initialized at:", lastPolledSignature);
+    for (const wallet of TARGET_WALLETS) {
+      const sigs = await connection.getSignaturesForAddress(wallet, { limit: 1 }, "confirmed");
+      if (sigs.length > 0 && sigs[0]) {
+        lastPolledSignature.set(wallet.toString(), sigs[0].signature);
+        console.log("âœ… Polling cursor initialized for", wallet.toString(), "at:", sigs[0].signature);
+      } else {
+        lastPolledSignature.set(wallet.toString(), null);
+      }
     }
   } catch (e: any) {
     console.log("âš ï¸ Could not initialize polling cursor:", e.message);
@@ -2247,22 +2262,25 @@ async function initPollingCursor() {
 
 async function pollForMissedTrades() {
   try {
-    const options: any = { limit: 25 };
-    if (lastPolledSignature) options.until = lastPolledSignature;
+    for (const wallet of TARGET_WALLETS) {
+      const options: any = { limit: 25 };
+      const lastSig = lastPolledSignature.get(wallet.toString());
+      if (lastSig) options.until = lastSig;
 
-    const sigs = await connection.getSignaturesForAddress(TARGET_WALLET, options, "confirmed");
-    if (sigs.length === 0) return;
+      const sigs = await connection.getSignaturesForAddress(wallet, options, "confirmed");
+      if (sigs.length === 0) continue;
 
-    const ordered = [...sigs].reverse();
+      const ordered = [...sigs].reverse();
 
-    for (const sigInfo of ordered) {
-      if (sigInfo.err) continue;
-      if (seenSignatures.has(sigInfo.signature)) continue;
-      console.log("ðŸ”Ž POLL found unprocessed signature:", sigInfo.signature);
-      handleTx(sigInfo.signature);
+      for (const sigInfo of ordered) {
+        if (sigInfo.err) continue;
+        if (seenSignatures.has(sigInfo.signature)) continue;
+        console.log("ðŸ”Ž POLL found unprocessed signature for", wallet.toString(), ":", sigInfo.signature);
+        handleTx(sigInfo.signature);
+      }
+
+      lastPolledSignature.set(wallet.toString(), sigs[0]?.signature ?? lastSig ?? null);
     }
-
-    lastPolledSignature = sigs[0]?.signature ?? lastPolledSignature;
   } catch (e: any) {
     console.log("Polling error:", e.message);
   }
