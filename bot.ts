@@ -1269,9 +1269,10 @@ async function sendRawTransactionDual(rawTx: Uint8Array): Promise<string | null>
 }
 
 async function validateBuyTransaction(rawTx: Uint8Array): Promise<boolean> {
-  try {
-    const tx = VersionedTransaction.deserialize(rawTx);
-    const result = await buyExecConnection.simulateTransaction(tx, {
+  const tx = VersionedTransaction.deserialize(rawTx);
+
+  async function simulate(conn: Connection): Promise<boolean> {
+    const result = await conn.simulateTransaction(tx, {
       commitment: "processed",
       replaceRecentBlockhash: true,
       sigVerify: false,
@@ -1282,9 +1283,20 @@ async function validateBuyTransaction(rawTx: Uint8Array): Promise<boolean> {
       return false;
     }
     return true;
+  }
+
+  try {
+    return await simulate(buyExecConnection);
   } catch (error: any) {
-    console.log("Buy candidate simulation unavailable:", error.message);
-    return false;
+    console.log("⚠️ Buy candidate simulation unavailable on buyExecConnection:", error.message);
+    try {
+      return await simulate(connection);
+    } catch (fallbackError: any) {
+      console.log("⚠️ Buy candidate simulation unavailable on fallback RPC:", fallbackError.message);
+      // If simulation cannot be completed due to RPC availability, allow the candidate
+      // to proceed so the bot can still attempt the buy on-chain.
+      return true;
+    }
   }
 }
 
