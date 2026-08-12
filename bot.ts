@@ -178,7 +178,8 @@ const MIN_WALLET_BALANCE_SOL = Number(process.env.MIN_WALLET_BALANCE_SOL ?? 0.02
 
 const SOL_MINT = "So11111111111111111111111111111111111111112";
 
-const JUP_BASE = "https://api.jup.ag/swap/v1";
+const JUP_BASE = process.env.JUP_BASE_URL ?? "https://quote-api.jup.ag/v1";
+const JUP_LEGACY_BASE = "https://api.jup.ag/swap/v1";
 const JUP_API_KEY = process.env.JUP_API_KEY;
 
 // bloXroute (free tier)
@@ -970,43 +971,104 @@ async function pollTelegramCommands() {
 
 /* ================= JUPITER (fallback path) ================= */
 
+function normalizeJupiterQuoteResponse(data: any): any | null {
+  if (!data) return null;
+  if (Array.isArray(data)) return data[0] ?? null;
+  if (data?.data && Array.isArray(data.data)) return data.data[0] ?? null;
+  if (data?.data) return data.data;
+  if (data?.quote) return data.quote;
+  return data;
+}
+
+function normalizeJupiterSwapResponse(data: any): string | null {
+  if (!data) return null;
+  if (typeof data.swapTransaction === "string") return data.swapTransaction;
+  if (data?.data?.swapTransaction && typeof data.data.swapTransaction === "string") return data.data.swapTransaction;
+  if (typeof data.transaction === "string") return data.transaction;
+  return null;
+}
+
 async function getQuote(inputMint: string, outputMint: string, amount: number, attempts = 4) {
   let lastError: string | null = null;
   for (let i = 0; i < attempts; i++) {
     const useDirect = ONLY_DIRECT_ROUTES && i < 2;
-    let url = `${JUP_BASE}/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${Math.floor(
-      amount
-    )}&slippageBps=${SLIPPAGE_BPS}`;
-    if (useDirect) url += "&onlyDirectRoutes=true";
+    const params = new URLSearchParams({
+      inputMint,
+      outputMint,
+      amount: Math.floor(amount).toString(),
+      slippageBps: SLIPPAGE_BPS.toString(),
+      onlyDirectRoutes: useDirect ? "true" : "false",
+    });
+    const url = `${JUP_BASE}/quote?${params.toString()}`;
     try {
       const data = await fetchJson(url, { headers: jupHeaders() });
-      if (data && !data.error && data.outAmount) return data;
-      lastError = data?.error ? String(data.error) : "empty quote response";
+      const quote = normalizeJupiterQuoteResponse(data);
+      if (quote && !quote.error && quote.outAmount) return quote;
+      console.log("🚫 Jupiter quote invalid response:", JSON.stringify(data).slice(0, 1200));
+      lastError = data?.error ? String(data.error) : quote?.error ? String(quote.error) : "empty quote response";
     } catch (e: any) {
-      lastError = e.message;
+      console.log("🚫 Jupiter quote fetch error:", String(e?.message ?? e));
+      if (i === 0 && JUP_BASE !== JUP_LEGACY_BASE) {
+        const fallbackUrl = `${JUP_LEGACY_BASE}/quote?${params.toString()}`;
+        try {
+          const data = await fetchJson(fallbackUrl, { headers: jupHeaders() });
+          const quote = normalizeJupiterQuoteResponse(data);
+          if (quote && !quote.error && quote.outAmount) return quote;
+          console.log("🚫 Jupiter legacy quote invalid response:", JSON.stringify(data).slice(0, 1200));
+          lastError = data?.error ? String(data.error) : quote?.error ? String(quote.error) : lastError;
+        } catch (legacyError: any) {
+          console.log("🚫 Jupiter legacy quote fetch error:", String(legacyError?.message ?? legacyError));
+          lastError = String(legacyError?.message ?? legacyError);
+        }
+      } else {
+        lastError = e.message ?? String(e);
+      }
     }
-    if (i < attempts - 1) await new Promise((r) => setTimeout(r, 400));
+    if (i < attempts - 1) await new Promise((r) => setTimeout(r, 600));
   }
-  if (lastError && attempts > 1) {
-    console.log("âŒ Quote failed after retries:", String(lastError).slice(0, 140));
+  if (lastError) {
+    console.log("🚫 Quote failed after retries:", String(lastError).slice(0, 140));
   }
   return null;
 }
 
 async function buildSwapTx(quoteResponse: any) {
+  const quote = normalizeJupiterQuoteResponse(quoteResponse);
   const data = await fetchJson(`${JUP_BASE}/swap`, {
     method: "POST",
     headers: jupHeaders({ "Content-Type": "application/json" }),
     body: JSON.stringify({
-      quoteResponse,
+      quoteResponse: quote,
       userPublicKey: wallet.publicKey.toString(),
       wrapAndUnwrapSol: true,
       prioritizationFeeLamports: getPriorityFee(),
       dynamicComputeUnitLimit: false,
     }),
   });
-  if (!data || data.error || !data.swapTransaction) return null;
-  return data.swapTransaction;
+  let swapTx = normalizeJupiterSwapResponse(data);
+  if (!swapTx && JUP_BASE !== JUP_LEGACY_BASE) {
+    if (data) console.log("🚫 Jupiter swap response invalid:", JSON.stringify(data).slice(0, 1200));
+    try {
+      const dataLegacy = await fetchJson(`${JUP_LEGACY_BASE}/swap`, {
+        method: "POST",
+        headers: jupHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify({
+          quoteResponse: quote,
+          userPublicKey: wallet.publicKey.toString(),
+          wrapAndUnwrapSol: true,
+          prioritizationFeeLamports: getPriorityFee(),
+          dynamicComputeUnitLimit: false,
+        }),
+      });
+      swapTx = normalizeJupiterSwapResponse(dataLegacy);
+      if (!swapTx) {
+        console.log("🚫 Jupiter legacy swap response invalid:", JSON.stringify(dataLegacy).slice(0, 1200));
+      }
+    } catch (legacySwapError: any) {
+      console.log("🚫 Jupiter legacy swap fetch error:", String(legacySwapError?.message ?? legacySwapError));
+    }
+  }
+  return swapTx;
 }
 
 /* ================= DUAL-PATH SUBMISSION ================= */
@@ -1308,122 +1370,66 @@ async function validateBuyTransaction(rawTx: Uint8Array): Promise<boolean> {
   try {
     const mintKey = new PublicKey(mint);
     const latestBlockhash = await getBlockhashFast();
-      const [mintInfo, global] = await Promise.all([
-        pumpSdkConnection.getAccountInfo(mintKey, "processed"),
-        pumpSdkForBuild.fetchGlobal(), // dedicated SDK RPC
-      ]);
-      if (!mintInfo) throw new Error("mint account not found");
-     const tokenProgram = mintInfo.owner;
-     if (!tokenProgram.equals(TOKEN_PROGRAM_ID) && !tokenProgram.equals(TOKEN_2022_PROGRAM_ID)) {
-       throw new Error("unsupported token program");
-     }
+    const [mintInfo, global] = await Promise.all([
+      pumpSdkConnection.getAccountInfo(mintKey, "processed"),
+      pumpSdkForBuild.fetchGlobal(), // dedicated SDK RPC
+    ]);
+    if (!mintInfo) throw new Error("mint account not found");
 
-      const cachedWarmState = buyStateWarmCache.get(mint);
-      const [buyState, mintState, feeConfig] = await Promise.all([
-        cachedWarmState?.timestamp && Date.now() - cachedWarmState.timestamp < 30_000
-          ? Promise.resolve(cachedWarmState.buyState)
-          : pumpSdkForBuild.fetchBuyState(mintKey, wallet.publicKey, tokenProgram), // dedicated SDK RPC
-        getMint(pumpSdkConnection, mintKey, "processed", tokenProgram), // dedicated SDK RPC
-        cachedWarmState?.timestamp && Date.now() - cachedWarmState.timestamp < 30_000
-          ? Promise.resolve(cachedWarmState.feeConfig)
-          : pumpSdkForBuild.fetchFeeConfig(), // dedicated SDK RPC
-      ]);
-      if (!cachedWarmState || !cachedWarmState.global) {
-        buyStateWarmCache.set(mint, { timestamp: Date.now(), buyState, mintState, feeConfig, global });
-      }
-     const solAmount = new BN(BUY_AMOUNT);
-      const bondingCurve = buyState.bondingCurve as any;
-      if (bondingCurve.complete || new BN(bondingCurve.realTokenReserves).isZero()) {
-        throw new Error("bonding curve is complete; PumpSwap route required");
-      }
-      if (bondingCurve.quoteMint && !new PublicKey(bondingCurve.quoteMint).equals(new PublicKey(SOL_MINT))) {
-        throw new Error(`unsupported quote mint: ${bondingCurve.quoteMint.toString()}`);
-      }
-      const tokenAmount = getBuyTokenAmountFromSolAmount({
-        global,
-        feeConfig,
-        mintSupply: (typeof mintState.supply === "bigint" ? new BN(mintState.supply.toString()) : mintState.supply),
-        bondingCurve,
-        amount: solAmount,
-        quoteMint: new PublicKey(SOL_MINT),
-      });
-     if (tokenAmount.isZero()) throw new Error("bonding curve returned zero tokens");
-
-     const instructions = await PUMP_SDK.buyInstructions({
-       global,
-        ...buyState, // buyState already has bondingCurve, associatedBondingCurve, etc.
-       mint: mintKey,
-       user: wallet.publicKey,
-       amount: tokenAmount,
-       solAmount,
-       slippage: slippageBps / 100,
-       tokenProgram,
-     });
-     const dynamicFee = getDynamicPriorityFee();
-    const dynamicComputeUnits = await simulateAndGetComputeUnits(pumpSdkConnection, instructions, wallet.publicKey);
-    const priorityMicroLamports = Math.ceil((dynamicFee * 1_000_000) / dynamicComputeUnits);
-     const message = new TransactionMessage({
-       payerKey: wallet.publicKey,
-        recentBlockhash: latestBlockhash,
-       instructions: [
-         ComputeBudgetProgram.setComputeUnitLimit({ units: dynamicComputeUnits }),
-         ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityMicroLamports }),
-         ...instructions,
-       ],
-     }).compileToV0Message();
-     const tx = new VersionedTransaction(message);
-     tx.sign([wallet]);
-    const elapsed = nowMs() - startMs;
-    console.log(`✅ Local Pump.fun build succeeded (${elapsed}ms): ${mint}`);
-    return tx.serialize();
-   } catch (e: any) {
-    const elapsed = nowMs() - startMs;
-    console.log("â†ªï¸ Local Pump.fun build unavailable:", e?.stack ?? e?.message ?? String(e), `(${elapsed}ms)`, mint);
-     return null;
-   }
- }
-
-async function buildLocalPumpSwapBuyTx(mint: string, slippageBps = SLIPPAGE_BPS): Promise<Uint8Array | null> {
-  const startMs = nowMs();
-  try {
-    const mintKey = new PublicKey(mint);
-    const latestBlockhash = await getBlockhashFast();
-    const canonicalPoolKey = canonicalPumpPoolPda(mintKey, new PublicKey(SOL_MINT));
-    let poolKey = canonicalPoolKey;
-    const canonicalPool = await pumpSdkConnection.getAccountInfo(canonicalPoolKey, "processed");
-
-    if (!canonicalPool) {
-      // A migrated token can use a noncanonical pool or arrive before the
-      // canonical pool is visible on the first RPC read.
-      const poolAccounts = await pumpSdkConnection.getProgramAccounts(PUMP_AMM_PROGRAM_ID, {
-        commitment: "processed",
-        filters: [{ memcmp: { offset: 43, bytes: mintKey.toBase58() } }],
-      });
-      for (const account of poolAccounts) {
-        try {
-          const pool = PUMP_AMM_SDK.decodePool(account.account);
-          if (pool.baseMint.equals(mintKey) && pool.quoteMint.equals(new PublicKey(SOL_MINT))) {
-            poolKey = account.pubkey;
-            break;
-          }
-        } catch {
-          // Ignore other Pump AMM accounts that happen to match the filter.
-        }
-      }
+    const tokenProgram = mintInfo.owner;
+    if (!tokenProgram.equals(TOKEN_PROGRAM_ID) && !tokenProgram.equals(TOKEN_2022_PROGRAM_ID)) {
+      throw new Error(`unsupported token program: ${tokenProgram.toBase58()}`);
     }
 
-    if (poolKey.equals(canonicalPoolKey) && !canonicalPool) {
-      throw new Error("PumpSwap pool not visible yet");
+    const cachedWarmState = buyStateWarmCache.get(mint);
+    const [buyState, mintState, feeConfig] = await Promise.all([
+      cachedWarmState?.timestamp && Date.now() - cachedWarmState.timestamp < 30_000
+        ? Promise.resolve(cachedWarmState.buyState)
+        : pumpSdkForBuild.fetchBuyState(mintKey, wallet.publicKey, tokenProgram),
+      getMint(pumpSdkConnection, mintKey, "processed", tokenProgram),
+      cachedWarmState?.timestamp && Date.now() - cachedWarmState.timestamp < 30_000
+        ? Promise.resolve(cachedWarmState.feeConfig)
+        : pumpSdkForBuild.fetchFeeConfig(),
+    ]);
+
+    if (!cachedWarmState || !cachedWarmState.global) {
+      buyStateWarmCache.set(mint, { timestamp: Date.now(), buyState, mintState, feeConfig, global });
     }
-    const swapState = await pumpAmmSdkForBuild.swapSolanaState(poolKey, wallet.publicKey);
-    if (!swapState.pool.quoteMint.equals(new PublicKey(SOL_MINT))) {
-      throw new Error(`unsupported PumpSwap quote mint: ${swapState.pool.quoteMint.toString()}`);
+
+    const solAmount = new BN(BUY_AMOUNT);
+    const bondingCurve = buyState.bondingCurve as any;
+    if (!bondingCurve) throw new Error("missing bonding curve state");
+    if (bondingCurve.complete || new BN(bondingCurve.realTokenReserves).isZero()) {
+      throw new Error("bonding curve is complete; PumpSwap route required");
     }
-    const instructions = await PUMP_AMM_SDK.buyQuoteInput(
-      swapState,
-      new BN(BUY_AMOUNT),
-      slippageBps / 100
-    );
+    if (bondingCurve.quoteMint && !new PublicKey(bondingCurve.quoteMint).equals(new PublicKey(SOL_MINT))) {
+      throw new Error(`unsupported quote mint: ${bondingCurve.quoteMint.toString()}`);
+    }
+
+    const tokenAmount = getBuyTokenAmountFromSolAmount({
+      global,
+      feeConfig,
+      mintSupply: typeof mintState.supply === "bigint" ? new BN(mintState.supply.toString()) : mintState.supply,
+      bondingCurve,
+      amount: solAmount,
+      quoteMint: new PublicKey(SOL_MINT),
+    });
+    if (tokenAmount.isZero()) throw new Error("bonding curve returned zero tokens");
+
+    const instructions = await PUMP_SDK.buyInstructions({
+      global,
+      ...buyState,
+      mint: mintKey,
+      user: wallet.publicKey,
+      amount: tokenAmount,
+      solAmount,
+      slippage: slippageBps / 100,
+      tokenProgram,
+    });
+    if (!Array.isArray(instructions) || instructions.length === 0) {
+      throw new Error("buyInstructions returned no instructions");
+    }
+
     const dynamicFee = getDynamicPriorityFee();
     const dynamicComputeUnits = await simulateAndGetComputeUnits(pumpSdkConnection, instructions, wallet.publicKey);
     const priorityMicroLamports = Math.ceil((dynamicFee * 1_000_000) / dynamicComputeUnits);
@@ -1438,12 +1444,85 @@ async function buildLocalPumpSwapBuyTx(mint: string, slippageBps = SLIPPAGE_BPS)
     }).compileToV0Message();
     const tx = new VersionedTransaction(message);
     tx.sign([wallet]);
+
     const elapsed = nowMs() - startMs;
-    console.log(`✅ PumpSwap build succeeded (${elapsed}ms): ${mint}`);
+    console.log(`✅ Local Pump.fun build succeeded (${elapsed}ms): ${mint}`);
+    return tx.serialize();
+  } catch (e: any) {
+    const elapsed = nowMs() - startMs;
+    console.log(`❌ Local Pump.fun build unavailable for ${mint}:`, e?.message ?? String(e), `(${elapsed}ms)`);
+    return null;
+  }
+}
+
+async function buildLocalPumpSwapBuyTx(mint: string, slippageBps = SLIPPAGE_BPS): Promise<Uint8Array | null> {
+  const startMs = nowMs();
+  try {
+    const mintKey = new PublicKey(mint);
+    const latestBlockhash = await getBlockhashFast();
+    const canonicalPoolKey = canonicalPumpPoolPda(mintKey, new PublicKey(SOL_MINT));
+    let poolKey = canonicalPoolKey;
+    let poolOrigin = "canonical";
+    const canonicalPool = await pumpSdkConnection.getAccountInfo(canonicalPoolKey, "processed");
+
+    if (!canonicalPool) {
+      const poolAccounts = await pumpSdkConnection.getProgramAccounts(PUMP_AMM_PROGRAM_ID, {
+        commitment: "processed",
+        filters: [{ memcmp: { offset: 43, bytes: mintKey.toBase58() } }],
+      });
+      for (const account of poolAccounts) {
+        try {
+          const pool = PUMP_AMM_SDK.decodePool(account.account);
+          if (pool.baseMint.equals(mintKey) && pool.quoteMint.equals(new PublicKey(SOL_MINT))) {
+            poolKey = account.pubkey;
+            poolOrigin = "noncanonical";
+            break;
+          }
+        } catch {
+          // Ignore other Pump AMM accounts that happen to match the filter.
+        }
+      }
+    }
+
+    if (poolKey.equals(canonicalPoolKey) && !canonicalPool) {
+      throw new Error("PumpSwap pool not visible yet");
+    }
+    if (poolOrigin === "noncanonical") {
+      console.log(`ℹ️ Using noncanonical PumpSwap pool for ${mint}: ${poolKey.toBase58()}`);
+    }
+
+    const swapState = await pumpAmmSdkForBuild.swapSolanaState(poolKey, wallet.publicKey);
+    if (!swapState || !swapState.pool) throw new Error("missing PumpSwap swap state");
+    if (!swapState.pool.quoteMint.equals(new PublicKey(SOL_MINT))) {
+      throw new Error(`unsupported PumpSwap quote mint: ${swapState.pool.quoteMint.toBase58()}`);
+    }
+
+    const instructions = await PUMP_AMM_SDK.buyQuoteInput(swapState, new BN(BUY_AMOUNT), slippageBps / 100);
+    if (!Array.isArray(instructions) || instructions.length === 0) {
+      throw new Error("buyQuoteInput returned no instructions");
+    }
+
+    const dynamicFee = getDynamicPriorityFee();
+    const dynamicComputeUnits = await simulateAndGetComputeUnits(pumpSdkConnection, instructions, wallet.publicKey);
+    const priorityMicroLamports = Math.ceil((dynamicFee * 1_000_000) / dynamicComputeUnits);
+    const message = new TransactionMessage({
+      payerKey: wallet.publicKey,
+      recentBlockhash: latestBlockhash,
+      instructions: [
+        ComputeBudgetProgram.setComputeUnitLimit({ units: dynamicComputeUnits }),
+        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityMicroLamports }),
+        ...instructions,
+      ],
+    }).compileToV0Message();
+    const tx = new VersionedTransaction(message);
+    tx.sign([wallet]);
+
+    const elapsed = nowMs() - startMs;
+    console.log(`✅ PumpSwap build succeeded (${elapsed}ms) via ${poolOrigin} pool: ${mint}`);
     return tx.serialize();
   } catch (error: any) {
     const elapsed = nowMs() - startMs;
-    console.log("PumpSwap local build unavailable:", error?.stack ?? error?.message ?? String(error), `(${elapsed}ms)`, mint);
+    console.log(`❌ PumpSwap local build unavailable for ${mint}:`, error?.message ?? String(error), `(${elapsed}ms)`);
     return null;
   }
 }
@@ -1624,9 +1703,19 @@ function passesFilters(quote: any) {
 // Build Jupiter buy transaction (returns signed Uint8Array for parallel race)
 async function buildJupiterBuyTx(mint: string) {
   const quote = await getQuote(SOL_MINT, mint, BUY_AMOUNT);
-  if (!quote || !passesFilters(quote)) return null;
+  if (!quote) {
+    console.log(`âŒ Jupiter quote unavailable for ${mint}`);
+    return null;
+  }
+  if (!passesFilters(quote)) {
+    console.log(`âŒ Jupiter quote rejected by filters for ${mint}`);
+    return null;
+  }
   const txBase64 = await buildSwapTx(quote);
-  if (!txBase64) return null;
+  if (!txBase64) {
+    console.log(`âŒ Jupiter swap transaction unavailable for ${mint}`);
+    return null;
+  }
   const swapTx = VersionedTransaction.deserialize(Buffer.from(txBase64, "base64"));
   swapTx.sign([wallet]);
   return swapTx.serialize();
