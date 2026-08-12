@@ -2083,10 +2083,21 @@ function rotateSubscriptions() {
 
   for (const ch of activeChannels) {
     try {
-      ch.conn.removeOnLogsListener(ch.subId);
-    } catch {}
-    try {
-      (ch.conn as any)._rpcWebSocket?.close?.();
+      // Only unsubscribe if the underlying websocket is OPEN. Calling
+      // removeOnLogsListener when the socket is CLOSING/CLOSED can trigger
+      // a library-level `logsUnsubscribe` RPC error (readyState 2).
+      const ws = (ch.conn as any)._rpcWebSocket;
+      if (ws && ws.readyState === 1) {
+        try {
+          ch.conn.removeOnLogsListener(ch.subId);
+        } catch {}
+      } else {
+        // If socket not open, attempt to close it (best-effort) and skip
+        // the unsubscribe RPC which would fail.
+        try {
+          ws?.close?.();
+        } catch {}
+      }
     } catch {}
   }
 
