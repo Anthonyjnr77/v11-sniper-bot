@@ -179,8 +179,30 @@ const MIN_WALLET_BALANCE_SOL = Number(process.env.MIN_WALLET_BALANCE_SOL ?? 0.02
 const SOL_MINT = "So11111111111111111111111111111111111111112";
 
 const JUP_BASE = process.env.JUP_BASE_URL ?? "https://quote-api.jup.ag/v1";
-const JUP_LEGACY_BASE = "https://api.jup.ag/swap/v1";
+const JUP_LEGACY_BASE = process.env.JUP_LEGACY_BASE_URL ?? "https://api.jup.ag/swap/v1";
 const JUP_API_KEY = process.env.JUP_API_KEY;
+const JUP_FALLBACK_TTL_MS = Number(process.env.JUP_FALLBACK_TTL_MS ?? 30_000);
+let jupiterDisabledUntil = 0;
+const jupiterNoRouteCache = new Map<string, number>();
+
+function isJupiterAvailable(): boolean {
+  return Date.now() >= jupiterDisabledUntil;
+}
+
+function disableJupiter(reason: string, durationMs = JUP_FALLBACK_TTL_MS) {
+  jupiterDisabledUntil = Math.max(jupiterDisabledUntil, Date.now() + durationMs);
+  console.log(`⚠️ Jupiter disabled for ${Math.round(durationMs / 1000)}s: ${reason}`);
+}
+
+function skipJupiterForMint(mint: string): boolean {
+  const expiry = jupiterNoRouteCache.get(mint);
+  if (!expiry) return false;
+  if (Date.now() > expiry) {
+    jupiterNoRouteCache.delete(mint);
+    return false;
+  }
+  return true;
+}
 
 // bloXroute (free tier)
 const BLOXROUTE_AUTH = process.env.BLOXROUTE_AUTH;
@@ -989,6 +1011,9 @@ function normalizeJupiterSwapResponse(data: any): string | null {
 }
 
 async function getQuote(inputMint: string, outputMint: string, amount: number, attempts = 4) {
+  if (!isJupiterAvailable()) return null;
+  if (skipJupiterForMint(outputMint)) return null;
+
   let lastError: string | null = null;
   for (let i = 0; i < attempts; i++) {
     const useDirect = ONLY_DIRECT_ROUTES && i < 2;
@@ -999,33 +1024,38 @@ async function getQuote(inputMint: string, outputMint: string, amount: number, a
       slippageBps: SLIPPAGE_BPS.toString(),
       onlyDirectRoutes: useDirect ? "true" : "false",
     });
-    const url = `${JUP_BASE}/quote?${params.toString()}`;
-    try {
-      const data = await fetchJson(url, { headers: jupHeaders() });
-      const quote = normalizeJupiterQuoteResponse(data);
-      if (quote && !quote.error && quote.outAmount) return quote;
-      console.log("🚫 Jupiter quote invalid response:", JSON.stringify(data).slice(0, 1200));
-      lastError = data?.error ? String(data.error) : quote?.error ? String(quote.error) : "empty quote response";
-    } catch (e: any) {
-      console.log("🚫 Jupiter quote fetch error:", String(e?.message ?? e));
-      if (i === 0 && JUP_BASE !== JUP_LEGACY_BASE) {
-        const fallbackUrl = `${JUP_LEGACY_BASE}/quote?${params.toString()}`;
-        try {
-          const data = await fetchJson(fallbackUrl, { headers: jupHeaders() });
-          const quote = normalizeJupiterQuoteResponse(data);
-          if (quote && !quote.error && quote.outAmount) return quote;
-          console.log("🚫 Jupiter legacy quote invalid response:", JSON.stringify(data).slice(0, 1200));
-          lastError = data?.error ? String(data.error) : quote?.error ? String(quote.error) : lastError;
-        } catch (legacyError: any) {
-          console.log("🚫 Jupiter legacy quote fetch error:", String(legacyError?.message ?? legacyError));
-          lastError = String(legacyError?.message ?? legacyError);
+
+    for (const baseUrl of [JUP_BASE, JUP_LEGACY_BASE]) {
+      const url = `${baseUrl}/quote?${params.toString()}`;
+      try {
+        const data = await fetchJson(url, { headers: jupHeaders() });
+        const quote = normalizeJupiterQuoteResponse(data);
+        if (quote && !quote.error && quote.outAmount) {
+          if (baseUrl !== JUP_BASE) console.log(`ℹ️ Jupiter quote served by fallback host: ${baseUrl}`);
+          return quote;
         }
-      } else {
-        lastError = e.message ?? String(e);
+
+        const normalizedError = data?.error ?? quote?.error ?? "empty quote response";
+        console.log(`🚫 Jupiter quote invalid response (${baseUrl}):`, JSON.stringify(data).slice(0, 1200));
+        lastError = String(normalizedError);
+
+        if (String(normalizedError).toLowerCase().includes("no routes")) {
+          jupiterNoRouteCache.set(outputMint, Date.now() + JUP_FALLBACK_TTL_MS);
+          disableJupiter(`no routes found for ${outputMint}`, 10_000);
+          return null;
+        }
+      } catch (e: any) {
+        console.log(`🚫 Jupiter quote fetch error (${baseUrl}):`, String(e?.message ?? e));
+        lastError = String(e?.message ?? e);
+        if (String(lastError).includes("ENOTFOUND") || String(lastError).includes("ECONNREFUSED")) {
+          disableJupiter(`Jupiter host unreachable (${baseUrl})`, 10_000);
+        }
       }
     }
+
     if (i < attempts - 1) await new Promise((r) => setTimeout(r, 600));
   }
+
   if (lastError) {
     console.log("🚫 Quote failed after retries:", String(lastError).slice(0, 140));
   }
@@ -1034,22 +1064,11 @@ async function getQuote(inputMint: string, outputMint: string, amount: number, a
 
 async function buildSwapTx(quoteResponse: any) {
   const quote = normalizeJupiterQuoteResponse(quoteResponse);
-  const data = await fetchJson(`${JUP_BASE}/swap`, {
-    method: "POST",
-    headers: jupHeaders({ "Content-Type": "application/json" }),
-    body: JSON.stringify({
-      quoteResponse: quote,
-      userPublicKey: wallet.publicKey.toString(),
-      wrapAndUnwrapSol: true,
-      prioritizationFeeLamports: getPriorityFee(),
-      dynamicComputeUnitLimit: false,
-    }),
-  });
-  let swapTx = normalizeJupiterSwapResponse(data);
-  if (!swapTx && JUP_BASE !== JUP_LEGACY_BASE) {
-    if (data) console.log("🚫 Jupiter swap response invalid:", JSON.stringify(data).slice(0, 1200));
+  if (!quote) return null;
+
+  for (const baseUrl of [JUP_BASE, JUP_LEGACY_BASE]) {
     try {
-      const dataLegacy = await fetchJson(`${JUP_LEGACY_BASE}/swap`, {
+      const data = await fetchJson(`${baseUrl}/swap`, {
         method: "POST",
         headers: jupHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify({
@@ -1060,15 +1079,25 @@ async function buildSwapTx(quoteResponse: any) {
           dynamicComputeUnitLimit: false,
         }),
       });
-      swapTx = normalizeJupiterSwapResponse(dataLegacy);
-      if (!swapTx) {
-        console.log("🚫 Jupiter legacy swap response invalid:", JSON.stringify(dataLegacy).slice(0, 1200));
+      const swapTx = normalizeJupiterSwapResponse(data);
+      if (swapTx) {
+        if (baseUrl !== JUP_BASE) console.log(`ℹ️ Jupiter swap served by fallback host: ${baseUrl}`);
+        return swapTx;
       }
-    } catch (legacySwapError: any) {
-      console.log("🚫 Jupiter legacy swap fetch error:", String(legacySwapError?.message ?? legacySwapError));
+      console.log(`🚫 Jupiter swap invalid response (${baseUrl}):`, JSON.stringify(data).slice(0, 1200));
+      if (data?.error && String(data.error).toLowerCase().includes("no routes")) {
+        disableJupiter(`Jupiter swap no routes`, 10_000);
+        return null;
+      }
+    } catch (e: any) {
+      console.log(`🚫 Jupiter swap fetch error (${baseUrl}):`, String(e?.message ?? e));
+      if (String(e?.message ?? "").includes("ENOTFOUND") || String(e?.message ?? "").includes("ECONNREFUSED")) {
+        disableJupiter(`Jupiter host unreachable (${baseUrl})`, 10_000);
+      }
     }
   }
-  return swapTx;
+
+  return null;
 }
 
 /* ================= DUAL-PATH SUBMISSION ================= */
@@ -1704,19 +1733,27 @@ function passesFilters(quote: any) {
 async function buildJupiterBuyTx(mint: string) {
   const quote = await getQuote(SOL_MINT, mint, BUY_AMOUNT);
   if (!quote) {
-    console.log(`âŒ Jupiter quote unavailable for ${mint}`);
+    console.log(`🚫 Jupiter quote unavailable for ${mint}`);
     return null;
   }
   if (!passesFilters(quote)) {
-    console.log(`âŒ Jupiter quote rejected by filters for ${mint}`);
+    console.log(`🚫 Jupiter quote rejected by filters for ${mint}`);
     return null;
   }
   const txBase64 = await buildSwapTx(quote);
   if (!txBase64) {
-    console.log(`âŒ Jupiter swap transaction unavailable for ${mint}`);
+    console.log(`🚫 Jupiter swap transaction unavailable for ${mint}`);
     return null;
   }
   const swapTx = VersionedTransaction.deserialize(Buffer.from(txBase64, "base64"));
+  try {
+    const blockhash = await getBlockhashFast();
+    if (swapTx.message && typeof (swapTx.message as any).recentBlockhash === "string") {
+      (swapTx.message as any).recentBlockhash = blockhash;
+    }
+  } catch (e: any) {
+    console.log(`⚠️ Jupiter build blockhash refresh failed for ${mint}:`, e.message ?? String(e));
+  }
   swapTx.sign([wallet]);
   return swapTx.serialize();
 }
@@ -1793,7 +1830,11 @@ async function executeBuy(
         }
         candidates.push(["local Pump SDK", () => buildLocalPumpBuyTx(mint, SLIPPAGE_BPS)]);
         candidates.push(["local PumpSwap SDK", () => buildLocalPumpSwapBuyTx(mint, SLIPPAGE_BPS)]);
-        candidates.push(["Jupiter", () => buildJupiterBuyTx(mint)]);
+        if (isJupiterAvailable() && !skipJupiterForMint(mint)) {
+          candidates.push(["Jupiter", () => buildJupiterBuyTx(mint)]);
+        } else if (!isJupiterAvailable()) {
+          console.log(`ℹ️ Skipping Jupiter build for ${mint} while the endpoint is temporarily disabled`);
+        }
         const orderedCandidates = orderBuyBuilders(candidates.map(([name, build]) => ({ name, kind: name === "Jupiter" ? "fallback" : "direct", build }))).map(({ name, build }) => [name, build] as [string, () => Promise<Uint8Array | null>]);
 
         // Build and validate every route concurrently. The first valid route wins,
