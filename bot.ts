@@ -2051,6 +2051,15 @@ interface DetectionChannel {
 
 let activeChannels: DetectionChannel[] = [];
 let consecutive429s = 0;
+let rotationTimer: ReturnType<typeof setTimeout> | null = null;
+
+function scheduleRotate(delayMs = 60 * 1000) {
+  if (rotationTimer) return;
+  rotationTimer = setTimeout(() => {
+    rotationTimer = null;
+    rotateSubscriptions();
+  }, delayMs);
+}
 
 function rotateSubscriptions() {
   const urls = uniqueDetectionUrls.length > 0 ? uniqueDetectionUrls : DETECTION_URLS;
@@ -2073,9 +2082,10 @@ function rotateSubscriptions() {
     console.log("⚠️ Rotation produced no channels — keeping the old ones alive");
     if (consecutive429s > 2) {
       console.log("🐌 Too many 429s, extending next rotation to 5 minutes");
-      setTimeout(rotateSubscriptions, 5 * 60 * 1000);
+      scheduleRotate(5 * 60 * 1000);
       return;
     }
+    scheduleRotate();
     return;
   }
 
@@ -2103,6 +2113,7 @@ function rotateSubscriptions() {
 
   activeChannels = fresh;
   console.log(`✅ ${fresh.length} detection channel(s) rotated onto fresh websockets`);
+  scheduleRotate();
 }
 
 /* ================= PUMPPORTAL CHANNEL ================= */
@@ -2482,7 +2493,6 @@ async function start() {
   }
 
   rotateSubscriptions();
-  setInterval(rotateSubscriptions, 60 * 1000);
   setInterval(pollForMissedTrades, POLL_INTERVAL_MS);
   setInterval(checkWalletBalance, 60 * 1000);
   setInterval(pollTelegramCommands, 3000);
