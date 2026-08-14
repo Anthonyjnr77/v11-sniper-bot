@@ -417,6 +417,11 @@ const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const TELEGRAM_EXTENDED = (process.env.TELEGRAM_EXTENDED ?? "false").toLowerCase() === "true";
 const TELEGRAM_COOLDOWN_MS = Number(process.env.TELEGRAM_COOLDOWN_MS ?? 5000);
 const TELEGRAM_COOLDOWN_NOTIFY_MS = Number(process.env.TELEGRAM_COOLDOWN_NOTIFY_MS ?? 60_000);
+const TELEGRAM_WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET || "mysecret123";
+const TELEGRAM_WEBHOOK_MODE = (process.env.TELEGRAM_WEBHOOK_MODE ?? "true").toLowerCase() !== "false" && !!TELEGRAM_BOT_TOKEN;
+const TELEGRAM_WEBHOOK_ROUTE = `/telegram-webhook/${TELEGRAM_WEBHOOK_SECRET}`;
+const TELEGRAM_WEBHOOK_URL = process.env.TELEGRAM_WEBHOOK_URL ||
+  (process.env.RENDER_EXTERNAL_URL ? `${process.env.RENDER_EXTERNAL_URL.replace(/\/$/, "")}${TELEGRAM_WEBHOOK_ROUTE}` : `http://localhost:${process.env.PORT || 3000}${TELEGRAM_WEBHOOK_ROUTE}`);
 
 // Rate-limiting state per chat to avoid command floods
 const telegramLastCommandAt = new Map<string, number>();
@@ -443,6 +448,117 @@ async function sendTelegramAlert(message: string) {
     });
   } catch (e: any) {
     console.log("Telegram alert failed:", e.message);
+  }
+}
+
+async function sendTelegramMessage(chatId: number | string, text: string) {
+  if (!TELEGRAM_BOT_TOKEN) return;
+  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+  try {
+    await fetch(url, {
+      agent,
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text,
+        parse_mode: "HTML",
+      }),
+    });
+  } catch (e: any) {
+    console.log("Telegram message failed:", e.message);
+  }
+}
+
+async function setupTelegramWebhook() {
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_WEBHOOK_MODE) return;
+  try {
+    const deleteUrl = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/deleteWebhook`;
+    await fetch(deleteUrl, {
+      agent,
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ drop_pending_updates: true }),
+    }).catch(() => undefined);
+
+    const setUrl = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook`;
+    const res = await fetch(setUrl, {
+      agent,
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        url: TELEGRAM_WEBHOOK_URL,
+        drop_pending_updates: true,
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    console.log("Webhook setup result:", data);
+  } catch (e: any) {
+    console.log("Webhook setup failed:", e?.message ?? String(e));
+  }
+}
+
+async function handleTelegramCommandMessage(msg: any) {
+  if (!msg || String(msg.chat?.id) !== String(TELEGRAM_CHAT_ID)) return;
+
+  const chatId = String(msg.chat?.id);
+  const now = Date.now();
+  const last = telegramLastCommandAt.get(chatId) ?? 0;
+  if (now - last < TELEGRAM_COOLDOWN_MS) {
+    const lastNotify = telegramLastNotifyAt.get(chatId) ?? 0;
+    if (now - lastNotify > TELEGRAM_COOLDOWN_NOTIFY_MS) {
+      telegramLastNotifyAt.set(chatId, now);
+      try {
+        await sendTelegramAlert(`Please wait ${Math.ceil((TELEGRAM_COOLDOWN_MS - (now - last)) / 1000)}s before sending another command.`);
+      } catch {
+        // ignore notify failures
+      }
+    }
+    return;
+  }
+
+  const msgAgeSec = Math.floor(Date.now() / 1000) - (msg.date ?? 0);
+  if (msgAgeSec > 30) {
+    console.log(`⏩ Skipping stale Telegram update (${msgAgeSec}s old): ${msg.text}`);
+    return;
+  }
+
+  const text = (msg.text ?? "").trim().toLowerCase();
+  if (text === "/pause") {
+    telegramLastCommandAt.set(chatId, Date.now());
+    botPaused = true;
+    console.log("⏸ Bot PAUSED via Telegram command");
+    await sendTelegramAlert("⏸ <b>Bot paused.</b> No new buys will be taken. Existing positions still monitored/sold normally. Send /resume to continue.");
+  } else if (text === "/resume") {
+    telegramLastCommandAt.set(chatId, Date.now());
+    botPaused = false;
+    console.log("▶ Bot RESUMED via Telegram command");
+    await sendTelegramAlert("▶ <b>Bot resumed.</b> New buys re-enabled.");
+  } else if (text === "/status") {
+    telegramLastCommandAt.set(chatId, Date.now());
+    const balanceStr = lastKnownBalanceLamports !== null
+      ? `${(lastKnownBalanceLamports / 1e9).toFixed(4)} SOL`
+      : "unknown";
+    await sendTelegramAlert(
+      `📢 <b>Status</b>\n` +
+      `Paused: ${botPaused ? "YES" : "no"}\n` +
+      `Open positions: ${positions.size}\n` +
+      `Wallet: ${balanceStr}\n` +
+      `WS channels: ${DETECTION_URLS.length}\n` +
+      `PumpPortal: ${pumpPortalConnected ? "✅ connected" : "❌ NOT connected"}`
+    );
+  } else if (text === "/positions" && TELEGRAM_EXTENDED) {
+    telegramLastCommandAt.set(chatId, Date.now());
+    await sendTelegramAlert(await getTelegramPositionsText());
+  } else if (text === "/stats" && TELEGRAM_EXTENDED) {
+    telegramLastCommandAt.set(chatId, Date.now());
+    await sendTelegramAlert(await getTelegramStatsText());
+  } else if (text === "/history" && TELEGRAM_EXTENDED) {
+    telegramLastCommandAt.set(chatId, Date.now());
+    await sendTelegramAlert(await getTelegramHistoryText());
+  } else if (text === "/settings" && TELEGRAM_EXTENDED) {
+    telegramLastCommandAt.set(chatId, Date.now());
+    await sendTelegramAlert(await getTelegramSettingsText());
   }
 }
 
@@ -962,6 +1078,7 @@ const TELEGRAM_GETUPDATES_TIMEOUT_SEC = Number(process.env.TELEGRAM_GETUPDATES_T
 const TELEGRAM_POLL_BACKOFF_MS = Number(process.env.TELEGRAM_POLL_BACKOFF_MS ?? 5 * 60 * 1000);
 
 async function pollTelegramCommands() {
+  if (TELEGRAM_WEBHOOK_MODE) return;
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
   if (Date.now() < telegramPollingDisabledUntil) return;
   try {
@@ -996,67 +1113,7 @@ async function pollTelegramCommands() {
       telegramUpdateOffset = updateId + 1;
       const msg = update.message;
       if (!msg || String(msg.chat?.id) !== String(TELEGRAM_CHAT_ID)) continue;
-
-      // Rate-limit commands per chat
-      const chatId = String(msg.chat?.id);
-      const now = Date.now();
-      const last = telegramLastCommandAt.get(chatId) ?? 0;
-      if (now - last < TELEGRAM_COOLDOWN_MS) {
-        const lastNotify = telegramLastNotifyAt.get(chatId) ?? 0;
-        if (now - lastNotify > TELEGRAM_COOLDOWN_NOTIFY_MS) {
-          telegramLastNotifyAt.set(chatId, now);
-          try {
-            await sendTelegramAlert(`Please wait ${Math.ceil((TELEGRAM_COOLDOWN_MS - (now - last)) / 1000)}s before sending another command.`);
-          } catch {
-            // ignore notify failures
-          }
-        }
-        continue;
-      }
-      // Ignore stale updates (older than 30s) — prevents reprocessing on restart
-      const msgAgeSec = Math.floor(Date.now() / 1000) - (msg.date ?? 0);
-      if (msgAgeSec > 30) {
-        console.log(`⏩ Skipping stale Telegram update (${msgAgeSec}s old): ${msg.text}`);
-        continue;
-      }
-
-      const text = (msg.text ?? "").trim().toLowerCase();
-      if (text === "/pause") {
-        telegramLastCommandAt.set(chatId, Date.now());
-        botPaused = true;
-        console.log("\u{23F8} Bot PAUSED via Telegram command");
-        await sendTelegramAlert("\u{23F8} <b>Bot paused.</b> No new buys will be taken. Existing positions still monitored/sold normally. Send /resume to continue.");
-      } else if (text === "/resume") {
-        telegramLastCommandAt.set(chatId, Date.now());
-        botPaused = false;
-        console.log("\u{25B6} Bot RESUMED via Telegram command");
-        await sendTelegramAlert("\u{25B6} <b>Bot resumed.</b> New buys re-enabled.");
-      } else if (text === "/status") {
-        telegramLastCommandAt.set(chatId, Date.now());
-        const balanceStr = lastKnownBalanceLamports !== null
-          ? `${(lastKnownBalanceLamports / 1e9).toFixed(4)} SOL`
-          : "unknown";
-        await sendTelegramAlert(
-          `\u{1F4E2} <b>Status</b>\n` +
-          `Paused: ${botPaused ? "YES" : "no"}\n` +
-          `Open positions: ${positions.size}\n` +
-          `Wallet: ${balanceStr}\n` +
-          `WS channels: ${DETECTION_URLS.length}\n` +
-          `PumpPortal: ${pumpPortalConnected ? "\u{2705} connected" : "\u{274C} NOT connected"}`
-        );
-      } else if (text === "/positions" && TELEGRAM_EXTENDED) {
-        telegramLastCommandAt.set(chatId, Date.now());
-        await sendTelegramAlert(await getTelegramPositionsText());
-      } else if (text === "/stats" && TELEGRAM_EXTENDED) {
-        telegramLastCommandAt.set(chatId, Date.now());
-        await sendTelegramAlert(await getTelegramStatsText());
-      } else if (text === "/history" && TELEGRAM_EXTENDED) {
-        telegramLastCommandAt.set(chatId, Date.now());
-        await sendTelegramAlert(await getTelegramHistoryText());
-      } else if (text === "/settings" && TELEGRAM_EXTENDED) {
-        telegramLastCommandAt.set(chatId, Date.now());
-        await sendTelegramAlert(await getTelegramSettingsText());
-      }
+      await handleTelegramCommandMessage(msg);
     }
   } catch (e: any) {
     console.log("Telegram poll error:", e.message);
@@ -2572,6 +2629,7 @@ async function pollForMissedTrades() {
 /* ================= KEEP-ALIVE SERVER ================= */
 
 const app = express();
+app.use(express.json());
 app.get("/", (_req, res) => res.send("Engine Active"));
 app.get("/health", (_req, res) => {
   const mem = process.memoryUsage().heapUsed / 1024 / 1024;
@@ -2585,6 +2643,20 @@ app.get("/health", (_req, res) => {
     memoryMB: Math.round(mem),
     timestamp: Date.now(),
   });
+});
+
+app.post(TELEGRAM_WEBHOOK_ROUTE, async (req, res) => {
+  try {
+    const update = req.body ?? {};
+    const msg = update.message;
+    if (msg) {
+      await handleTelegramCommandMessage(msg);
+    }
+    res.sendStatus(200);
+  } catch (err: any) {
+    console.error("Webhook error:", err?.message ?? String(err));
+    res.sendStatus(500);
+  }
 });
 
 // Simple HTTP endpoint to pre-warm a specific mint in the prebuild/buyState cache.
@@ -2772,8 +2844,12 @@ async function start() {
   rotateSubscriptions();
   setInterval(pollForMissedTrades, POLL_INTERVAL_MS);
   setInterval(checkWalletBalance, 60 * 1000);
-  // Poll Telegram commands using long-polling; default every 30s interval
-  setInterval(pollTelegramCommands, TELEGRAM_POLL_INTERVAL_MS);
+  if (TELEGRAM_WEBHOOK_MODE) {
+    await setupTelegramWebhook();
+  } else {
+    // Poll Telegram commands using long-polling; default every 30s interval
+    setInterval(pollTelegramCommands, TELEGRAM_POLL_INTERVAL_MS);
+  }
 
   // Probe and rank submission RPCs, then warm them periodically
   await probeSubmissionConnections().catch(() => {});
