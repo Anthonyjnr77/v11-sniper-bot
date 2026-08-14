@@ -68,12 +68,13 @@ function makeConnection(url: string, opts: { disableWs?: boolean } = {}): Connec
   if (!trimmed.startsWith("http://") && !trimmed.startsWith("https://")) {
     throw new Error(`Endpoint URL must start with http: or https:: "${trimmed}"`);
   }
-  // Optionally disable websocket endpoints for Helius (free-tier) when set.
-  // This keeps Helius usable for HTTP RPC send/getLatestBlockhash but avoids
-  // opening many websocket connections that trigger 429 rate limits.
-  const disableHeliusWs = (process.env.DISABLE_HELIUS_WS ?? "false").toLowerCase() === "true";
-  const isHelius = trimmed.includes("helius") || trimmed.includes("api.helius") || trimmed.includes("helius.dev");
-  const wsEndpoint = disableHeliusWs && isHelius ? ("" as any) : trimmed.replace("https", "wss");
+  // Decide whether to disable websockets for this connection.
+  // Priority: explicit opts.disableWs takes precedence. Otherwise, honor
+  // DISABLE_HELIUS_WS env when set to "true" and the URL looks like Helius.
+  const disableHeliusWsEnv = (process.env.DISABLE_HELIUS_WS ?? "false").toLowerCase() === "true";
+  const looksLikeHelius = trimmed.includes("helius") || trimmed.includes("api.helius") || trimmed.includes("helius.dev");
+  const finalDisableWs = Boolean(opts.disableWs) || (disableHeliusWsEnv && looksLikeHelius);
+  const wsEndpoint = finalDisableWs ? ("" as any) : trimmed.replace("https", "wss");
   return new Connection(trimmed, {
     commitment: "processed",
     wsEndpoint,
@@ -361,10 +362,8 @@ refreshPrebuildCache();
 // Isolate SDK read traffic from detection/write traffic so free-tier Helius
 // rate limits on detection WS don't starve the buy builder.
 const PUMP_SDK_RPC_URL = process.env.PUMP_SDK_RPC_URL ?? "https://rpc.ankr.com/solana";
-const pumpSdkConnection = new Connection(PUMP_SDK_RPC_URL, {
-  commitment: "processed",
-  wsEndpoint: PUMP_SDK_RPC_URL.replace("https", "wss"),
-  httpAgent: agent,
+const pumpSdkConnection = makeConnection(PUMP_SDK_RPC_URL, {
+  disableWs: (process.env.DISABLE_HELIUS_WS ?? "false").toLowerCase() === "true",
 });
 const pumpSdkForBuild = new OnlinePumpSdk(pumpSdkConnection);
 const pumpAmmSdkForBuild = new OnlinePumpAmmSdk(pumpSdkConnection);
@@ -399,12 +398,7 @@ verifyPumpSdkRpc().catch(() => {});
 // Set BUY_EXEC_RPC_URL to a premium endpoint (Helius paid, Triton, QuickNode, etc.)
 // Falls back to main RPC if not set.
 const BUY_EXEC_RPC_URL = process.env.BUY_EXEC_RPC_URL ?? RPC_URL;
-const buyExecConnection = new Connection(BUY_EXEC_RPC_URL, {
-  commitment: "processed",
-  httpAgent: agent,
-  // Disable WS for this connection - we only need HTTP for sendRawTransaction
-  wsEndpoint: "" as any,
-});
+const buyExecConnection = makeConnection(BUY_EXEC_RPC_URL, { disableWs: true });
 
 
 const originalLog = console.log;
