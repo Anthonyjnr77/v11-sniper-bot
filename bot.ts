@@ -1,104 +1,115 @@
-﻿import "dotenv/config";
-import {
-  Connection,
-  Keypair,
-  VersionedTransaction,
-  PublicKey,
-  SystemProgram,
-  Transaction,
-  TransactionMessage,
-  ComputeBudgetProgram,
-  type SimulatedTransactionResponse,
-} from "@solana/web3.js";
-import type { Logs } from "@solana/web3.js";
-import { Program, AnchorProvider, BorshEventCoder } from "@coral-xyz/anchor";
-import { getMint, getAssociatedTokenAddress, TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID } from "@solana/spl-token";
-import { OnlinePumpSdk, PUMP_SDK, getBuyTokenAmountFromSolAmount, bondingCurvePda } from "@pump-fun/pump-sdk";
-import { OnlinePumpAmmSdk, PUMP_AMM_PROGRAM_ID, PUMP_AMM_SDK, canonicalPumpPoolPda } from "@pump-fun/pump-swap-sdk";
-import BN from "bn.js";
-import fetch from "node-fetch";
-import bs58 from "bs58";
-import https from "https";
-import express from "express";
-import { orderBuyBuilders } from "./hot-path.js";
+﻿async function pollTelegramCommands() {
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
+  if (Date.now() < telegramPollingDisabledUntil) return;
 
-export interface GrpcTradeEvent {
-  type: "buy" | "sell";
-  mint: string;
-  user: string;
-  solAmount: number;
-  tokenAmount: number;
-  signature: string;
-  slot: number;
-  timestamp: number;
-}
+  const lockKey = process.env.TELEGRAM_LEADER_LOCK_KEY ?? "telegram-leader-bot";
+  const lockTtlSec = Math.max(60, TELEGRAM_GETUPDATES_TIMEOUT_SEC + 15);
+  const haveLock = await acquireTelegramLeaderLock(lockKey, lockTtlSec);
+  if (!haveLock) return; // not the leader — skip polling
 
-/* ================= CONFIG ================= */
+  try {
+    // Use long polling (timeout in seconds) to reduce frequency of requests.
+    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?offset=${telegramUpdateOffset}&timeout=${TELEGRAM_GETUPDATES_TIMEOUT_SEC}`;
+    let data: any;
+    try {
+      data = await fetchJson(url, {}, 2);
+    } catch (e: any) {
+      const msg = String(e?.message ?? e);
+      // Detect Telegram 409 conflict (another getUpdates owner) and back off to avoid constant 409 spam.
+      if (msg.includes("409") || /Conflict|terminated by other getUpdates/i.test(msg)) {
+        console.log(`\u001b[33mTelegram polling conflict detected: ${msg}. Backing off ${TELEGRAM_POLL_BACKOFF_MS / 1000}s\u001b[0m`);
+        telegramPollingDisabledUntil = Date.now() + TELEGRAM_POLL_BACKOFF_MS;
+        return;
+      }
+      throw e;
+    }
+    if (!data?.result) return;
 
-function requireEnv(name: string): string {
-  const val = process.env[name];
-  if (!val) throw new Error(`Missing required env var: ${name}`);
-  return val;
-}
+    for (const update of data.result) {
+      const updateId = update.update_id;
+      if (updateId == null || processedUpdateIds.has(updateId)) continue;
+      processedUpdateIds.add(updateId);
+      if (processedUpdateIds.size > 1000) {
+        // Keep set from growing unbounded
+        const first = processedUpdateIds.values().next().value;
+        if (first !== undefined) processedUpdateIds.delete(first);
+      }
 
-const RPC_URL = requireEnv("RPC_URL");
+      telegramUpdateOffset = updateId + 1;
+      const msg = update.message;
+      if (!msg || String(msg.chat?.id) !== String(TELEGRAM_CHAT_ID)) continue;
 
-// High-performance HTTP agent for all outbound requests (Jupiter, PumpPortal, Jito, etc.)
-const agent = new https.Agent({
-  keepAlive: true,
-  maxSockets: 256,                    // Increased from 64 for high-concurrency bursts
-  maxFreeSockets: 128,
-  timeout: 8000,                      // 8s total timeout
-  keepAliveMsecs: 1000,
-  scheduling: 'fifo' as any,
-});
+      // Rate-limit commands per chat
+      const chatId = String(msg.chat?.id);
+      const now = Date.now();
+      const last = telegramLastCommandAt.get(chatId) ?? 0;
+      if (now - last < TELEGRAM_COOLDOWN_MS) {
+        const lastNotify = telegramLastNotifyAt.get(chatId) ?? 0;
+        if (now - lastNotify > TELEGRAM_COOLDOWN_NOTIFY_MS) {
+          telegramLastNotifyAt.set(chatId, now);
+          try {
+            await sendTelegramAlert(`Please wait ${Math.ceil((TELEGRAM_COOLDOWN_MS - (now - last)) / 1000)}s before sending another command.`);
+          } catch {
+            // ignore notify failures
+          }
+        }
+        continue;
+      }
+      // Ignore stale updates (older than 30s) — prevents reprocessing on restart
+      const msgAgeSec = Math.floor(Date.now() / 1000) - (msg.date ?? 0);
+      if (msgAgeSec > 30) {
+        console.log(`⏩ Skipping stale Telegram update (${msgAgeSec}s old): ${msg.text}`);
+        continue;
+      }
 
-// Separate agent for PumpPortal trade-local (can burst independently)
-const pumpPortalAgent = new https.Agent({
-  keepAlive: true,
-  maxSockets: 64,
-  timeout: 6000,
-});
-
-function makeConnection(url: string, opts: { disableWs?: boolean } = {}): Connection {
-  if (!url || typeof url !== "string") {
-    throw new Error(`Invalid URL: "${url}"`);
+      const text = (msg.text ?? "").trim().toLowerCase();
+      if (text === "/pause") {
+        telegramLastCommandAt.set(chatId, Date.now());
+        botPaused = true;
+        console.log("\u{23F8} Bot PAUSED via Telegram command");
+        await sendTelegramAlert("\u{23F8} <b>Bot paused.</b> No new buys will be taken. Existing positions still monitored/sold normally. Send /resume to continue.");
+      } else if (text === "/resume") {
+        telegramLastCommandAt.set(chatId, Date.now());
+        botPaused = false;
+        console.log("\u{25B6} Bot RESUMED via Telegram command");
+        await sendTelegramAlert("\u{25B6} <b>Bot resumed.</b> New buys re-enabled.");
+      } else if (text === "/status") {
+        telegramLastCommandAt.set(chatId, Date.now());
+        const balanceStr = lastKnownBalanceLamports !== null
+          ? `${(lastKnownBalanceLamports / 1e9).toFixed(4)} SOL`
+          : "unknown";
+        await sendTelegramAlert(
+          `\u{1F4E2} <b>Status</b>\n` +
+          `Paused: ${botPaused ? "YES" : "no"}\n` +
+          `Open positions: ${positions.size}\n` +
+          `Wallet: ${balanceStr}\n` +
+          `WS channels: ${DETECTION_URLS.length}\n` +
+          `PumpPortal: ${pumpPortalConnected ? "\u{2705} connected" : "\u{274C} NOT connected"}`
+        );
+      } else if (text === "/positions" && TELEGRAM_EXTENDED) {
+        telegramLastCommandAt.set(chatId, Date.now());
+        await sendTelegramAlert(await getTelegramPositionsText());
+      } else if (text === "/stats" && TELEGRAM_EXTENDED) {
+        telegramLastCommandAt.set(chatId, Date.now());
+        await sendTelegramAlert(await getTelegramStatsText());
+      } else if (text === "/history" && TELEGRAM_EXTENDED) {
+        telegramLastCommandAt.set(chatId, Date.now());
+        await sendTelegramAlert(await getTelegramHistoryText());
+      } else if (text === "/settings" && TELEGRAM_EXTENDED) {
+        telegramLastCommandAt.set(chatId, Date.now());
+        await sendTelegramAlert(await getTelegramSettingsText());
+      }
+    }
+  } catch (e: any) {
+    console.log("Telegram poll error:", e.message);
+  } finally {
+    try {
+      await releaseTelegramLeaderLock(lockKey);
+    } catch (e: any) {
+      console.log("release lock error:", e?.message ?? e);
+    }
   }
-  const trimmed = url.trim();
-  if (!trimmed.startsWith("http://") && !trimmed.startsWith("https://")) {
-    throw new Error(`Endpoint URL must start with http: or https:: "${trimmed}"`);
-  }
-  // Decide whether to disable websockets for this connection.
-  // Priority: explicit opts.disableWs takes precedence. Otherwise, honor
-  // DISABLE_HELIUS_WS env when set to "true" and the URL looks like Helius.
-  const disableHeliusWsEnv = (process.env.DISABLE_HELIUS_WS ?? "false").toLowerCase() === "true";
-  const looksLikeHelius = trimmed.includes("helius") || trimmed.includes("api.helius") || trimmed.includes("helius.dev");
-  const finalDisableWs = Boolean(opts.disableWs) || (disableHeliusWsEnv && looksLikeHelius);
-  const wsEndpoint = finalDisableWs ? ("" as any) : trimmed.replace("https", "wss");
-  return new Connection(trimmed, {
-    commitment: "processed",
-    wsEndpoint,
-    httpAgent: agent,
-  });
 }
-
-// If PumpPortal is used as primary detection, disable Helius WS to avoid 429s
-const connection = makeConnection(RPC_URL, { disableWs: (process.env.PUMPPORTAL ?? "true").toLowerCase() === "true" });
-
-const WS_FANOUT = Math.max(1, Math.min(1, Number(process.env.WS_FANOUT ?? 1))); // Force 1 for Helius free tier
-const EXTRA_WS_URLS = (process.env.EXTRA_WS_URLS ?? "")
-  .split(",")
-  .map((s) => s.trim())
-  .filter((s) => s.startsWith("http://") || s.startsWith("https://"));
-
-const DETECTION_URLS: string[] = [];
-for (let i = 0; i < WS_FANOUT; i++) DETECTION_URLS.push(RPC_URL);
-DETECTION_URLS.push(...EXTRA_WS_URLS);
-
-// Deduplicate URLs to avoid multiple connections to same endpoint
-const uniqueDetectionUrls = [...new Set(DETECTION_URLS)];
-if (uniqueDetectionUrls.length !== DETECTION_URLS.length) {
-  console.log(`⚠️ Deduplicated detection URLs: ${DETECTION_URLS.length} -> ${uniqueDetectionUrls.length}`);
 }
 
 // Short-term control: if true, only use PumpPortal for detection and skip
@@ -841,6 +852,39 @@ async function redisGet(key: string): Promise<string | null> {
   } catch (e: any) {
     console.log(`Redis get(${key}) error:`, e.message);
     return null;
+  }
+}
+
+// Upstash leader-lock helpers for Telegram polling
+async function acquireTelegramLeaderLock(key: string, ttlSec: number): Promise<boolean> {
+  if (!UPSTASH_URL || !UPSTASH_TOKEN) return true; // best-effort: allow polling when Upstash not configured
+  try {
+    const url = `${UPSTASH_URL}/set/${encodeURIComponent(key)}?nx=true&ex=${Math.max(1, Math.floor(ttlSec))}`;
+    const res = await fetch(url, {
+      agent,
+      method: "POST",
+      headers: { Authorization: `Bearer ${UPSTASH_TOKEN}`, "Content-Type": "text/plain" },
+      body: "1",
+    });
+    // Upstash returns a JSON result object for set; treat any truthy `result` as success
+    const data: any = await res.json().catch(() => null);
+    return !!data?.result || res.status === 200;
+  } catch (e: any) {
+    console.log(`acquireTelegramLeaderLock(${key}) error:`, e?.message ?? e);
+    return false;
+  }
+}
+
+async function releaseTelegramLeaderLock(key: string): Promise<void> {
+  if (!UPSTASH_URL || !UPSTASH_TOKEN) return;
+  try {
+    await fetch(`${UPSTASH_URL}/del/${encodeURIComponent(key)}`, {
+      agent,
+      method: "POST",
+      headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` },
+    });
+  } catch (e: any) {
+    console.log(`releaseTelegramLeaderLock(${key}) error:`, e?.message ?? e);
   }
 }
 
