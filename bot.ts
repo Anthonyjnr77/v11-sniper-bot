@@ -929,12 +929,31 @@ let pumpPortalConnected = false;
 let botPaused = false;
 let telegramUpdateOffset = 0;
 const processedUpdateIds = new Set<number>();
+let telegramPollingDisabledUntil = 0;
+const TELEGRAM_POLL_INTERVAL_MS = Number(process.env.TELEGRAM_POLL_INTERVAL_MS ?? 30_000);
+const TELEGRAM_GETUPDATES_TIMEOUT_SEC = Number(process.env.TELEGRAM_GETUPDATES_TIMEOUT_SEC ?? 30);
+const TELEGRAM_POLL_BACKOFF_MS = Number(process.env.TELEGRAM_POLL_BACKOFF_MS ?? 5 * 60 * 1000);
 
 async function pollTelegramCommands() {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
+  if (Date.now() < telegramPollingDisabledUntil) return;
   try {
-    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?offset=${telegramUpdateOffset}&timeout=0`;
-    const data: any = await fetchJson(url);
+    // Use long polling (timeout in seconds) to reduce frequency of requests.
+    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?offset=${telegramUpdateOffset}&timeout=${TELEGRAM_GETUPDATES_TIMEOUT_SEC}`;
+    let data: any;
+    try {
+      data = await fetchJson(url, {}, 2);
+    } catch (e: any) {
+      const msg = String(e?.message ?? e);
+      // Detect Telegram 409 conflict (another getUpdates owner) and back off to avoid constant 409 spam.
+      if (msg.includes("409") || /Conflict|terminated by other getUpdates/i.test(msg)) {
+        console.log(`[33mTelegram polling conflict detected: ${msg}. Backing off ${TELEGRAM_POLL_BACKOFF_MS / 1000}s[0m`);
+        telegramPollingDisabledUntil = Date.now() + TELEGRAM_POLL_BACKOFF_MS;
+        return;
+      }
+      throw e;
+    }
+    if (!data?.result) return;
     if (!data?.result) return;
 
     for (const update of data.result) {
@@ -2675,6 +2694,12 @@ async function start() {
 
   await Promise.all([loadPositions(), initPumpDecoder(), initPollingCursor()]);
 
+  // Log Helius WS / detection configuration for debugging 429 sources
+  const heliusWsEnv = (process.env.DISABLE_HELIUS_WS ?? "false").toLowerCase() === "true";
+  const heliusWsDisabled = heliusWsEnv || PUMPPORTAL_ENABLED;
+  console.log(`âœ… Helius WS disabled: ${heliusWsDisabled} (DISABLE_HELIUS_WS=${process.env.DISABLE_HELIUS_WS ?? "unset"}, PUMPPORTAL=${PUMPPORTAL_ENABLED})`);
+  console.log(`âœ… Detection channels configured: ${DETECTION_URLS.length} URLs, extra unique: ${uniqueDetectionUrls.length}`);
+
   // Start background blockhash refresher (replaces old 25s interval)
   startBlockhashRefresher();
 
@@ -2720,7 +2745,8 @@ async function start() {
   rotateSubscriptions();
   setInterval(pollForMissedTrades, POLL_INTERVAL_MS);
   setInterval(checkWalletBalance, 60 * 1000);
-  setInterval(pollTelegramCommands, 3000);
+  // Poll Telegram commands using long-polling; default every 30s interval
+  setInterval(pollTelegramCommands, TELEGRAM_POLL_INTERVAL_MS);
 
   // Probe and rank submission RPCs, then warm them periodically
   await probeSubmissionConnections().catch(() => {});
