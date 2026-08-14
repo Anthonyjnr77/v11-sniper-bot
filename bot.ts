@@ -60,7 +60,7 @@ const pumpPortalAgent = new https.Agent({
   timeout: 6000,
 });
 
-function makeConnection(url: string): Connection {
+function makeConnection(url: string, opts: { disableWs?: boolean } = {}): Connection {
   if (!url || typeof url !== "string") {
     throw new Error(`Invalid URL: "${url}"`);
   }
@@ -68,14 +68,21 @@ function makeConnection(url: string): Connection {
   if (!trimmed.startsWith("http://") && !trimmed.startsWith("https://")) {
     throw new Error(`Endpoint URL must start with http: or https:: "${trimmed}"`);
   }
+  // Optionally disable websocket endpoints for Helius (free-tier) when set.
+  // This keeps Helius usable for HTTP RPC send/getLatestBlockhash but avoids
+  // opening many websocket connections that trigger 429 rate limits.
+  const disableHeliusWs = (process.env.DISABLE_HELIUS_WS ?? "false").toLowerCase() === "true";
+  const isHelius = trimmed.includes("helius") || trimmed.includes("api.helius") || trimmed.includes("helius.dev");
+  const wsEndpoint = disableHeliusWs && isHelius ? ("" as any) : trimmed.replace("https", "wss");
   return new Connection(trimmed, {
     commitment: "processed",
-    wsEndpoint: trimmed.replace("https", "wss"),
+    wsEndpoint,
     httpAgent: agent,
   });
 }
 
-const connection = makeConnection(RPC_URL);
+// If PumpPortal is used as primary detection, disable Helius WS to avoid 429s
+const connection = makeConnection(RPC_URL, { disableWs: (process.env.PUMPPORTAL ?? "true").toLowerCase() === "true" });
 
 const WS_FANOUT = Math.max(1, Math.min(1, Number(process.env.WS_FANOUT ?? 1))); // Force 1 for Helius free tier
 const EXTRA_WS_URLS = (process.env.EXTRA_WS_URLS ?? "")
@@ -92,6 +99,10 @@ const uniqueDetectionUrls = [...new Set(DETECTION_URLS)];
 if (uniqueDetectionUrls.length !== DETECTION_URLS.length) {
   console.log(`⚠️ Deduplicated detection URLs: ${DETECTION_URLS.length} -> ${uniqueDetectionUrls.length}`);
 }
+
+// Short-term control: if true, only use PumpPortal for detection and skip
+// websocket/grpc-based detection channels. Default is false (legacy behavior).
+const ONLY_PUMPPORTAL_DETECTION = (process.env.ONLY_PUMPPORTAL_DETECTION ?? "false").toLowerCase() === "true";
 
 const BROADCAST_RPC_URL = process.env.BROADCAST_RPC_URL ?? "https://api.mainnet-beta.solana.com";
 const broadcastConnection = makeConnection(BROADCAST_RPC_URL);
@@ -125,6 +136,7 @@ function isTargetWalletAddress(address: string): boolean {
 const BUY_AMOUNT_SOL = Number(process.env.BUY_AMOUNT_SOL);
 const BUY_AMOUNT = BUY_AMOUNT_SOL * 1e9;
 const BASE_PRIORITY_FEE = Number(process.env.PRIORITY_FEE_LAMPORTS ?? 500_000);
+const FORCE_PRIORITY_FEE = Number(process.env.FORCE_PRIORITY_FEE_LAMPORTS ?? 0);
 const SLIPPAGE_BPS = Number(process.env.SLIPPAGE_BPS ?? 3000);
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS ?? 2500);
 
@@ -156,6 +168,7 @@ const GRPC_ENABLED = !!GRPC_TOKEN;
 const MAX_PRICE_IMPACT = Number(process.env.MAX_PRICE_IMPACT ?? 0.15);
 const ONLY_DIRECT_ROUTES = (process.env.ONLY_DIRECT_ROUTES ?? "true").toLowerCase() === "true";
 const PUMPPORTAL_ENABLED = (process.env.PUMPPORTAL ?? "true").toLowerCase() === "true";
+const PREFER_PUMPPORTAL_ONLY = (process.env.PREFER_PUMPPORTAL_ONLY ?? "false").toLowerCase() === "true";
 
 // Per-mint Pump-only fallback cache: when a mint returns Anchor error 6005
 // (BondingCurveComplete / migrated to AMM), we mark it so the bot will
@@ -657,12 +670,25 @@ function logFeeSizingWarning() {
 /* ================= NETWORK ================= */
 
 async function fetchJson(url: string, options: any = {}, retries = 2): Promise<any> {
+  const baseDelay = 300;
   for (let i = 0; i <= retries; i++) {
     try {
-      return await fetch(url, { agent, ...options }).then((r: any) => r.json());
+      const res: any = await fetch(url, { agent, ...options });
+      if (res.status === 429) {
+        if (i === retries) throw new Error(`HTTP 429 Too Many Requests: ${url}`);
+        const delay = Math.min(10_000, baseDelay * Math.pow(2, i)) + Math.floor(Math.random() * 100);
+        await new Promise((r) => setTimeout(r, delay));
+        continue;
+      }
+      if (!res.ok) {
+        const txt = await res.text().catch(() => "");
+        throw new Error(`HTTP ${res.status}: ${txt}`);
+      }
+      return await res.json();
     } catch (e: any) {
       if (i === retries) throw e;
-      await new Promise((r) => setTimeout(r, 300));
+      const delay = Math.min(10_000, baseDelay * Math.pow(2, i)) + Math.floor(Math.random() * 100);
+      await new Promise((r) => setTimeout(r, delay));
     }
   }
 }
@@ -1182,6 +1208,12 @@ const PRIORITY_FEE_TTL_MS = 15_000;
 
 async function refreshPriorityFee() {
   try {
+    if (FORCE_PRIORITY_FEE > 0) {
+      dynamicPriorityFeeLamports = FORCE_PRIORITY_FEE;
+      lastPriorityFeeUpdate = Date.now();
+      console.log(`⚡ Using forced priority fee: ${FORCE_PRIORITY_FEE} lamports`);
+      return;
+    }
     // Fetch recent prioritization fees from Helius RPCs only (others return 0)
     const fees = await Promise.allSettled(
       priorityFeeConnections.map(c => c.getRecentPrioritizationFees())
@@ -1215,12 +1247,20 @@ async function refreshPriorityFee() {
   }
 }
 
-// Refresh priority fee periodically
-setInterval(refreshPriorityFee, PRIORITY_FEE_TTL_MS);
-// Initial fetch
-refreshPriorityFee();
+// Refresh priority fee periodically (skip if a forced priority fee is configured)
+if (FORCE_PRIORITY_FEE === 0) {
+  setInterval(refreshPriorityFee, PRIORITY_FEE_TTL_MS);
+  // Initial fetch
+  refreshPriorityFee();
+} else {
+  // Ensure forced fee is recorded in the cache
+  dynamicPriorityFeeLamports = FORCE_PRIORITY_FEE;
+  lastPriorityFeeUpdate = Date.now();
+  console.log(`⚡ Using forced priority fee (no RPC sampling): ${FORCE_PRIORITY_FEE} lamports`);
+}
 
 function getDynamicPriorityFee(): number {
+  if (FORCE_PRIORITY_FEE > 0) return FORCE_PRIORITY_FEE;
   // Fall back to base if cache is stale
   if (Date.now() - lastPriorityFeeUpdate > PRIORITY_FEE_TTL_MS * 2) {
     return BASE_PRIORITY_FEE;
@@ -1828,6 +1868,12 @@ async function executeBuy(
         } else if (isPumpFallbackActive(mint)) {
           console.log(`ℹ️ Skipping PumpPortal build for ${mint} due to recent Anchor 6005 failures`);
         }
+
+        // Optional: if user requests PumpPortal-only short path, skip other builders
+        if (PREFER_PUMPPORTAL_ONLY && PUMPPORTAL_ENABLED && !isPumpFallbackActive(mint)) {
+          // Keep only the PumpPortal candidate
+          candidates.splice(0, candidates.length, ["PumpPortal-trade-local", () => buildPumpPortalTx("buy", mint, BUY_AMOUNT / 1e9, true, SLIPPAGE_BPS, "auto")]);
+        }
         candidates.push(["local Pump SDK", () => buildLocalPumpBuyTx(mint, SLIPPAGE_BPS)]);
         candidates.push(["local PumpSwap SDK", () => buildLocalPumpSwapBuyTx(mint, SLIPPAGE_BPS)]);
         if (isJupiterAvailable() && !skipJupiterForMint(mint)) {
@@ -2204,6 +2250,10 @@ function scheduleRotate(delayMs = 60 * 1000) {
 }
 
 function rotateSubscriptions() {
+  if (PUMPPORTAL_ENABLED) {
+    console.log("⚠️ Skipping websocket rotation — PumpPortal is primary detection channel");
+    return;
+  }
   const urls = uniqueDetectionUrls.length > 0 ? uniqueDetectionUrls : DETECTION_URLS;
   const fresh: DetectionChannel[] = [];
   for (const url of urls) {
@@ -2222,9 +2272,11 @@ function rotateSubscriptions() {
 
   if (fresh.length === 0) {
     console.log("⚠️ Rotation produced no channels — keeping the old ones alive");
-    if (consecutive429s > 2) {
-      console.log("🐌 Too many 429s, extending next rotation to 5 minutes");
-      scheduleRotate(5 * 60 * 1000);
+    // Exponential backoff when encountering repeated 429 rate limits.
+    if (consecutive429s > 0) {
+      const backoffMs = Math.min(5 * 60 * 1000, 60_000 * Math.pow(2, Math.max(0, consecutive429s - 1)));
+      console.log(`🐌 Too many 429s (${consecutive429s}) — backing off next rotation for ${Math.round(backoffMs / 1000)}s`);
+      scheduleRotate(backoffMs);
       return;
     }
     scheduleRotate();
@@ -2533,6 +2585,16 @@ app.post('/prewarm', express.json(), async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Keep-alive server on port ${PORT}`));
+
+// Optional: keep Render (or any URL) warm by pinging it periodically to avoid cold starts.
+const WARM_URL = process.env.WARM_URL ?? process.env.RENDER_WARM_URL ?? "";
+if (WARM_URL) {
+  const warmInterval = Number(process.env.WARM_PING_INTERVAL_MS ?? 5 * 60 * 1000);
+  setInterval(() => {
+    fetch(WARM_URL, { agent }).catch(() => {});
+  }, warmInterval);
+  console.log(`âœ… Keep-alive pings enabled for ${WARM_URL} every ${Math.round(warmInterval / 1000)}s`);
+}
 
 /* ================= EARLY PENDING-TRANSACTION FEED ================= */
 
