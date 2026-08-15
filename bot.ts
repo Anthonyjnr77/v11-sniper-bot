@@ -285,6 +285,7 @@ interface CachedBondingCurve {
   virtualTokenReserves: BN;
   realQuoteReserves: BN;
   realTokenReserves: BN;
+  tokenTotalSupply?: BN | null;
   timestamp: number;
 }
 
@@ -339,6 +340,7 @@ async function refreshPrebuildCache() {
               virtualTokenReserves: new BN(data.subarray(16, 24).readBigUInt64LE(0).toString()),
               realQuoteReserves: new BN(data.subarray(24, 32).readBigUInt64LE(0).toString()),
               realTokenReserves: new BN(data.subarray(32, 40).readBigUInt64LE(0).toString()),
+              tokenTotalSupply: data.length >= 48 ? new BN(data.subarray(40, 48).readBigUInt64LE(0).toString()) : null,
               timestamp: Date.now(),
             });
             cached++;
@@ -1604,7 +1606,7 @@ async function validateBuyTransaction(rawTx: Uint8Array): Promise<boolean> {
     }
 
     const dynamicFee = getDynamicPriorityFee();
-    const dynamicComputeUnits = await simulateAndGetComputeUnits(pumpSdkConnection, instructions, wallet.publicKey);
+    const dynamicComputeUnits = LOCAL_PUMP_COMPUTE_UNITS; // avoid hot-path simulation
     const priorityMicroLamports = Math.ceil((dynamicFee * 1_000_000) / dynamicComputeUnits);
     const message = new TransactionMessage({
       payerKey: wallet.publicKey,
@@ -1624,6 +1626,84 @@ async function validateBuyTransaction(rawTx: Uint8Array): Promise<boolean> {
   } catch (e: any) {
     const elapsed = nowMs() - startMs;
     console.log(`❌ Local Pump.fun build unavailable for ${mint}:`, e?.message ?? String(e), `(${elapsed}ms)`);
+    return null;
+  }
+}
+
+// Attempt to reconstruct the pre-buy market-cap using only cached data.
+// Returns { tokenPriceUSD, marketCapUSD } or null if insufficient data.
+function reconstructPreTradeSnapshotFromCache(mint: string, solAmountLamports: number) {
+  try {
+    const cached = bondingCurveCache.get(mint);
+    const warm = buyStateWarmCache.get(mint);
+    if (!cached || !warm) return null;
+
+    const Q_post = cached.virtualQuoteReserves; // BN
+    const T_post = cached.virtualTokenReserves; // BN
+    const realTokenReserves = cached.realTokenReserves;
+    const mintSupplyRaw = cached.tokenTotalSupply ?? warm.mintState?.supply;
+    const feeConfig = warm.feeConfig;
+    if (!Q_post || !T_post || !mintSupplyRaw || !feeConfig) return null;
+
+    // Extract fee tiers from feeConfig. Expected shape: { tiers: [{ maxMarketCap, feeBps }] }
+    let feeTiers: Array<{ maxMarketCap: number | null; feeBps: number }> = [];
+    if (Array.isArray(feeConfig.tiers) && feeConfig.tiers.length > 0) {
+      feeTiers = feeConfig.tiers.map((t: any) => ({ maxMarketCap: t.maxMarketCap ?? null, feeBps: Number(t.feeBps) }));
+    } else if (Array.isArray(feeConfig.feeTiers) && feeConfig.feeTiers.length > 0) {
+      feeTiers = feeConfig.feeTiers.map((t: any) => ({ maxMarketCap: t.maxMarketCap ?? null, feeBps: Number(t.feeBps) }));
+    } else if (Array.isArray(feeConfig) && feeConfig.length > 0) {
+      feeTiers = feeConfig.map((t: any) => ({ maxMarketCap: t.maxMarketCap ?? null, feeBps: Number(t.feeBps) }));
+    } else {
+      return null;
+    }
+
+    const candidateBps = [...new Set(feeTiers.map((t) => t.feeBps))];
+    const solAmtBn = new BN(solAmountLamports ?? 0);
+    if (solAmtBn.lte(new BN(0))) return null;
+
+    const LAMPORTS = new BN(1e9);
+    const solPriceUsd = Number(process.env.SOL_PRICE_USD ?? warm.global?.solPriceUsd ?? warm.global?.solUsdPrice ?? 0);
+    if (!solPriceUsd || solPriceUsd <= 0) return null;
+
+    for (const totalFeeBps of candidateBps) {
+      // inputAmount = floor((amount - 1) * 10000 / (10000 + totalFeeBps))
+      const A = solAmtBn.subn(1).mul(new BN(10000));
+      const D = new BN(10000 + totalFeeBps);
+      if (A.lt(new BN(0))) continue;
+      const inputAmount = A.div(D);
+      if (Q_post.lte(inputAmount)) continue;
+      const numer = inputAmount.mul(T_post);
+      const denom = Q_post.sub(inputAmount);
+      if (denom.lte(new BN(0))) continue;
+      const xCand = numer.div(denom);
+      let finalTokens = xCand;
+      if (realTokenReserves && xCand.gte(realTokenReserves)) finalTokens = realTokenReserves;
+
+      const virtualTokenReserves_pre = T_post.add(finalTokens);
+      const virtualQuoteReserves_pre = Q_post.sub(inputAmount);
+      if (virtualTokenReserves_pre.lte(new BN(0)) || virtualQuoteReserves_pre.lte(new BN(0))) continue;
+
+      const mintSupplyBN = typeof mintSupplyRaw === "bigint" ? new BN(mintSupplyRaw.toString()) : new BN(String(mintSupplyRaw));
+
+      const preMarketCapQuote = virtualQuoteReserves_pre.mul(mintSupplyBN).div(virtualTokenReserves_pre); // in lamports*units
+      // Convert quote (lamports) to SOL and then to USD
+      const preMarketCapSol = Number(preMarketCapQuote.div(LAMPORTS).toString());
+      const preMarketCapUsd = preMarketCapSol * solPriceUsd;
+
+      // Determine selected fee tier for this preMarketCap (in USD)
+      // Map feeTiers maxMarketCap assumed to be USD in feeConfig; fallback to selection by value order
+      let selectedFee = totalFeeBps;
+      for (const t of feeTiers) {
+        if (t.maxMarketCap == null) { selectedFee = t.feeBps; break; }
+        if (preMarketCapUsd <= Number(t.maxMarketCap)) { selectedFee = t.feeBps; break; }
+      }
+
+      if (selectedFee === totalFeeBps) {
+        return { tokenPriceUSD: null, marketCapUSD: preMarketCapUsd };
+      }
+    }
+    return null;
+  } catch (e) {
     return null;
   }
 }
@@ -1717,7 +1797,7 @@ async function buildPumpPortalTx(
   pool: "pump" | "auto" = "auto"
 ): Promise<Uint8Array | null> {
   const url = "https://pumpportal.fun/api/trade-local";
-  for (let attempt = 1; attempt <= 2; attempt++) {
+  for (let attempt = 1; attempt <= 1; attempt++) {
     try {
       const res: any = await fetch(url, {
         agent: pumpPortalAgent,
@@ -1740,7 +1820,6 @@ async function buildPumpPortalTx(
         const truncated = String(errText).slice(0, 240);
         console.log(`✖ trade-local ${action} build failed (pool=${pool}, attempt=${attempt}): status=${res.status} body=${truncated}`);
         if ((res.status >= 500 || res.status === 429 || res.status === 408) && attempt < 2) {
-          await new Promise((resolve) => setTimeout(resolve, 250));
           continue;
         }
         return null;
@@ -1750,37 +1829,15 @@ async function buildPumpPortalTx(
       const tx = VersionedTransaction.deserialize(buf);
       tx.sign([wallet]);
 
-      // Quick local simulation on our low-latency buy execution RPC to detect
-      // deterministic failures such as Anchor Custom:6005 (BondingCurveComplete).
-      try {
-        const sim = await buyExecConnection.simulateTransaction(tx, {
-          commitment: "processed",
-          replaceRecentBlockhash: true,
-          sigVerify: false,
-        });
-        if (sim.value?.err) {
-          const logs = sim.value.logs?.filter(Boolean).join(" | ") ?? "no simulation logs";
-          console.log("Buy candidate simulation failed (pumpportal-built):", JSON.stringify(sim.value.err), logs);
-          const l = logs.toLowerCase();
-          if (l.includes("6005") || l.includes("bondingcurvecomplete") || JSON.stringify(sim.value.err).includes("6005")) {
-            pumpFallbackCache.set(mint, Date.now() + PUMP_FALLBACK_TTL_MS);
-            if (!pumpFirstFailureLogged.has(mint)) {
-              pumpFirstFailureLogged.add(mint);
-              console.log(`⚠️ Marked mint ${mint} as pump-fallback for ${PUMP_FALLBACK_TTL_MS}ms (Anchor 6005 / BondingCurveComplete)`);
-            }
-            return null;
-          }
-        }
-      } catch (e: any) {
-        console.log("⚠️ pumpPortal simulation unavailable:", e?.message ?? String(e));
-      }
+      // NOTE: removed pre-submit simulation for hot-path speed. Deterministic
+      // failures (such as Anchor 6005) will be handled post-submit or via
+      // background reconciliation. This keeps the builder fast and non-blocking.
 
       return tx.serialize();
     } catch (e: any) {
       const message = e?.message ?? String(e);
       console.log(`✖ trade-local ${action} error (pool=${pool}, attempt=${attempt}):`, message);
       if (attempt < 2) {
-        await new Promise((resolve) => setTimeout(resolve, 250));
         continue;
       }
       return null;
@@ -1915,6 +1972,8 @@ async function submitJupiterBuy(mint: string) {
 async function executeBuy(
     mint: string,
     targetSnapshotPromise?: Promise<{ tokenPriceUSD: number | null; marketCapUSD: number | null }>,
+    solAmountLamports?: number,
+    detectionMs?: number,
     skipMcCheck: boolean = false
   ) {
     // Atomic duplicate guard — must be first, before any async
@@ -1948,8 +2007,25 @@ async function executeBuy(
       return;
     }
 
-    const preTradeSnapshot = await (targetSnapshotPromise ?? Promise.resolve({ tokenPriceUSD: null, marketCapUSD: null }));
+    const detectionTs = detectionMs ?? nowMs();
+    let preTradeSnapshot: { tokenPriceUSD: number | null; marketCapUSD: number | null } | null = null;
+    if (targetSnapshotPromise) {
+      preTradeSnapshot = await targetSnapshotPromise;
+    } else {
+      // Attempt to reconstruct a pre-trade snapshot from existing cached data
+      try {
+        console.log(`⚡ PREBUY_MC_CHECK start: ${nowMs() - detectionTs}ms after detection`);
+        const startCheck = nowMs();
+        preTradeSnapshot = reconstructPreTradeSnapshotFromCache(mint, solAmountLamports ?? 0);
+        const checkElapsed = nowMs() - startCheck;
+        console.log(`⚡ PREBUY_MC_CHECK done: ${checkElapsed}ms`);
+      } catch (e: any) {
+        preTradeSnapshot = { tokenPriceUSD: null, marketCapUSD: null };
+      }
+      if (!preTradeSnapshot) preTradeSnapshot = { tokenPriceUSD: null, marketCapUSD: null };
+    }
     const preTradeMc = preTradeSnapshot.marketCapUSD ?? null;
+    console.log(`⚡ PREBUY_MC: ${preTradeMc === null ? 'UNKNOWN' : '$' + preTradeMc.toFixed(2)} (checked at ${nowMs() - detectionTs}ms)`);
     if (shouldRejectPreTradeMarketCap(preTradeMc)) {
       console.log(
         `🚫 PRE-TRADE MC rejected for ${mint}: $${(preTradeMc ?? 0).toFixed(0)} > $${PRE_TRADE_MAX_MARKET_CAP_USD.toFixed(0)}`
@@ -1979,14 +2055,14 @@ async function executeBuy(
         const candidates: Array<[string, () => Promise<Uint8Array | null>]> = [];
 
         if (!isPumpFallbackActive(mint) && PUMPPORTAL_ENABLED) {
-          candidates.push(["PumpPortal-trade-local", () => buildPumpPortalTx("buy", mint, BUY_AMOUNT / 1e9, true, SLIPPAGE_BPS, "auto")]);
+          candidates.push(["PumpPortal-trade-local", () => buildPumpPortalTx("buy", mint, BUY_AMOUNT / 1e9, true, SLIPPAGE_BPS, "pump")]);
         } else if (isPumpFallbackActive(mint)) {
           console.log(`ℹ️ Skipping PumpPortal build for ${mint} due to recent Anchor 6005 failures`);
         }
 
         if (PREFER_PUMPPORTAL_ONLY && PUMPPORTAL_ENABLED && !isPumpFallbackActive(mint)) {
           candidates.length = 0;
-          candidates.push(["PumpPortal-trade-local", () => buildPumpPortalTx("buy", mint, BUY_AMOUNT / 1e9, true, SLIPPAGE_BPS, "auto")]);
+          candidates.push(["PumpPortal-trade-local", () => buildPumpPortalTx("buy", mint, BUY_AMOUNT / 1e9, true, SLIPPAGE_BPS, "pump")]);
         }
 
         candidates.push(["local Pump SDK", () => buildLocalPumpBuyTx(mint, SLIPPAGE_BPS)]);
@@ -1996,14 +2072,14 @@ async function executeBuy(
         const racedCandidates = orderedCandidates.map(async ([builderName, buildFn]) => {
           const bStart = nowMs();
           try {
-            console.log(`⏱ Builder start: ${builderName} for ${mint}`);
+            console.log(`⚡ BUILD START: ${builderName} for ${mint} (${nowMs() - detectionTs}ms since detection)`);
             const candidate = await buildFn();
             const bElapsed = nowMs() - bStart;
             if (!candidate) {
               console.log(`↪ ${builderName} returned null (${bElapsed}ms)`);
               throw new Error(`${builderName} unavailable`);
             }
-            console.log(`✅ Builder ready: ${builderName} (${bElapsed}ms)`);
+            console.log(`✅ BUILDER_READY: ${builderName} (${nowMs() - detectionTs}ms since detection, ${bElapsed}ms build)`);
             return { builderName, rawTx: candidate };
           } catch (e: any) {
             console.log(`⚠️ ${builderName} build error:`, e?.stack ?? e?.message ?? String(e));
@@ -2025,8 +2101,9 @@ async function executeBuy(
           console.log("âŒ Buy aborted — all builders failed for", mint);
           return;
         }
+        console.log(`⚡ SIGN: signing/submitting tx (${nowMs() - detectionTs}ms since detection)`);
         sig = await sendRawTransactionDual(rawTx);
-        if (sig) console.log(`ðŸš€ BUY submitted (${selectedBuilder}):`, mint, sig);
+        if (sig) console.log(`🚀 SUBMITTED (${selectedBuilder}): ${mint} ${sig} (total ${(nowMs() - detectionTs)}ms since detection)`);
         if (!sig) return;
       }
 
@@ -2258,7 +2335,8 @@ async function handleTxInternal(tx: any, signature: string): Promise<boolean> {
       if (postAmount > preAmount) {
         foundAny = true;
         console.log("ðŸ”¥ DETECTED buy:", post.mint);
-        executeBuy(post.mint, delayedMarketCapSnapshot(post.mint));
+        // Avoid network MC lookups on the hot path; rely on cached reconstruction.
+        executeBuy(post.mint, undefined, 0, nowMs());
         return true;
       }
     }
@@ -2310,7 +2388,7 @@ function onWalletLog(log: Logs) {
     console.log(`⚡ IDL FAST-PATH BUY: ${fast.mint}`);
     seenSignatures.add(signature);
     // Fire and forget - don't await executeBuy to minimize latency
-    executeBuy(fast.mint, fetchPriceAndMarketCap(fast.mint)).catch(e =>
+    executeBuy(fast.mint, undefined, fast.solAmount, nowMs()).catch(e =>
       console.log("⚠️ executeBuy error (non-blocking):", e.message)
     );
     return;
@@ -2594,6 +2672,7 @@ async function startPumpPortal() {
                         virtualTokenReserves,
                         realQuoteReserves,
                         realTokenReserves,
+                        tokenTotalSupply: data.length >= 48 ? new BN(data.subarray(40, 48).readBigUInt64LE(0).toString()) : null,
                         timestamp: Date.now(),
                       });
                       console.log("ðŸ’¾ Cached bonding curve for", msg.mint);
@@ -2606,7 +2685,7 @@ async function startPumpPortal() {
             } catch {}
           }
 
-         executeBuy(msg.mint, fetchPriceAndMarketCap(msg.mint)).catch(e =>
+         executeBuy(msg.mint, undefined, msg.solAmount, nowMs()).catch(e =>
             console.log("⚠️ executeBuy error (non-blocking):", e.message)
           );
        } catch {
@@ -2953,7 +3032,7 @@ async function handleGrpcTradeEvent(event: GrpcTradeEvent) {
 
     if (event.type === "buy") {
       // Fire and forget - don't await executeBuy to minimize latency
-      executeBuy(event.mint, fetchPriceAndMarketCap(event.mint)).catch(e =>
+      executeBuy(event.mint, undefined, event.solAmount, nowMs()).catch(e =>
         console.log("⚠️ executeBuy error (non-blocking):", e.message)
       );
     } else if (event.type === "sell") {

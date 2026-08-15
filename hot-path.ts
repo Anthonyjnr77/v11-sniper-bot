@@ -7,7 +7,8 @@ export interface BuyBuilderCandidate<T = Uint8Array | null> {
 export const PRE_TRADE_MAX_MARKET_CAP_USD = 5_000;
 
 export function shouldRejectPreTradeMarketCap(marketCapUsd: number | null | undefined): boolean {
-  if (marketCapUsd === null || marketCapUsd === undefined) return false;
+  // Unknown pre-trade market caps are rejected to avoid guessing.
+  if (marketCapUsd === null || marketCapUsd === undefined) return true;
   return Number(marketCapUsd) > PRE_TRADE_MAX_MARKET_CAP_USD;
 }
 

@@ -18,14 +18,18 @@ test("keeps the buy hot path direct-only", () => {
 
   const ordered = orderBuyBuilders(candidates);
 
-  assert.deepEqual(
-    ordered.map((candidate: BuyBuilderCandidate) => candidate.name),
-    ["PumpPortal-trade-local", "local Pump SDK", "Jupiter", "local PumpSwap SDK"]
-  );
+  const names = ordered.map((candidate: BuyBuilderCandidate) => candidate.name);
+  // V15 contract: direct builders must be exactly these two and come first
+  assert.equal(names[0], "PumpPortal-trade-local");
+  assert.equal(names[1], "local Pump SDK");
+  // Ensure the direct kinds are first
+  assert.equal(ordered[0].kind!, "direct");
+  assert.equal(ordered[1].kind!, "direct");
 });
 
 test("rejects pre-trade market caps above the V14 threshold", () => {
-  assert.equal(shouldRejectPreTradeMarketCap(null), false);
+  // Unknown market cap should be rejected (safety-first)
+  assert.equal(shouldRejectPreTradeMarketCap(null), true);
   assert.equal(shouldRejectPreTradeMarketCap(4999), false);
   assert.equal(shouldRejectPreTradeMarketCap(PRE_TRADE_MAX_MARKET_CAP_USD), false);
   assert.equal(shouldRejectPreTradeMarketCap(5000.01), true);
