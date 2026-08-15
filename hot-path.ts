@@ -4,10 +4,16 @@ export interface BuyBuilderCandidate<T = Uint8Array | null> {
   build: () => Promise<T>;
 }
 
+export const PRE_TRADE_MAX_MARKET_CAP_USD = 5_000;
+
+export function shouldRejectPreTradeMarketCap(marketCapUsd: number | null | undefined): boolean {
+  if (marketCapUsd === null || marketCapUsd === undefined) return false;
+  return Number(marketCapUsd) > PRE_TRADE_MAX_MARKET_CAP_USD;
+}
+
 const DIRECT_BUILDER_ORDER = [
   "PumpPortal-trade-local",
   "local Pump SDK",
-  "local PumpSwap SDK",
 ];
 
 export function orderBuyBuilders<T extends BuyBuilderCandidate>(candidates: T[]): T[] {
@@ -25,9 +31,6 @@ export function orderBuyBuilders<T extends BuyBuilderCandidate>(candidates: T[])
     if (leftRank >= 0 && rightRank >= 0) {
       return leftRank - rightRank;
     }
-
-    if (left.name === "Jupiter") return 1;
-    if (right.name === "Jupiter") return -1;
 
     return left.name.localeCompare(right.name);
   });

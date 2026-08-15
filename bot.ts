@@ -20,7 +20,7 @@ import fetch from "node-fetch";
 import bs58 from "bs58";
 import https from "https";
 import express from "express";
-import { orderBuyBuilders } from "./hot-path.js";
+import { PRE_TRADE_MAX_MARKET_CAP_USD, orderBuyBuilders, shouldRejectPreTradeMarketCap } from "./hot-path.js";
 
 export interface GrpcTradeEvent {
   type: "buy" | "sell";
@@ -1947,6 +1947,16 @@ async function executeBuy(
       return;
     }
 
+    const preTradeSnapshot = await (targetSnapshotPromise ?? Promise.resolve({ tokenPriceUSD: null, marketCapUSD: null }));
+    const preTradeMc = preTradeSnapshot.marketCapUSD ?? null;
+    if (shouldRejectPreTradeMarketCap(preTradeMc)) {
+      console.log(
+        `🚫 PRE-TRADE MC rejected for ${mint}: $${(preTradeMc ?? 0).toFixed(0)} > $${PRE_TRADE_MAX_MARKET_CAP_USD.toFixed(0)}`
+      );
+      inFlight.delete(mint);
+      return;
+    }
+
     // Buy immediately. Market cap is measured after execution for reporting.
     console.log(`⚡ Immediate copy-buy path: ${mint}`);
 
@@ -1966,28 +1976,22 @@ async function executeBuy(
         dryRunStats.pnlSol += (Math.random() - 0.45) * 0.01;
       } else {
         const candidates: Array<[string, () => Promise<Uint8Array | null>]> = [];
+
         if (!isPumpFallbackActive(mint) && PUMPPORTAL_ENABLED) {
           candidates.push(["PumpPortal-trade-local", () => buildPumpPortalTx("buy", mint, BUY_AMOUNT / 1e9, true, SLIPPAGE_BPS, "auto")]);
         } else if (isPumpFallbackActive(mint)) {
           console.log(`ℹ️ Skipping PumpPortal build for ${mint} due to recent Anchor 6005 failures`);
         }
 
-        // Optional: if user requests PumpPortal-only short path, skip other builders
         if (PREFER_PUMPPORTAL_ONLY && PUMPPORTAL_ENABLED && !isPumpFallbackActive(mint)) {
-          // Keep only the PumpPortal candidate
-          candidates.splice(0, candidates.length, ["PumpPortal-trade-local", () => buildPumpPortalTx("buy", mint, BUY_AMOUNT / 1e9, true, SLIPPAGE_BPS, "auto")]);
+          candidates.length = 0;
+          candidates.push(["PumpPortal-trade-local", () => buildPumpPortalTx("buy", mint, BUY_AMOUNT / 1e9, true, SLIPPAGE_BPS, "auto")]);
         }
-        candidates.push(["local Pump SDK", () => buildLocalPumpBuyTx(mint, SLIPPAGE_BPS)]);
-        candidates.push(["local PumpSwap SDK", () => buildLocalPumpSwapBuyTx(mint, SLIPPAGE_BPS)]);
-        if (isJupiterAvailable() && !skipJupiterForMint(mint)) {
-          candidates.push(["Jupiter", () => buildJupiterBuyTx(mint)]);
-        } else if (!isJupiterAvailable()) {
-          console.log(`ℹ️ Skipping Jupiter build for ${mint} while the endpoint is temporarily disabled`);
-        }
-        const orderedCandidates = orderBuyBuilders(candidates.map(([name, build]) => ({ name, kind: name === "Jupiter" ? "fallback" : "direct", build }))).map(({ name, build }) => [name, build] as [string, () => Promise<Uint8Array | null>]);
 
-        // Build and validate every route concurrently. The first valid route wins,
-        // so a slow or unavailable Pump.fun route cannot delay PumpSwap/Jupiter.
+        candidates.push(["local Pump SDK", () => buildLocalPumpBuyTx(mint, SLIPPAGE_BPS)]);
+        const orderedCandidates = orderBuyBuilders(candidates.map(([name, build]) => ({ name, kind: "direct", build }))).map(({ name, build }) => [name, build] as [string, () => Promise<Uint8Array | null>]);
+
+        // V14 hot path: only the direct bonding-curve builders are allowed. No Jupiter, no PumpSwap, no fallback routes.
         const racedCandidates = orderedCandidates.map(async ([builderName, buildFn]) => {
           const bStart = nowMs();
           try {
@@ -1995,20 +1999,13 @@ async function executeBuy(
             const candidate = await buildFn();
             const bElapsed = nowMs() - bStart;
             if (!candidate) {
-              console.log(`â†ª ${builderName} returned null (${bElapsed}ms)`);
+              console.log(`↪ ${builderName} returned null (${bElapsed}ms)`);
               throw new Error(`${builderName} unavailable`);
             }
-            const validStart = nowMs();
-            const ok = await validateBuyTransaction(candidate);
-            const validElapsed = nowMs() - validStart;
-            if (!ok) {
-              console.log(`âš ï¸ ${builderName} simulation rejected (${bElapsed}ms build + ${validElapsed}ms sim)`);
-              throw new Error(`${builderName} simulation failed`);
-            }
-            console.log(`✅ Builder valid: ${builderName} (${bElapsed}ms build + ${validElapsed}ms sim)`);
+            console.log(`✅ Builder ready: ${builderName} (${bElapsed}ms)`);
             return { builderName, rawTx: candidate };
           } catch (e: any) {
-            console.log(`âš ï¸ ${builderName} build error:`, e?.stack ?? e?.message ?? String(e));
+            console.log(`⚠️ ${builderName} build error:`, e?.stack ?? e?.message ?? String(e));
             throw new Error(`${builderName} unavailable`);
           }
         });
@@ -2033,8 +2030,8 @@ async function executeBuy(
       }
 
       const myMcPromise = delayedMarketCapSnapshot(mint, 2000);
-      const targetMcPromise = targetSnapshotPromise ?? Promise.resolve({ tokenPriceUSD: null, marketCapUSD: null });
-      let confirmationPromise = waitForConfirmation(sig);
+      const targetMcPromise = Promise.resolve(preTradeSnapshot);
+      const confirmationPromise = waitForConfirmation(sig);
       let actual = await waitForBalance(mint);
       let confirmation = await confirmationPromise;
 
@@ -2312,7 +2309,7 @@ function onWalletLog(log: Logs) {
     console.log(`⚡ IDL FAST-PATH BUY: ${fast.mint}`);
     seenSignatures.add(signature);
     // Fire and forget - don't await executeBuy to minimize latency
-    executeBuy(fast.mint, delayedMarketCapSnapshot(fast.mint), true).catch(e =>
+    executeBuy(fast.mint, fetchPriceAndMarketCap(fast.mint)).catch(e =>
       console.log("⚠️ executeBuy error (non-blocking):", e.message)
     );
     return;
@@ -2548,8 +2545,8 @@ async function startPumpPortal() {
             } catch {}
           }
 
-         executeBuy(msg.mint, delayedMarketCapSnapshot(msg.mint), true).catch(e =>
-            console.log("âš ï¸ executeBuy error (non-blocking):", e.message)
+         executeBuy(msg.mint, fetchPriceAndMarketCap(msg.mint)).catch(e =>
+            console.log("⚠️ executeBuy error (non-blocking):", e.message)
           );
        } catch {
          // non-JSON frame, ignore
@@ -2881,9 +2878,9 @@ async function start() {
   await sendTelegramAlert(
     `✅ <b>Bot Active</b>\nTargets:\n${targetList}\n` +
     `Buy: ${BUY_AMOUNT_SOL} SOL | Minimum copied buy: disabled\n` +
-    `Buy path: concurrent PumpPortal / Pump SDK / PumpSwap / Jupiter\n` +
+    `Buy path: PumpPortal + local Pump SDK (direct only)\n` +
     `Channels: ${channelsDesc}\n` +
-    `Pre-buy MC filter: disabled\n` +
+    `Pre-buy MC filter: $${PRE_TRADE_MAX_MARKET_CAP_USD.toLocaleString()} max\n` +
     `Commands: /pause /resume /status${TELEGRAM_EXTENDED ? ' /positions /stats /history /settings' : ''}`
   );
 }
@@ -2895,7 +2892,7 @@ async function handleGrpcTradeEvent(event: GrpcTradeEvent) {
 
     if (event.type === "buy") {
       // Fire and forget - don't await executeBuy to minimize latency
-      executeBuy(event.mint, delayedMarketCapSnapshot(event.mint), true).catch(e =>
+      executeBuy(event.mint, fetchPriceAndMarketCap(event.mint)).catch(e =>
         console.log("⚠️ executeBuy error (non-blocking):", e.message)
       );
     } else if (event.type === "sell") {
