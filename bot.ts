@@ -16,6 +16,7 @@ import { getMint, getAssociatedTokenAddress, TOKEN_2022_PROGRAM_ID, TOKEN_PROGRA
 import { OnlinePumpSdk, PUMP_SDK, getBuyTokenAmountFromSolAmount, bondingCurvePda } from "@pump-fun/pump-sdk";
 import { OnlinePumpAmmSdk, PUMP_AMM_PROGRAM_ID, PUMP_AMM_SDK, canonicalPumpPoolPda } from "@pump-fun/pump-swap-sdk";
 import BN from "bn.js";
+import fs from "fs";
 import fetch from "node-fetch";
 import bs58 from "bs58";
 import https from "https";
@@ -2502,6 +2503,66 @@ async function startPumpPortal() {
 
          console.log("âš¡ PUMPPORTAL detected buy:", msg.mint);
          seenSignatures.add(msg.signature);
+
+         // Temporary read-only capture for verifier: save raw PumpPortal event
+         // plus any already-cached bonding-curve / warm-state data. This does
+         // NOT change buy logic nor perform additional network calls.
+         try {
+           (async () => {
+             try {
+               const captureDir = "verifier/real-events";
+               await fs.promises.mkdir(captureDir, { recursive: true });
+               const cached = bondingCurveCache.get(msg.mint) || null;
+               const warm = buyStateWarmCache.get(msg.mint) || null;
+
+               function bnToStr(v: any) {
+                 if (v == null) return null;
+                 if (typeof v === "object" && typeof v.toString === "function") return v.toString();
+                 return String(v);
+               }
+
+               const capture: any = {
+                 rawEvent: msg,
+                 mint: msg.mint,
+                 solAmount: msg.solAmount ?? null,
+                 signature: msg.signature ?? null,
+                 slot: msg.slot ?? null,
+                 timestamp: Date.now(),
+                 bondingCurveCache: null,
+                 buyStateWarmCache: null,
+               };
+
+               if (cached) {
+                 capture.bondingCurveCache = {
+                   associatedBondingCurve: cached.associatedBondingCurve ? String(cached.associatedBondingCurve) : null,
+                   virtualQuoteReserves: bnToStr(cached.virtualQuoteReserves),
+                   virtualTokenReserves: bnToStr(cached.virtualTokenReserves),
+                   realQuoteReserves: bnToStr(cached.realQuoteReserves),
+                   realTokenReserves: bnToStr(cached.realTokenReserves),
+                   timestamp: cached.timestamp ?? null,
+                 };
+               }
+
+               if (warm) {
+                 capture.buyStateWarmCache = {
+                   feeConfig: warm.feeConfig ?? null,
+                   mintSupply: warm.mintState?.supply ? String(warm.mintState.supply) : null,
+                   buyStateBondingCurve: warm.buyState?.bondingCurve ?? null,
+                   timestamp: warm.timestamp ?? null,
+                 };
+               }
+
+               const fileName = `${Date.now()}-${msg.mint}.json`;
+               const filePath = `${captureDir}/${fileName}`;
+               await fs.promises.writeFile(filePath, JSON.stringify(capture, null, 2));
+               console.log("🔒 Wrote PumpPortal capture:", filePath);
+             } catch (e: any) {
+               console.log("⚠️ failed to write PumpPortal capture:", e?.message ?? String(e));
+             }
+           })();
+         } catch (e) {
+           // swallow errors to avoid impacting hot path
+         }
 
           // Prime bonding curve cache from PumpPortal event (if present)
           // PumpPortal sometimes includes bonding curve account in the trade event

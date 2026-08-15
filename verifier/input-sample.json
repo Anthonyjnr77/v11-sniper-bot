@@ -1,0 +1,12 @@
+{
+  "postVirtualQuoteReserves": "2000000000000",
+  "postVirtualTokenReserves": "1000000000000",
+  "solAmount": "500000000",
+  "mintSupply": "1000000000",
+  "realTokenReserves": "1000000000000",
+  "feeTiers": [
+    { "maxMarketCap": 1000000000000, "feeBps": 500 },
+    { "maxMarketCap": 5000000000000, "feeBps": 300 },
+    { "maxMarketCap": null, "feeBps": 100 }
+  ]
+}
