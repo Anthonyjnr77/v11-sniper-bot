@@ -23,8 +23,8 @@ test("keeps the buy hot path direct-only", () => {
   assert.equal(names[0], "PumpPortal-trade-local");
   assert.equal(names[1], "local Pump SDK");
   // Ensure the direct kinds are first
-  assert.equal(ordered[0].kind!, "direct");
-  assert.equal(ordered[1].kind!, "direct");
+  assert.equal(ordered[0]?.kind, "direct");
+  assert.equal(ordered[1]?.kind, "direct");
 });
 
 test("rejects pre-trade market caps above the V14 threshold", () => {

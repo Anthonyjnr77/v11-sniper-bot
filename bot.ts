@@ -333,13 +333,16 @@ async function refreshPrebuildCache() {
         if (bcAccount?.data && abcAccount?.data && feeConfig) {
           const data = bcAccount.data;
           if (data.length >= 48) {
+            // Anchor/SDK BondingCurve layout: discriminator (8) then
+            // virtualTokenReserves (8), virtualQuoteReserves (8),
+            // realTokenReserves (8), realQuoteReserves (8), tokenTotalSupply (8)
             prebuildCache.set(mint, {
               bondingCurve: bondingCurveAddress,
               associatedBondingCurve: associatedBondingCurve,
-              virtualQuoteReserves: new BN(data.subarray(8, 16).readBigUInt64LE(0).toString()),
-              virtualTokenReserves: new BN(data.subarray(16, 24).readBigUInt64LE(0).toString()),
-              realQuoteReserves: new BN(data.subarray(24, 32).readBigUInt64LE(0).toString()),
-              realTokenReserves: new BN(data.subarray(32, 40).readBigUInt64LE(0).toString()),
+              virtualTokenReserves: new BN(data.subarray(8, 16).readBigUInt64LE(0).toString()),
+              virtualQuoteReserves: new BN(data.subarray(16, 24).readBigUInt64LE(0).toString()),
+              realTokenReserves: new BN(data.subarray(24, 32).readBigUInt64LE(0).toString()),
+              realQuoteReserves: new BN(data.subarray(32, 40).readBigUInt64LE(0).toString()),
               tokenTotalSupply: data.length >= 48 ? new BN(data.subarray(40, 48).readBigUInt64LE(0).toString()) : null,
               timestamp: Date.now(),
             });
@@ -1636,34 +1639,77 @@ function reconstructPreTradeSnapshotFromCache(mint: string, solAmountLamports: n
   try {
     const cached = bondingCurveCache.get(mint);
     const warm = buyStateWarmCache.get(mint);
-    if (!cached || !warm) return null;
-
-    const Q_post = cached.virtualQuoteReserves; // BN
-    const T_post = cached.virtualTokenReserves; // BN
-    const realTokenReserves = cached.realTokenReserves;
-    const mintSupplyRaw = cached.tokenTotalSupply ?? warm.mintState?.supply;
-    const feeConfig = warm.feeConfig;
-    if (!Q_post || !T_post || !mintSupplyRaw || !feeConfig) return null;
-
-    // Extract fee tiers from feeConfig. Expected shape: { tiers: [{ maxMarketCap, feeBps }] }
-    let feeTiers: Array<{ maxMarketCap: number | null; feeBps: number }> = [];
-    if (Array.isArray(feeConfig.tiers) && feeConfig.tiers.length > 0) {
-      feeTiers = feeConfig.tiers.map((t: any) => ({ maxMarketCap: t.maxMarketCap ?? null, feeBps: Number(t.feeBps) }));
-    } else if (Array.isArray(feeConfig.feeTiers) && feeConfig.feeTiers.length > 0) {
-      feeTiers = feeConfig.feeTiers.map((t: any) => ({ maxMarketCap: t.maxMarketCap ?? null, feeBps: Number(t.feeBps) }));
-    } else if (Array.isArray(feeConfig) && feeConfig.length > 0) {
-      feeTiers = feeConfig.map((t: any) => ({ maxMarketCap: t.maxMarketCap ?? null, feeBps: Number(t.feeBps) }));
-    } else {
+    const missingTop: string[] = [];
+    if (!cached) missingTop.push("bondingCurveCache");
+    if (!warm) missingTop.push("buyStateWarmCache");
+    if (missingTop.length > 0) {
+      console.log(`PREBUY_MC: UNKNOWN reason=missing ${missingTop.join(",")}`);
       return null;
     }
 
-    const candidateBps = [...new Set(feeTiers.map((t) => t.feeBps))];
+    // Narrow types for TS after presence checks
+    const cachedState = cached!;
+    const warmState = warm!;
+
+    const Q_post = cachedState.virtualQuoteReserves; // BN
+    const T_post = cachedState.virtualTokenReserves; // BN
+    const realTokenReserves = cachedState.realTokenReserves;
+    const mintSupplyRaw = cachedState.tokenTotalSupply ?? warmState.mintState?.supply;
+    const feeConfig = warmState.feeConfig;
+    const missing: string[] = [];
+    if (!Q_post) missing.push("virtualQuoteReserves");
+    if (!T_post) missing.push("virtualTokenReserves");
+    if (!realTokenReserves) missing.push("realTokenReserves");
+    if (!mintSupplyRaw) missing.push("tokenTotalSupply");
+    if (!feeConfig) missing.push("feeConfig");
+    if (missing.length > 0) {
+      console.log(`PREBUY_MC: UNKNOWN reason=missing ${missing.join(",")}`);
+      return null;
+    }
+
+    // Extract fee tiers from feeConfig. Prefer SDK shape: feeConfig.feeTiers
+    // where each tier has { marketCapLamportsThreshold: BN, fees: { protocolFeeBps, creatorFeeBps } }
+    let sdkFeeTiers: Array<{ threshold: BN | null; totalFeeBps: number }> = [];
+    try {
+      if (feeConfig) {
+        if (Array.isArray(feeConfig.feeTiers) && feeConfig.feeTiers.length > 0) {
+          sdkFeeTiers = feeConfig.feeTiers.map((t: any) => {
+            const thr = t.marketCapLamportsThreshold ?? t.marketCapLamportsThreshold ?? t.marketCap ?? null;
+            const thrBN = thr == null ? null : (typeof thr === "object" && typeof thr.toString === "function" ? new BN(thr.toString()) : new BN(String(thr)));
+            const protocol = t.fees?.protocolFeeBps ?? t.protocolFeeBps ?? 0;
+            const creator = t.fees?.creatorFeeBps ?? t.creatorFeeBps ?? 0;
+            const p = typeof protocol === "object" && typeof protocol.toString === "function" ? Number(new BN(protocol.toString()).toString()) : Number(protocol || 0);
+            const c = typeof creator === "object" && typeof creator.toString === "function" ? Number(new BN(creator.toString()).toString()) : Number(creator || 0);
+            return { threshold: thrBN, totalFeeBps: p + c };
+          });
+        } else if (Array.isArray(feeConfig.tiers) && feeConfig.tiers.length > 0) {
+          // fallback shape
+          sdkFeeTiers = feeConfig.tiers.map((t: any) => ({ threshold: null, totalFeeBps: Number(t.feeBps) }));
+        } else if (Array.isArray(feeConfig) && feeConfig.length > 0) {
+          sdkFeeTiers = feeConfig.map((t: any) => ({ threshold: null, totalFeeBps: Number(t.feeBps) }));
+        }
+      }
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      console.log(`PREBUY_MC: UNKNOWN reason=feeTiers_parse_error ${errorMessage}`);
+      return null;
+    }
+
+    if (sdkFeeTiers.length === 0) {
+      console.log(`PREBUY_MC: UNKNOWN reason=missing feeTiers`);
+      return null;
+    }
+
+    const candidateBps = [...new Set(sdkFeeTiers.map((t) => t.totalFeeBps))];
     const solAmtBn = new BN(solAmountLamports ?? 0);
     if (solAmtBn.lte(new BN(0))) return null;
 
     const LAMPORTS = new BN(1e9);
-    const solPriceUsd = Number(process.env.SOL_PRICE_USD ?? warm.global?.solPriceUsd ?? warm.global?.solUsdPrice ?? 0);
-    if (!solPriceUsd || solPriceUsd <= 0) return null;
+    const solPriceUsd = Number(process.env.SOL_PRICE_USD ?? warmState.global?.solPriceUsd ?? warmState.global?.solUsdPrice ?? 0);
+    if (!solPriceUsd || solPriceUsd <= 0) {
+      console.log(`PREBUY_MC: UNKNOWN reason=missing solPriceUsd`);
+      return null;
+    }
 
     for (const totalFeeBps of candidateBps) {
       // inputAmount = floor((amount - 1) * 10000 / (10000 + totalFeeBps))
@@ -1693,17 +1739,77 @@ function reconstructPreTradeSnapshotFromCache(mint: string, solAmountLamports: n
       // Determine selected fee tier for this preMarketCap (in USD)
       // Map feeTiers maxMarketCap assumed to be USD in feeConfig; fallback to selection by value order
       let selectedFee = totalFeeBps;
+      // Build a best-effort feeTiers usable for USD-based selection
+      const feeTiers: Array<{ maxMarketCap: number | null; feeBps: number }> = [];
+      if (Array.isArray((feeConfig as any).feeTiers) && (feeConfig as any).feeTiers.length > 0) {
+        for (const t of (feeConfig as any).feeTiers) {
+          const max = t.maxMarketCap ?? t.maxMarketCap ?? null;
+          const maxNum = max == null ? null : Number(max);
+          const protocol = t.fees?.protocolFeeBps ?? t.protocolFeeBps ?? 0;
+          const creator = t.fees?.creatorFeeBps ?? t.creatorFeeBps ?? 0;
+          const protocolNum = typeof protocol === 'object' && protocol !== null && typeof protocol.toString === 'function' ? Number(new BN(protocol.toString()).toString()) : Number(protocol || 0);
+          const creatorNum = typeof creator === 'object' && creator !== null && typeof creator.toString === 'function' ? Number(new BN(creator.toString()).toString()) : Number(creator || 0);
+          feeTiers.push({ maxMarketCap: maxNum, feeBps: protocolNum + creatorNum });
+        }
+      } else if (Array.isArray((feeConfig as any).tiers) && (feeConfig as any).tiers.length > 0) {
+        for (const t of (feeConfig as any).tiers) {
+          feeTiers.push({ maxMarketCap: t.maxMarketCap == null ? null : Number(t.maxMarketCap), feeBps: Number(t.feeBps) });
+        }
+      } else {
+        // fallback: treat SDK fee tiers as feeTiers with null maxMarketCap
+        for (const s of sdkFeeTiers) feeTiers.push({ maxMarketCap: null, feeBps: s.totalFeeBps });
+      }
       for (const t of feeTiers) {
         if (t.maxMarketCap == null) { selectedFee = t.feeBps; break; }
         if (preMarketCapUsd <= Number(t.maxMarketCap)) { selectedFee = t.feeBps; break; }
       }
 
-      if (selectedFee === totalFeeBps) {
+      // Determine selected fee tier using SDK semantics (market cap in lamports)
+      let selectedFeeBps: number | null = null;
+      try {
+        // Find matching tier similar to SDK calculateFeeTier behavior
+        // If thresholds are present, use BN comparisons; otherwise fallback to first-match by value
+        const tiersWithThresh = sdkFeeTiers.filter((t): t is { threshold: BN; totalFeeBps: number } => t.threshold != null);
+        if (tiersWithThresh.length > 0) {
+          // Sort ascending by threshold
+          tiersWithThresh.sort((a, b) => a.threshold.cmp(b.threshold));
+          // If marketCap < first.threshold -> first
+          const preMarketCapLamports = preMarketCapQuote; // BN in lamports
+          const firstTier = tiersWithThresh[0];
+          if (!firstTier) {
+            selectedFeeBps = null;
+          } else {
+            if (preMarketCapLamports.lt(firstTier!.threshold)) {
+              selectedFeeBps = firstTier!.totalFeeBps;
+            } else {
+              // find highest tier with threshold <= marketCap
+              for (let i = tiersWithThresh.length - 1; i >= 0; i--) {
+                const tier = tiersWithThresh[i]!;
+                if (preMarketCapLamports.gte(tier.threshold)) {
+                  selectedFeeBps = tier.totalFeeBps;
+                  break;
+                }
+              }
+              if (selectedFeeBps === null) selectedFeeBps = firstTier!.totalFeeBps;
+            }
+          }
+        } else {
+          const firstSdk = sdkFeeTiers[0];
+          if (firstSdk) selectedFeeBps = firstSdk.totalFeeBps;
+          else selectedFeeBps = null;
+        }
+      } catch {
+        selectedFeeBps = null;
+      }
+
+      if (selectedFeeBps === totalFeeBps) {
         return { tokenPriceUSD: null, marketCapUSD: preMarketCapUsd };
       }
     }
     return null;
-  } catch (e) {
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    console.log(`PREBUY_MC: UNKNOWN reason=exception ${errorMessage}`);
     return null;
   }
 }
@@ -2027,9 +2133,13 @@ async function executeBuy(
     const preTradeMc = preTradeSnapshot.marketCapUSD ?? null;
     console.log(`⚡ PREBUY_MC: ${preTradeMc === null ? 'UNKNOWN' : '$' + preTradeMc.toFixed(2)} (checked at ${nowMs() - detectionTs}ms)`);
     if (shouldRejectPreTradeMarketCap(preTradeMc)) {
-      console.log(
-        `🚫 PRE-TRADE MC rejected for ${mint}: $${(preTradeMc ?? 0).toFixed(0)} > $${PRE_TRADE_MAX_MARKET_CAP_USD.toFixed(0)}`
-      );
+      if (preTradeMc === null || preTradeMc === undefined) {
+        console.log(`🚫 PRE-TRADE MC REJECTED: UNKNOWN — bonding curve state unavailable for ${mint}`);
+      } else {
+        console.log(
+          `🚫 PRE-TRADE MC rejected for ${mint}: $${preTradeMc.toFixed(0)} > $${PRE_TRADE_MAX_MARKET_CAP_USD.toFixed(0)}`
+        );
+      }
       inFlight.delete(mint);
       return;
     }
@@ -2579,8 +2689,9 @@ async function startPumpPortal() {
          }
          if (msg.txType !== "buy") return;
 
-         console.log("âš¡ PUMPPORTAL detected buy:", msg.mint);
-         seenSignatures.add(msg.signature);
+        console.log("âš¡ PUMPPORTAL detected buy:", msg.mint);
+        seenSignatures.add(msg.signature);
+        const detectionTs = nowMs();
 
          // Temporary read-only capture for verifier: save raw PumpPortal event
          // plus any already-cached bonding-curve / warm-state data. This does
@@ -2650,36 +2761,88 @@ async function startPumpPortal() {
               const associatedBondingCurveKey = new PublicKey(msg.associatedBondingCurve);
               // Fetch and cache asynchronously, don't block the hot path
               (async () => {
+                const primeStart = nowMs();
+                console.log(`PRIME_START: mint=${msg.mint} ts=${Date.now()} rel=${primeStart - detectionTs}ms`);
+                // Start operations in parallel but capture start times
+                const bcStart = nowMs();
+                const bcPromise = pumpSdkConnection.getAccountInfo(bondingCurveKey, "processed");
+                console.log(`PRIME_OP_START: bondingCurve.getAccountInfo start=${bcStart}`);
+
+                const abcStart = nowMs();
+                const abcPromise = pumpSdkConnection.getAccountInfo(associatedBondingCurveKey, "processed");
+                console.log(`PRIME_OP_START: associatedBondingCurve.getAccountInfo start=${abcStart}`);
+
+                const feeStart = nowMs();
+                const feePromise = pumpSdkForBuild.fetchFeeConfig();
+                console.log(`PRIME_OP_START: fetchFeeConfig start=${feeStart}`);
+
+                let bcAccount: any = null;
+                let abcAccount: any = null;
+                let feeConfig: any = null;
                 try {
-                  const [bcAccount, abcAccount, feeConfig] = await Promise.all([
-                    pumpSdkConnection.getAccountInfo(bondingCurveKey, "processed"),
-                    pumpSdkConnection.getAccountInfo(associatedBondingCurveKey, "processed"),
-                    pumpSdkForBuild.fetchFeeConfig(),
-                  ]);
+                  try {
+                    bcAccount = await bcPromise;
+                    const bcEnd = nowMs();
+                    console.log(`PRIME_OP_END: bondingCurve.getAccountInfo end=${bcEnd} dur=${bcEnd - bcStart}ms`);
+                  } catch (e: any) {
+                    const bcFail = nowMs();
+                    console.log(`PRIME_OP_FAILED: bondingCurve.getAccountInfo dur=${bcFail - bcStart}ms err=${e?.message ?? String(e)}`);
+                    throw e;
+                  }
+
+                  try {
+                    abcAccount = await abcPromise;
+                    const abcEnd = nowMs();
+                    console.log(`PRIME_OP_END: associatedBondingCurve.getAccountInfo end=${abcEnd} dur=${abcEnd - abcStart}ms`);
+                  } catch (e: any) {
+                    const abcFail = nowMs();
+                    console.log(`PRIME_OP_FAILED: associatedBondingCurve.getAccountInfo dur=${abcFail - abcStart}ms err=${e?.message ?? String(e)}`);
+                    throw e;
+                  }
+
+                  try {
+                    feeConfig = await feePromise;
+                    const feeEnd = nowMs();
+                    console.log(`PRIME_OP_END: fetchFeeConfig end=${feeEnd} dur=${feeEnd - feeStart}ms`);
+                  } catch (e: any) {
+                    const feeFail = nowMs();
+                    console.log(`PRIME_OP_FAILED: fetchFeeConfig dur=${feeFail - feeStart}ms err=${e?.message ?? String(e)}`);
+                    throw e;
+                  }
+
                   if (bcAccount && abcAccount && feeConfig) {
-                    // Parse bonding curve state (ASCII layout from Pump.fun)
                     const data = bcAccount.data;
                     if (data.length >= 8 + 8 + 8 + 8 + 8 + 8) {
-                      // Discriminator (8) + virtualQuoteReserves (8) + virtualTokenReserves (8) + realQuoteReserves (8) + realTokenReserves (8) + totalSupply (8)
-                      const virtualQuoteReserves = new BN(data.subarray(8, 16).readBigUInt64LE(0).toString());
-                      const virtualTokenReserves = new BN(data.subarray(16, 24).readBigUInt64LE(0).toString());
-                      const realQuoteReserves = new BN(data.subarray(24, 32).readBigUInt64LE(0).toString());
-                      const realTokenReserves = new BN(data.subarray(32, 40).readBigUInt64LE(0).toString());
+                      const virtualTokenReserves = new BN(data.subarray(8, 16).readBigUInt64LE(0).toString());
+                      const virtualQuoteReserves = new BN(data.subarray(16, 24).readBigUInt64LE(0).toString());
+                      const realTokenReserves = new BN(data.subarray(24, 32).readBigUInt64LE(0).toString());
+                      const realQuoteReserves = new BN(data.subarray(32, 40).readBigUInt64LE(0).toString());
+                      const tokenTotalSupply = data.length >= 48 ? new BN(data.subarray(40, 48).readBigUInt64LE(0).toString()) : null;
                       bondingCurveCache.set(msg.mint, {
                         bondingCurve: bondingCurveKey,
                         associatedBondingCurve: associatedBondingCurveKey,
-                        virtualQuoteReserves,
                         virtualTokenReserves,
-                        realQuoteReserves,
+                        virtualQuoteReserves,
                         realTokenReserves,
-                        tokenTotalSupply: data.length >= 48 ? new BN(data.subarray(40, 48).readBigUInt64LE(0).toString()) : null,
+                        realQuoteReserves,
+                        tokenTotalSupply,
                         timestamp: Date.now(),
                       });
-                      console.log("ðŸ’¾ Cached bonding curve for", msg.mint);
+                      const primeEnd = nowMs();
+                      const warm = buyStateWarmCache.get(msg.mint) || null;
+                      const solPriceUsd = Number(process.env.SOL_PRICE_USD ?? warm?.global?.solPriceUsd ?? warm?.global?.solUsdPrice ?? 0);
+                      console.log(`PRIME_COMPLETE: mint=${msg.mint} totalDur=${primeEnd - primeStart}ms populated=true buyStateWarmCache=${warm ? "present" : "absent"} fields={virtualTokenReserves:${virtualTokenReserves != null},virtualQuoteReserves:${virtualQuoteReserves != null},realTokenReserves:${realTokenReserves != null},tokenTotalSupply:${tokenTotalSupply != null},feeConfig:${feeConfig != null},solPriceUsd:${!!solPriceUsd}}`);
+                    } else {
+                      const primeEnd = nowMs();
+                      console.log(`PRIME_COMPLETE: mint=${msg.mint} totalDur=${primeEnd - primeStart}ms populated=false reason=insufficient_account_data_len=${data?.length ?? 0}`);
                     }
+                  } else {
+                    const primeEnd = nowMs();
+                    console.log(`PRIME_COMPLETE: mint=${msg.mint} totalDur=${primeEnd - primeStart}ms populated=false reason=missing_accounts_or_feeConfig`);
                   }
                 } catch (e: any) {
-                  console.log("âš ï¸ Bonding curve cache prime failed:", e.message);
+                  const primeFail = nowMs();
+                  console.log(`PRIME_FAILED: mint=${msg.mint} dur=${primeFail - primeStart}ms err=${e?.message ?? String(e)}`);
                 }
               })();
             } catch {}
