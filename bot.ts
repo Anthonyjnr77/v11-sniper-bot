@@ -12,7 +12,7 @@ import {
 } from "@solana/web3.js";
 import type { Logs } from "@solana/web3.js";
 import { Program, AnchorProvider, BorshEventCoder } from "@coral-xyz/anchor";
-import { getMint, getAssociatedTokenAddress, TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID } from "@solana/spl-token";
+import { getMint, getAssociatedTokenAddress, getAssociatedTokenAddressSync, TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID } from "@solana/spl-token";
 import { OnlinePumpSdk, PUMP_SDK, getBuyTokenAmountFromSolAmount, bondingCurvePda } from "@pump-fun/pump-sdk";
 import { OnlinePumpAmmSdk, PUMP_AMM_PROGRAM_ID, PUMP_AMM_SDK, canonicalPumpPoolPda } from "@pump-fun/pump-swap-sdk";
 import BN from "bn.js";
@@ -290,6 +290,75 @@ interface CachedBondingCurve {
 }
 
 const bondingCurveCache = new Map<string, CachedBondingCurve>();
+
+async function primeMintDerivedState(mint: string, detectionTs: number = nowMs()): Promise<boolean> {
+  const now = nowMs();
+  const cached = bondingCurveCache.get(mint);
+  const warm = buyStateWarmCache.get(mint);
+  const cacheFresh = Boolean(cached && warm && now - cached.timestamp < BONDING_CURVE_TTL_MS && now - warm.timestamp < 30_000);
+  if (cacheFresh) return true;
+
+  const mintKey = new PublicKey(mint);
+  const bondingCurveKey = bondingCurvePda(mintKey);
+  const primeStart = nowMs();
+  console.log(`PRIME_START: mint=${mint} ts=${Date.now()} rel=${primeStart - detectionTs}ms source=mint-derived`);
+
+  let tokenProgram = TOKEN_PROGRAM_ID;
+  let mintInfo: any = null;
+  try {
+    mintInfo = await pumpSdkConnection.getAccountInfo(mintKey, "processed");
+    if (mintInfo?.owner) {
+      tokenProgram = mintInfo.owner;
+    }
+  } catch (e: any) {
+    console.log(`PRIME_OP_FAILED: mintInfo.getAccountInfo dur=${nowMs() - primeStart}ms err=${e?.message ?? String(e)}`);
+  }
+
+  const associatedBondingCurveKey = getAssociatedTokenAddressSync(mintKey, bondingCurveKey, true, tokenProgram);
+
+  const [bcAccount, abcAccount, feeConfig, global, mintState, buyState] = await Promise.all([
+    pumpSdkConnection.getAccountInfo(bondingCurveKey, "processed"),
+    pumpSdkConnection.getAccountInfo(associatedBondingCurveKey, "processed"),
+    warm?.feeConfig && now - warm.timestamp < 60_000 ? Promise.resolve(warm.feeConfig) : pumpSdkForBuild.fetchFeeConfig(),
+    warm?.global && now - warm.timestamp < 60_000 ? Promise.resolve(warm.global) : pumpSdkForBuild.fetchGlobal(),
+    warm?.mintState && now - warm.timestamp < 60_000 ? Promise.resolve(warm.mintState) : getMint(pumpSdkConnection, mintKey, "processed", tokenProgram),
+    warm?.buyState && now - warm.timestamp < 60_000 ? Promise.resolve(warm.buyState) : pumpSdkForBuild.fetchBuyState(mintKey, wallet.publicKey, tokenProgram),
+  ]);
+
+  let populated = false;
+  try {
+    if (bcAccount?.data && bcAccount.data.length >= 48) {
+      const data = bcAccount.data;
+      const virtualTokenReserves = new BN(data.subarray(8, 16).readBigUInt64LE(0).toString());
+      const virtualQuoteReserves = new BN(data.subarray(16, 24).readBigUInt64LE(0).toString());
+      const realTokenReserves = new BN(data.subarray(24, 32).readBigUInt64LE(0).toString());
+      const realQuoteReserves = new BN(data.subarray(32, 40).readBigUInt64LE(0).toString());
+      const tokenTotalSupply = new BN(data.subarray(40, 48).readBigUInt64LE(0).toString());
+      bondingCurveCache.set(mint, {
+        bondingCurve: bondingCurveKey,
+        associatedBondingCurve: associatedBondingCurveKey,
+        virtualTokenReserves,
+        virtualQuoteReserves,
+        realTokenReserves,
+        realQuoteReserves,
+        tokenTotalSupply,
+        timestamp: Date.now(),
+      });
+      populated = true;
+    }
+  } catch (e: any) {
+    console.log(`PRIME_FAILED: mint=${mint} dur=${nowMs() - primeStart}ms err=${e?.message ?? String(e)}`);
+    return false;
+  }
+
+  if (buyState && mintState && feeConfig && global) {
+    buyStateWarmCache.set(mint, { timestamp: Date.now(), buyState, mintState, feeConfig, global });
+  }
+
+  const primeEnd = nowMs();
+  console.log(`PRIME_COMPLETE: mint=${mint} totalDur=${primeEnd - primeStart}ms populated=${populated} source=mint-derived buyStateWarmCache=${buyState ? "present" : "absent"} feeConfig=${feeConfig ? "present" : "absent"} global=${global ? "present" : "absent"}`);
+  return populated;
+}
 
 // Pump.fun global PDA (constant, never changes)
 const PUMPFUN_GLOBAL_PDA = new PublicKey("4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf");
@@ -2668,7 +2737,7 @@ async function startPumpPortal() {
       ws.send(JSON.stringify({ method: "subscribeAccountTrade", keys: TARGET_WALLET_STRINGS }));
     };
 
-    ws.onmessage = (ev: any) => {
+    ws.onmessage = async (ev: any) => {
        try {
          const raw = typeof ev.data === "string" ? ev.data : ev.data.toString();
          const msg = JSON.parse(raw);
@@ -2692,6 +2761,10 @@ async function startPumpPortal() {
         console.log("âš¡ PUMPPORTAL detected buy:", msg.mint);
         seenSignatures.add(msg.signature);
         const detectionTs = nowMs();
+
+        await primeMintDerivedState(msg.mint, detectionTs).catch((e: any) => {
+          console.log(`PRIME_FAILED: mint=${msg.mint} dur=${nowMs() - detectionTs}ms err=${e?.message ?? String(e)}`);
+        });
 
          // Temporary read-only capture for verifier: save raw PumpPortal event
          // plus any already-cached bonding-curve / warm-state data. This does

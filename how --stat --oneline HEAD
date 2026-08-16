@@ -1,0 +1,120 @@
+[33mcommit 0d5d7f14c6046e7ceaa5c3e415d8aa41fe5248ad[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m, [m[1;31morigin/main[m[33m, [m[1;31morigin/HEAD[m[33m)[m
+Author:     Anthony Mberede <132375361+Anthonyjnr77@users.noreply.github.com>
+AuthorDate: Sat Aug 15 15:45:52 2026 +0100
+Commit:     Anthony Mberede <132375361+Anthonyjnr77@users.noreply.github.com>
+CommitDate: Sat Aug 15 15:45:52 2026 +0100
+
+    new111
+
+[1mdiff --git a/bot.ts b/bot.ts[m
+[1mindex 525e0c4..4c0a951 100644[m
+[1m--- a/bot.ts[m
+[1m+++ b/bot.ts[m
+[36m@@ -333,13 +333,16 @@[m [masync function refreshPrebuildCache() {[m
+         if (bcAccount?.data && abcAccount?.data && feeConfig) {[m
+           const data = bcAccount.data;[m
+           if (data.length >= 48) {[m
+[32m+[m[32m            // Anchor/SDK BondingCurve layout: discriminator (8) then[m
+[32m+[m[32m            // virtualTokenReserves (8), virtualQuoteReserves (8),[m
+[32m+[m[32m            // realTokenReserves (8), realQuoteReserves (8), tokenTotalSupply (8)[m
+             prebuildCache.set(mint, {[m
+               bondingCurve: bondingCurveAddress,[m
+               associatedBondingCurve: associatedBondingCurve,[m
+[31m-              virtualQuoteReserves: new BN(data.subarray(8, 16).readBigUInt64LE(0).toString()),[m
+[31m-              virtualTokenReserves: new BN(data.subarray(16, 24).readBigUInt64LE(0).toString()),[m
+[31m-              realQuoteReserves: new BN(data.subarray(24, 32).readBigUInt64LE(0).toString()),[m
+[31m-              realTokenReserves: new BN(data.subarray(32, 40).readBigUInt64LE(0).toString()),[m
+[32m+[m[32m              virtualTokenReserves: new BN(data.subarray(8, 16).readBigUInt64LE(0).toString()),[m
+[32m+[m[32m              virtualQuoteReserves: new BN(data.subarray(16, 24).readBigUInt64LE(0).toString()),[m
+[32m+[m[32m              realTokenReserves: new BN(data.subarray(24, 32).readBigUInt64LE(0).toString()),[m
+[32m+[m[32m              realQuoteReserves: new BN(data.subarray(32, 40).readBigUInt64LE(0).toString()),[m
+               tokenTotalSupply: data.length >= 48 ? new BN(data.subarray(40, 48).readBigUInt64LE(0).toString()) : null,[m
+               timestamp: Date.now(),[m
+             });[m
+[36m@@ -1636,34 +1639,77 @@[m [mfunction reconstructPreTradeSnapshotFromCache(mint: string, solAmountLamports: n[m
+   try {[m
+     const cached = bondingCurveCache.get(mint);[m
+     const warm = buyStateWarmCache.get(mint);[m
+[31m-    if (!cached || !warm) return null;[m
+[31m-[m
+[31m-    const Q_post = cached.virtualQuoteReserves; // BN[m
+[31m-    const T_post = cached.virtualTokenReserves; // BN[m
+[31m-    const realTokenReserves = cached.realTokenReserves;[m
+[31m-    const mintSupplyRaw = cached.tokenTotalSupply ?? warm.mintState?.supply;[m
+[31m-    const feeConfig = warm.feeConfig;[m
+[31m-    if (!Q_post || !T_post || !mintSupplyRaw || !feeConfig) return null;[m
+[31m-[m
+[31m-    // Extract fee tiers from feeConfig. Expected shape: { tiers: [{ maxMarketCap, feeBps }] }[m
+[31m-    let feeTiers: Array<{ maxMarketCap: number | null; feeBps: number }> = [];[m
+[31m-    if (Array.isArray(feeConfig.tiers) && feeConfig.tiers.length > 0) {[m
+[31m-      feeTiers = feeConfig.tiers.map((t: any) => ({ maxMarketCap: t.maxMarketCap ?? null, feeBps: Number(t.feeBps) }));[m
+[31m-    } else if (Array.isArray(feeConfig.feeTiers) && feeConfig.feeTiers.length > 0) {[m
+[31m-      feeTiers = feeConfig.feeTiers.map((t: any) => ({ maxMarketCap: t.maxMarketCap ?? null, feeBps: Number(t.feeBps) }));[m
+[31m-    } else if (Array.isArray(feeConfig) && feeConfig.length > 0) {[m
+[31m-      feeTiers = feeConfig.map((t: any) => ({ maxMarketCap: t.maxMarketCap ?? null, feeBps: Number(t.feeBps) }));[m
+[31m-    } else {[m
+[32m+[m[32m    const missingTop: string[] = [];[m
+[32m+[m[32m    if (!cached) missingTop.push("bondingCurveCache");[m
+[32m+[m[32m    if (!warm) missingTop.push("buyStateWarmCache");[m
+[32m+[m[32m    if (missingTop.length > 0) {[m
+[32m+[m[32m      console.log(`PREBUY_MC: UNKNOWN reason=missing ${missingTop.join(",")}`);[m
+[32m+[m[32m      return null;[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    // Narrow types for TS after presence checks[m
+[32m+[m[32m    const cachedState = cached!;[m
+[32m+[m[32m    const warmState = warm!;[m
+[32m+[m
+[32m+[m[32m    const Q_post = cachedState.virtualQuoteReserves; // BN[m
+[32m+[m[32m    const T_post = cachedState.virtualTokenReserves; // BN[m
+[32m+[m[32m    const realTokenReserves = cachedState.realTokenReserves;[m
+[32m+[m[32m    const mintSupplyRaw = cachedState.tokenTotalSupply ?? warmState.mintState?.supply;[m
+[32m+[m[32m    const feeConfig = warmState.feeConfig;[m
+[32m+[m[32m    const missing: string[] = [];[m
+[32m+[m[32m    if (!Q_post) missing.push("virtualQuoteReserves");[m
+[32m+[m[32m    if (!T_post) missing.push("virtualTokenReserves");[m
+[32m+[m[32m    if (!realTokenReserves) missing.push("realTokenReserves");[m
+[32m+[m[32m    if (!mintSupplyRaw) missing.push("tokenTotalSupply");[m
+[32m+[m[32m    if (!feeConfig) missing.push("feeConfig");[m
+[32m+[m[32m    if (missing.length > 0) {[m
+[32m+[m[32m      console.log(`PREBUY_MC: UNKNOWN reason=missing ${missing.join(",")}`);[m
+       return null;[m
+     }[m
+ [m
+[31m-    const candidateBps = [...new Set(feeTiers.map((t) => t.feeBps))];[m
+[32m+[m[32m    // Extract fee tiers from feeConfig. Prefer SDK shape: feeConfig.feeTiers[m
+[32m+[m[32m    // where each tier has { marketCapLamportsThreshold: BN, fees: { protocolFeeBps, creatorFeeBps } }[m
+[32m+[m[32m    let sdkFeeTiers: Array<{ threshold: BN | null; totalFeeBps: number }> = [];[m
+[32m+[m[32m    try {[m
+[32m+[m[32m      if (feeConfig) {[m
+[32m+[m[32m        if (Array.isArray(feeConfig.feeTiers) && feeConfig.feeTiers.length > 0) {[m
+[32m+[m[32m          sdkFeeTiers = feeConfig.feeTiers.map((t: any) => {[m
+[32m+[m[32m            const thr = t.marketCapLamportsThreshold ?? t.marketCapLamportsThreshold ?? t.marketCap ?? null;[m
+[32m+[m[32m            const thrBN = thr == null ? null : (typeof thr === "object" && typeof thr.toString === "function" ? new BN(thr.toString()) : new BN(String(thr)));[m
+[32m+[m[32m            const protocol = t.fees?.protocolFeeBps ?? t.protocolFeeBps ?? 0;[m
+[32m+[m[32m            const creator = t.fees?.creatorFeeBps ?? t.creatorFeeBps ?? 0;[m
+[32m+[m[32m            const p = typeof protocol === "object" && typeof protocol.toString === "function" ? Number(new BN(protocol.toString()).toString()) : Number(protocol || 0);[m
+[32m+[m[32m            const c = typeof creator === "object" && typeof creator.toString === "function" ? Number(new BN(creator.toString()).toString()) : Number(creator || 0);[m
+[32m+[m[32m            return { threshold: thrBN, totalFeeBps: p + c };[m
+[32m+[m[32m          });[m
+[32m+[m[32m        } else if (Array.isArray(feeConfig.tiers) && feeConfig.tiers.length > 0) {[m
+[32m+[m[32m          // fallback shape[m
+[32m+[m[32m          sdkFeeTiers = feeConfig.tiers.map((t: any) => ({ threshold: null, totalFeeBps: Number(t.feeBps) }));[m
+[32m+[m[32m        } else if (Array.isArray(feeConfig) && feeConfig.length > 0) {[m
+[32m+[m[32m          sdkFeeTiers = feeConfig.map((t: any) => ({ threshold: null, totalFeeBps: Number(t.feeBps) }));[m
+[32m+[m[32m        }[m
+[32m+[m[32m      }[m
+[32m+[m[32m    } catch (error) {[m
+[32m+[m[32m      const errorMessage = error instanceof Error ? error.message : String(error);[m
+[32m+[m[32m      console.log(`PREBUY_MC: UNKNOWN reason=feeTiers_parse_error ${errorMessage}`);[m
+[32m+[m[32m      return null;[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    if (sdkFeeTiers.length === 0) {[m
+[32m+[m[32m      console.log(`PREBUY_MC: UNKNOWN reason=missing feeTiers`);[m
+[32m+[m[32m      return null;[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    const candidateBps = [...new Set(sdkFeeTiers.map((t) => t.totalFeeBps))];[m
+     const solAmtBn = new BN(solAmountLamports ?? 0);[m
+     if (sol
