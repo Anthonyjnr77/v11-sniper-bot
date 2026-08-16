@@ -1702,10 +1702,20 @@ async function validateBuyTransaction(rawTx: Uint8Array): Promise<boolean> {
   }
 }
 
-// Attempt to reconstruct the pre-buy market-cap using only cached data.
-// Returns { tokenPriceUSD, marketCapUSD } or null if insufficient data.
-function reconstructPreTradeSnapshotFromCache(mint: string, solAmountLamports: number) {
+// Attempt to reconstruct the pre-buy market-cap using the current cache,
+// but prime the mint-derived state first if the cache is empty so a valid buy
+// is not rejected before the local Pump SDK path has a chance to fetch it.
+async function reconstructPreTradeSnapshotFromCache(mint: string, solAmountLamports: number) {
   try {
+    const primeStart = nowMs();
+    const primed = await primeMintDerivedState(mint, primeStart).catch((e: any) => {
+      console.log(`PREBUY_MC: PRIME_FALLBACK_FAILED mint=${mint} dur=${nowMs() - primeStart}ms err=${e?.message ?? String(e)}`);
+      return false;
+    });
+    if (!primed) {
+      console.log(`PREBUY_MC: cache-prime attempted for ${mint} (primed=${primed})`);
+    }
+
     const cached = bondingCurveCache.get(mint);
     const warm = buyStateWarmCache.get(mint);
     const missingTop: string[] = [];
@@ -2191,7 +2201,7 @@ async function executeBuy(
       try {
         console.log(`⚡ PREBUY_MC_CHECK start: ${nowMs() - detectionTs}ms after detection`);
         const startCheck = nowMs();
-        preTradeSnapshot = reconstructPreTradeSnapshotFromCache(mint, solAmountLamports ?? 0);
+        preTradeSnapshot = await reconstructPreTradeSnapshotFromCache(mint, solAmountLamports ?? 0);
         const checkElapsed = nowMs() - startCheck;
         console.log(`⚡ PREBUY_MC_CHECK done: ${checkElapsed}ms`);
       } catch (e: any) {
