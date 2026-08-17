@@ -1722,7 +1722,11 @@ async function reconstructPreTradeSnapshotFromCache(mint: string, solAmountLampo
     if (!cached) missingTop.push("bondingCurveCache");
     if (!warm) missingTop.push("buyStateWarmCache");
     if (missingTop.length > 0) {
-      console.log(`PREBUY_MC: UNKNOWN reason=missing ${missingTop.join(",")}`);
+      const diagTop = {
+        bondingCurveCache: !!cached,
+        buyStateWarmCache: !!warm,
+      };
+      console.log(`PREBUY_MC: UNKNOWN reason=missing_top ${missingTop.join(",")} diag=${JSON.stringify(diagTop)}`);
       return null;
     }
 
@@ -1742,7 +1746,18 @@ async function reconstructPreTradeSnapshotFromCache(mint: string, solAmountLampo
     if (!mintSupplyRaw) missing.push("tokenTotalSupply");
     if (!feeConfig) missing.push("feeConfig");
     if (missing.length > 0) {
-      console.log(`PREBUY_MC: UNKNOWN reason=missing ${missing.join(",")}`);
+      const diag = {
+        bondingCurveCache_present: !!cached,
+        buyStateWarmCache_present: !!warm,
+        virtualTokenReserves: T_post ? (typeof T_post.toString === 'function' ? T_post.toString() : String(T_post)) : null,
+        virtualQuoteReserves: Q_post ? (typeof Q_post.toString === 'function' ? Q_post.toString() : String(Q_post)) : null,
+        realTokenReserves: realTokenReserves ? (typeof realTokenReserves.toString === 'function' ? realTokenReserves.toString() : String(realTokenReserves)) : null,
+        realQuoteReserves: cachedState.realQuoteReserves ? (typeof cachedState.realQuoteReserves.toString === 'function' ? cachedState.realQuoteReserves.toString() : String(cachedState.realQuoteReserves)) : null,
+        tokenTotalSupply_cached: cachedState.tokenTotalSupply != null ? (typeof cachedState.tokenTotalSupply.toString === 'function' ? cachedState.tokenTotalSupply.toString() : String(cachedState.tokenTotalSupply)) : null,
+        mintState_supply: warmState.mintState?.supply ?? null,
+        feeConfig_present: !!feeConfig,
+      };
+      console.log(`PREBUY_MC: UNKNOWN reason=missing ${missing.join(",")} diag=${JSON.stringify(diag)}`);
       return null;
     }
 
@@ -1775,7 +1790,13 @@ async function reconstructPreTradeSnapshotFromCache(mint: string, solAmountLampo
     }
 
     if (sdkFeeTiers.length === 0) {
-      console.log(`PREBUY_MC: UNKNOWN reason=missing feeTiers`);
+      const feeDiag = {
+        feeConfig_present: !!feeConfig,
+        feeConfig_keys: feeConfig ? Object.keys(feeConfig).slice(0, 10) : null,
+        feeConfig_sample: feeConfig && typeof feeConfig === 'object' ? JSON.stringify(Object.entries(feeConfig).slice(0, 5)) : null,
+        sdkFeeTiers_length: sdkFeeTiers.length,
+      };
+      console.log(`PREBUY_MC: UNKNOWN reason=missing_feeTiers diag=${JSON.stringify(feeDiag)}`);
       return null;
     }
 
@@ -1786,7 +1807,13 @@ async function reconstructPreTradeSnapshotFromCache(mint: string, solAmountLampo
     const LAMPORTS = new BN(1e9);
     const solPriceUsd = Number(process.env.SOL_PRICE_USD ?? warmState.global?.solPriceUsd ?? warmState.global?.solUsdPrice ?? 0);
     if (!solPriceUsd || solPriceUsd <= 0) {
-      console.log(`PREBUY_MC: UNKNOWN reason=missing solPriceUsd`);
+      const solDiag = {
+        env_SOL_PRICE_USD: process.env.SOL_PRICE_USD ?? null,
+        warm_global_present: !!warmState.global,
+        warm_global_keys: warmState.global ? Object.keys(warmState.global).slice(0, 10) : null,
+        solPriceUsd_resolved: solPriceUsd,
+      };
+      console.log(`PREBUY_MC: UNKNOWN reason=missing_solPriceUsd diag=${JSON.stringify(solDiag)}`);
       return null;
     }
 
