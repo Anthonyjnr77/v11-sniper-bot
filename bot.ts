@@ -1817,6 +1817,8 @@ async function reconstructPreTradeSnapshotFromCache(mint: string, solAmountLampo
       return null;
     }
 
+    let lastSelectedFeeBps: number | null = null;
+    let lastTotalFeeBps: number | null = null;
     for (const totalFeeBps of candidateBps) {
       // inputAmount = floor((amount - 1) * 10000 / (10000 + totalFeeBps))
       const A = solAmtBn.subn(1).mul(new BN(10000));
@@ -1842,76 +1844,65 @@ async function reconstructPreTradeSnapshotFromCache(mint: string, solAmountLampo
       const preMarketCapSol = Number(preMarketCapQuote.div(LAMPORTS).toString());
       const preMarketCapUsd = preMarketCapSol * solPriceUsd;
 
-      // Determine selected fee tier for this preMarketCap (in USD)
-      // Map feeTiers maxMarketCap assumed to be USD in feeConfig; fallback to selection by value order
-      let selectedFee = totalFeeBps;
-      // Build a best-effort feeTiers usable for USD-based selection
-      const feeTiers: Array<{ maxMarketCap: number | null; feeBps: number }> = [];
-      if (Array.isArray((feeConfig as any).feeTiers) && (feeConfig as any).feeTiers.length > 0) {
-        for (const t of (feeConfig as any).feeTiers) {
-          const max = t.maxMarketCap ?? t.maxMarketCap ?? null;
-          const maxNum = max == null ? null : Number(max);
-          const protocol = t.fees?.protocolFeeBps ?? t.protocolFeeBps ?? 0;
-          const creator = t.fees?.creatorFeeBps ?? t.creatorFeeBps ?? 0;
-          const protocolNum = typeof protocol === 'object' && protocol !== null && typeof protocol.toString === 'function' ? Number(new BN(protocol.toString()).toString()) : Number(protocol || 0);
-          const creatorNum = typeof creator === 'object' && creator !== null && typeof creator.toString === 'function' ? Number(new BN(creator.toString()).toString()) : Number(creator || 0);
-          feeTiers.push({ maxMarketCap: maxNum, feeBps: protocolNum + creatorNum });
-        }
-      } else if (Array.isArray((feeConfig as any).tiers) && (feeConfig as any).tiers.length > 0) {
-        for (const t of (feeConfig as any).tiers) {
-          feeTiers.push({ maxMarketCap: t.maxMarketCap == null ? null : Number(t.maxMarketCap), feeBps: Number(t.feeBps) });
-        }
-      } else {
-        // fallback: treat SDK fee tiers as feeTiers with null maxMarketCap
-        for (const s of sdkFeeTiers) feeTiers.push({ maxMarketCap: null, feeBps: s.totalFeeBps });
-      }
-      for (const t of feeTiers) {
-        if (t.maxMarketCap == null) { selectedFee = t.feeBps; break; }
-        if (preMarketCapUsd <= Number(t.maxMarketCap)) { selectedFee = t.feeBps; break; }
-      }
-
-      // Determine selected fee tier using SDK semantics (market cap in lamports)
+      // Match the exact Pump SDK fee-tier semantics: threshold is in lamports, and
+      // the tier is selected by marketCap >= threshold, with the first tier used for
+      // marketCap below the lowest threshold. There is no "totalFeeBps" comparison in
+      // the SDK; the selected tier is the one whose `fees` object is returned.
       let selectedFeeBps: number | null = null;
       try {
-        // Find matching tier similar to SDK calculateFeeTier behavior
-        // If thresholds are present, use BN comparisons; otherwise fallback to first-match by value
         const tiersWithThresh = sdkFeeTiers.filter((t): t is { threshold: BN; totalFeeBps: number } => t.threshold != null);
         if (tiersWithThresh.length > 0) {
-          // Sort ascending by threshold
-          tiersWithThresh.sort((a, b) => a.threshold.cmp(b.threshold));
-          // If marketCap < first.threshold -> first
-          const preMarketCapLamports = preMarketCapQuote; // BN in lamports
-          const firstTier = tiersWithThresh[0];
+          const sorted = tiersWithThresh.slice().sort((a, b) => a.threshold.cmp(b.threshold));
+          const firstTier = sorted[0];
+          const preMarketCapLamports = preMarketCapQuote;
           if (!firstTier) {
             selectedFeeBps = null;
+          } else if (preMarketCapLamports.lt(firstTier.threshold)) {
+            selectedFeeBps = firstTier.totalFeeBps;
           } else {
-            if (preMarketCapLamports.lt(firstTier!.threshold)) {
-              selectedFeeBps = firstTier!.totalFeeBps;
-            } else {
-              // find highest tier with threshold <= marketCap
-              for (let i = tiersWithThresh.length - 1; i >= 0; i--) {
-                const tier = tiersWithThresh[i]!;
-                if (preMarketCapLamports.gte(tier.threshold)) {
-                  selectedFeeBps = tier.totalFeeBps;
-                  break;
-                }
-              }
-              if (selectedFeeBps === null) selectedFeeBps = firstTier!.totalFeeBps;
-            }
+            const matchedTier = sorted.slice().reverse().find((tier) => preMarketCapLamports.gte(tier.threshold));
+            selectedFeeBps = matchedTier?.totalFeeBps ?? firstTier.totalFeeBps;
           }
         } else {
           const firstSdk = sdkFeeTiers[0];
-          if (firstSdk) selectedFeeBps = firstSdk.totalFeeBps;
-          else selectedFeeBps = null;
+          selectedFeeBps = firstSdk ? firstSdk.totalFeeBps : null;
         }
       } catch {
         selectedFeeBps = null;
       }
 
+      lastSelectedFeeBps = selectedFeeBps;
+      lastTotalFeeBps = totalFeeBps;
       if (selectedFeeBps === totalFeeBps) {
         return { tokenPriceUSD: null, marketCapUSD: preMarketCapUsd };
       }
     }
+
+    const feeDiag = {
+      selectedFeeBps: lastSelectedFeeBps,
+      totalFeeBps: lastTotalFeeBps,
+      candidateBps,
+      sdkFeeTiers: sdkFeeTiers.map((tier) => ({
+        threshold: tier.threshold ? tier.threshold.toString() : null,
+        totalFeeBps: tier.totalFeeBps,
+      })),
+      feeConfig: feeConfig ? {
+        feeTiers: Array.isArray(feeConfig.feeTiers) ? feeConfig.feeTiers.map((tier: any) => ({
+          marketCapLamportsThreshold: tier.marketCapLamportsThreshold ? tier.marketCapLamportsThreshold.toString() : null,
+          fees: tier.fees ? {
+            lpFeeBps: tier.fees.lpFeeBps ? tier.fees.lpFeeBps.toString() : null,
+            protocolFeeBps: tier.fees.protocolFeeBps ? tier.fees.protocolFeeBps.toString() : null,
+            creatorFeeBps: tier.fees.creatorFeeBps ? tier.fees.creatorFeeBps.toString() : null,
+          } : null,
+        })) : null,
+        flatFees: feeConfig.flatFees ? {
+          lpFeeBps: feeConfig.flatFees.lpFeeBps ? feeConfig.flatFees.lpFeeBps.toString() : null,
+          protocolFeeBps: feeConfig.flatFees.protocolFeeBps ? feeConfig.flatFees.protocolFeeBps.toString() : null,
+          creatorFeeBps: feeConfig.flatFees.creatorFeeBps ? feeConfig.flatFees.creatorFeeBps.toString() : null,
+        } : null,
+      } : null,
+    };
+    console.log(`PREBUY_MC: UNKNOWN reason=no_fee_tier_match selectedFeeBps=${lastSelectedFeeBps ?? "null"} totalFeeBps=${lastTotalFeeBps ?? "null"} candidateBps=${JSON.stringify(candidateBps)} sdkFeeTiers=${JSON.stringify(feeDiag.sdkFeeTiers)} feeConfig=${JSON.stringify(feeDiag.feeConfig)}`);
     return null;
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
@@ -3323,24 +3314,3 @@ async function handleGrpcTradeEvent(event: GrpcTradeEvent) {
     console.error("[gRPC] Event handler error:", err.message);
   }
 }
-
-start();
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
