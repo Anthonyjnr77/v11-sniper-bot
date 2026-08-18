@@ -2761,8 +2761,10 @@ async function startPumpPortal() {
     ws.onopen = () => {
       pumpPortalConnected = true;
       reconnectDelayMs = RECONNECT_DELAY_MIN_MS;
+      console.log("BOT_STARTUP: PumpPortal connected");
       console.log("âœ… PumpPortal channel connected");
       ws.send(JSON.stringify({ method: "subscribeAccountTrade", keys: TARGET_WALLET_STRINGS }));
+      console.log("BOT_STARTUP: subscription sent");
     };
 
     ws.onmessage = async (ev: any) => {
@@ -3188,6 +3190,7 @@ let grpcManager: {
 } | null = null;
 
 async function start() {
+  console.log("BOT_STARTUP: process entered");
   console.log("ðŸš€ Copy-trade bot starting. Targets:", TARGET_WALLETS.map(w => w.toString()).join(", "));
 
   logFeeSizingWarning();
@@ -3269,7 +3272,11 @@ async function start() {
     }
   }, 30_000);
 
-  if (PUMPPORTAL_ENABLED) await startPumpPortal();
+  if (PUMPPORTAL_ENABLED) {
+    console.log("BOT_STARTUP: starting PumpPortal");
+    await startPumpPortal();
+    console.log("BOT_STARTUP: PumpPortal connected");
+  }
 
   await checkWalletBalance();
 
@@ -3288,6 +3295,10 @@ async function start() {
     `Commands: /pause /resume /status${TELEGRAM_EXTENDED ? ' /positions /stats /history /settings' : ''}`
   );
 }
+
+start().catch((err) => {
+  console.error("BOT_STARTUP FAILED:", err);
+});
 
 // Handle gRPC trade events
 async function handleGrpcTradeEvent(event: GrpcTradeEvent) {
