@@ -1884,8 +1884,22 @@ async function reconstructPreTradeSnapshotFromCache(mint: string, solAmountLampo
     const candidateBps = [...new Set(sdkFeeTiers
       .map((tier) => Number(tier.totalFeeBps))
       .filter((feeBps) => Number.isFinite(feeBps) && feeBps >= 0))];
-    const solAmtBn = new BN(solAmountLamports ?? 0);
-    if (solAmtBn.lte(new BN(0))) return null;
+    if (candidateBps.length === 0) {
+      console.log(`PREBUY_MC: UNKNOWN reason=no_valid_fee_candidates sdkFeeTiers=${JSON.stringify(sdkFeeTiers)}`);
+      return null;
+    }
+
+    // The bot always buys BUY_AMOUNT; decoded target-trade amounts can be zero
+    // when polling cannot decode the source transaction's buy log.
+    const requestedAmount = Number(solAmountLamports ?? 0);
+    const reconstructionAmount = Number.isFinite(requestedAmount) && requestedAmount > 0
+      ? requestedAmount
+      : BUY_AMOUNT;
+    if (!Number.isFinite(reconstructionAmount) || reconstructionAmount <= 0) {
+      console.log(`PREBUY_MC: UNKNOWN reason=missing_trade_amount requested=${String(solAmountLamports)} configured=${String(BUY_AMOUNT)}`);
+      return null;
+    }
+    const solAmtBn = new BN(Math.trunc(reconstructionAmount));
 
     const LAMPORTS = new BN(1e9);
     const solPriceUsd = await getSolPriceUsd() ?? Number(warmState.global?.solPriceUsd ?? warmState.global?.solUsdPrice ?? 0);
