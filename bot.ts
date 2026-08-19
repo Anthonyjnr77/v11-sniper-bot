@@ -1849,7 +1849,7 @@ async function reconstructPreTradeSnapshotFromCache(mint: string, solAmountLampo
       if (feeConfig) {
         if (Array.isArray(feeConfig.feeTiers) && feeConfig.feeTiers.length > 0) {
           sdkFeeTiers = feeConfig.feeTiers.map((t: any) => {
-            const thr = t.marketCapLamportsThreshold ?? t.marketCapLamportsThreshold ?? t.marketCap ?? null;
+            const thr = t.marketCapLamportsThreshold ?? t.marketCap ?? null;
             const thrBN = thr == null ? null : (typeof thr === "object" && typeof thr.toString === "function" ? new BN(thr.toString()) : new BN(String(thr)));
             const protocol = t.fees?.protocolFeeBps ?? t.protocolFeeBps ?? 0;
             const creator = t.fees?.creatorFeeBps ?? t.creatorFeeBps ?? 0;
@@ -1881,7 +1881,9 @@ async function reconstructPreTradeSnapshotFromCache(mint: string, solAmountLampo
       return null;
     }
 
-    const candidateBps = [...new Set(sdkFeeTiers.map((t) => t.totalFeeBps))];
+    const candidateBps = [...new Set(sdkFeeTiers
+      .map((tier) => Number(tier.totalFeeBps))
+      .filter((feeBps) => Number.isFinite(feeBps) && feeBps >= 0))];
     const solAmtBn = new BN(solAmountLamports ?? 0);
     if (solAmtBn.lte(new BN(0))) return null;
 
@@ -1900,24 +1902,38 @@ async function reconstructPreTradeSnapshotFromCache(mint: string, solAmountLampo
 
     let lastSelectedFeeBps: number | null = null;
     let lastTotalFeeBps: number | null = null;
+    let lastSkipReason: string | null = null;
+    let lastSelectionError: string | null = null;
     for (const totalFeeBps of candidateBps) {
       lastTotalFeeBps = totalFeeBps;
       // inputAmount = floor((amount - 1) * 10000 / (10000 + totalFeeBps))
       const A = solAmtBn.subn(1).mul(new BN(10000));
       const D = new BN(10000 + totalFeeBps);
-      if (A.lt(new BN(0))) continue;
+      if (A.lt(new BN(0))) {
+        lastSkipReason = "negative_fee_adjusted_amount";
+        continue;
+      }
       const inputAmount = A.div(D);
-      if (Q_post.lte(inputAmount)) continue;
+      if (Q_post.lte(inputAmount)) {
+        lastSkipReason = "input_exceeds_virtual_quote_reserves";
+        continue;
+      }
       const numer = inputAmount.mul(T_post);
       const denom = Q_post.sub(inputAmount);
-      if (denom.lte(new BN(0))) continue;
+      if (denom.lte(new BN(0))) {
+        lastSkipReason = "non_positive_curve_denominator";
+        continue;
+      }
       const xCand = numer.div(denom);
       let finalTokens = xCand;
       if (realTokenReserves && xCand.gte(realTokenReserves)) finalTokens = realTokenReserves;
 
       const virtualTokenReserves_pre = T_post.add(finalTokens);
       const virtualQuoteReserves_pre = Q_post.sub(inputAmount);
-      if (virtualTokenReserves_pre.lte(new BN(0)) || virtualQuoteReserves_pre.lte(new BN(0))) continue;
+      if (virtualTokenReserves_pre.lte(new BN(0)) || virtualQuoteReserves_pre.lte(new BN(0))) {
+        lastSkipReason = "non_positive_pre_trade_reserves";
+        continue;
+      }
 
       const mintSupplyBN = typeof mintSupplyRaw === "bigint" ? new BN(mintSupplyRaw.toString()) : new BN(String(mintSupplyRaw));
 
@@ -1926,10 +1942,6 @@ async function reconstructPreTradeSnapshotFromCache(mint: string, solAmountLampo
       const preMarketCapSol = Number(preMarketCapQuote.div(LAMPORTS).toString());
       const preMarketCapUsd = preMarketCapSol * solPriceUsd;
 
-      // Match the exact Pump SDK fee-tier semantics: threshold is in lamports, and
-      // the tier is selected by marketCap >= threshold, with the first tier used for
-      // marketCap below the lowest threshold. There is no "totalFeeBps" comparison in
-      // the SDK; the selected tier is the one whose `fees` object is returned.
       let selectedFeeBps: number | null = null;
       try {
         const tiersWithThresh = sdkFeeTiers.filter((t): t is { threshold: BN; totalFeeBps: number } => t.threshold != null);
@@ -1937,11 +1949,9 @@ async function reconstructPreTradeSnapshotFromCache(mint: string, solAmountLampo
           const sorted = tiersWithThresh.slice().sort((a, b) => a.threshold.cmp(b.threshold));
           const firstTier = sorted[0];
           const preMarketCapLamports = preMarketCapQuote;
-          if (!firstTier) {
-            selectedFeeBps = null;
-          } else if (preMarketCapLamports.lt(firstTier.threshold)) {
+          if (firstTier && preMarketCapLamports.lt(firstTier.threshold)) {
             selectedFeeBps = firstTier.totalFeeBps;
-          } else {
+          } else if (firstTier) {
             const matchedTier = sorted.slice().reverse().find((tier) => preMarketCapLamports.gte(tier.threshold));
             selectedFeeBps = matchedTier?.totalFeeBps ?? firstTier.totalFeeBps;
           }
@@ -1949,19 +1959,23 @@ async function reconstructPreTradeSnapshotFromCache(mint: string, solAmountLampo
           const firstSdk = sdkFeeTiers[0];
           selectedFeeBps = firstSdk ? firstSdk.totalFeeBps : null;
         }
-      } catch {
+      } catch (error) {
+        lastSelectionError = error instanceof Error ? error.message : String(error);
         selectedFeeBps = null;
       }
 
-      lastSelectedFeeBps = selectedFeeBps;
-      if (selectedFeeBps != null && Number(selectedFeeBps) === Number(totalFeeBps)) {
+      lastSelectedFeeBps = selectedFeeBps == null ? null : Number(selectedFeeBps);
+      if (lastSelectedFeeBps != null && lastSelectedFeeBps === Number(totalFeeBps)) {
         return { tokenPriceUSD: null, marketCapUSD: preMarketCapUsd };
       }
+      lastSkipReason = "selected_fee_does_not_match_candidate";
     }
 
     const feeDiag = {
       selectedFeeBps: lastSelectedFeeBps,
       totalFeeBps: lastTotalFeeBps,
+      lastSkipReason,
+      lastSelectionError,
       candidateBps,
       sdkFeeTiers: sdkFeeTiers.map((tier) => ({
         threshold: tier.threshold ? tier.threshold.toString() : null,
