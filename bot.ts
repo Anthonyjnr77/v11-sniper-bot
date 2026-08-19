@@ -2543,7 +2543,16 @@ async function handleTxInternal(tx: any, signature: string): Promise<boolean> {
         foundAny = true;
         console.log("ðŸ”¥ DETECTED buy:", post.mint);
         // Avoid network MC lookups on the hot path; rely on cached reconstruction.
-        executeBuy(post.mint, undefined, 0, nowMs());
+        const decoded = tryFastDecode(tx.meta.logMessages ?? []);
+        const solAmountLamports =
+          decoded !== null &&
+          decoded.isBuy === true &&
+          decoded.mint === post.mint &&
+          decoded.user === post.owner &&
+          decoded.solAmount > 0
+            ? decoded.solAmount
+            : 0;
+        executeBuy(post.mint, undefined, solAmountLamports, nowMs());
         return true;
       }
     }
