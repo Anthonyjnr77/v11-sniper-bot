@@ -192,6 +192,66 @@ function isPumpFallbackActive(mint: string): boolean {
 const MIN_WALLET_BALANCE_SOL = Number(process.env.MIN_WALLET_BALANCE_SOL ?? 0.02);
 
 const SOL_MINT = "So11111111111111111111111111111111111111112";
+const SOL_PRICE_CACHE_TTL_MS = 60_000;
+let solPriceCache: { priceUsd: number; timestamp: number } | null = null;
+let solPriceRefresh: Promise<number | null> | null = null;
+
+function getConfiguredSolPriceUsd(): number | null {
+  const value = Number(process.env.SOL_PRICE_USD ?? 0);
+  return Number.isFinite(value) && value > 0 ? value : null;
+}
+
+async function refreshSolPriceUsd(): Promise<number | null> {
+  if (solPriceRefresh) return solPriceRefresh;
+
+  solPriceRefresh = (async () => {
+    try {
+      const response = await fetch(`https://api.jup.ag/price/v2?ids=${SOL_MINT}`, { agent });
+      if (!response.ok) throw new Error(`Jupiter HTTP ${response.status}`);
+      const payload: any = await response.json();
+      const priceUsd = Number(payload?.data?.[SOL_MINT]?.price ?? 0);
+      if (!Number.isFinite(priceUsd) || priceUsd <= 0) throw new Error("Jupiter returned no positive SOL price");
+      solPriceCache = { priceUsd, timestamp: Date.now() };
+      console.log(`SOL price updated: $${priceUsd.toFixed(2)} (Jupiter)`);
+      return priceUsd;
+    } catch (jupiterError: any) {
+      try {
+        const response = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd", { agent });
+        if (!response.ok) throw new Error(`CoinGecko HTTP ${response.status}`);
+        const payload: any = await response.json();
+        const priceUsd = Number(payload?.solana?.usd ?? 0);
+        if (!Number.isFinite(priceUsd) || priceUsd <= 0) throw new Error("CoinGecko returned no positive SOL price");
+        solPriceCache = { priceUsd, timestamp: Date.now() };
+        console.log(`SOL price updated: $${priceUsd.toFixed(2)} (CoinGecko)`);
+        return priceUsd;
+      } catch (fallbackError: any) {
+        console.log(`SOL price fetch failed: Jupiter=${jupiterError?.message ?? String(jupiterError)}; CoinGecko=${fallbackError?.message ?? String(fallbackError)}`);
+        return null;
+      }
+    }
+  })().finally(() => {
+    solPriceRefresh = null;
+  });
+
+  return solPriceRefresh;
+}
+
+async function getSolPriceUsd(): Promise<number | null> {
+  if (solPriceCache && Date.now() - solPriceCache.timestamp < SOL_PRICE_CACHE_TTL_MS) {
+    return solPriceCache.priceUsd;
+  }
+
+  const livePrice = await refreshSolPriceUsd();
+  if (livePrice !== null) return livePrice;
+
+  const configuredPrice = getConfiguredSolPriceUsd();
+  if (configuredPrice !== null) {
+    console.log(`SOL price fallback: $${configuredPrice.toFixed(2)} (SOL_PRICE_USD)`);
+  } else {
+    console.log("SOL price unavailable: live providers failed and SOL_PRICE_USD is not set");
+  }
+  return configuredPrice;
+}
 
 const JUP_BASE = process.env.JUP_BASE_URL ?? "https://quote-api.jup.ag/v1";
 const JUP_LEGACY_BASE = process.env.JUP_LEGACY_BASE_URL ?? "https://api.jup.ag/swap/v1";
@@ -1805,7 +1865,7 @@ async function reconstructPreTradeSnapshotFromCache(mint: string, solAmountLampo
     if (solAmtBn.lte(new BN(0))) return null;
 
     const LAMPORTS = new BN(1e9);
-    const solPriceUsd = Number(process.env.SOL_PRICE_USD ?? warmState.global?.solPriceUsd ?? warmState.global?.solUsdPrice ?? 0);
+    const solPriceUsd = await getSolPriceUsd() ?? Number(warmState.global?.solPriceUsd ?? warmState.global?.solUsdPrice ?? 0);
     if (!solPriceUsd || solPriceUsd <= 0) {
       const solDiag = {
         env_SOL_PRICE_USD: process.env.SOL_PRICE_USD ?? null,
@@ -3205,6 +3265,10 @@ async function start() {
   logFeeSizingWarning();
 
   await Promise.all([loadPositions(), initPumpDecoder(), initPollingCursor()]);
+  await refreshSolPriceUsd();
+  setInterval(() => {
+    refreshSolPriceUsd().catch(() => {});
+  }, SOL_PRICE_CACHE_TTL_MS);
 
   // Log Helius WS / detection configuration for debugging 429 sources
   const heliusWsEnv = (process.env.DISABLE_HELIUS_WS ?? "false").toLowerCase() === "true";
