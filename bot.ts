@@ -1901,6 +1901,7 @@ async function reconstructPreTradeSnapshotFromCache(mint: string, solAmountLampo
     let lastSelectedFeeBps: number | null = null;
     let lastTotalFeeBps: number | null = null;
     for (const totalFeeBps of candidateBps) {
+      lastTotalFeeBps = totalFeeBps;
       // inputAmount = floor((amount - 1) * 10000 / (10000 + totalFeeBps))
       const A = solAmtBn.subn(1).mul(new BN(10000));
       const D = new BN(10000 + totalFeeBps);
@@ -1953,8 +1954,7 @@ async function reconstructPreTradeSnapshotFromCache(mint: string, solAmountLampo
       }
 
       lastSelectedFeeBps = selectedFeeBps;
-      lastTotalFeeBps = totalFeeBps;
-      if (selectedFeeBps === totalFeeBps) {
+      if (selectedFeeBps != null && Number(selectedFeeBps) === Number(totalFeeBps)) {
         return { tokenPriceUSD: null, marketCapUSD: preMarketCapUsd };
       }
     }
