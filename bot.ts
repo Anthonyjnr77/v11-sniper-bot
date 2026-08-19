@@ -206,27 +206,48 @@ async function refreshSolPriceUsd(): Promise<number | null> {
 
   solPriceRefresh = (async () => {
     try {
-      const response = await fetch(`https://api.jup.ag/price/v2?ids=${SOL_MINT}`, { agent });
+      const response = await fetch(`https://api.jup.ag/price/v3?ids=${SOL_MINT}`, {
+        agent,
+        headers: process.env.JUP_API_KEY ? { "x-api-key": process.env.JUP_API_KEY } : undefined,
+      });
       if (!response.ok) throw new Error(`Jupiter HTTP ${response.status}`);
       const payload: any = await response.json();
-      const priceUsd = Number(payload?.data?.[SOL_MINT]?.price ?? 0);
+      const priceUsd = Number(payload?.[SOL_MINT]?.usdPrice ?? 0);
       if (!Number.isFinite(priceUsd) || priceUsd <= 0) throw new Error("Jupiter returned no positive SOL price");
       solPriceCache = { priceUsd, timestamp: Date.now() };
       console.log(`SOL price updated: $${priceUsd.toFixed(2)} (Jupiter)`);
       return priceUsd;
     } catch (jupiterError: any) {
       try {
-        const response = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd", { agent });
-        if (!response.ok) throw new Error(`CoinGecko HTTP ${response.status}`);
+        const response = await fetch("https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT", { agent });
+        if (!response.ok) throw new Error(`Binance HTTP ${response.status}`);
         const payload: any = await response.json();
-        const priceUsd = Number(payload?.solana?.usd ?? 0);
-        if (!Number.isFinite(priceUsd) || priceUsd <= 0) throw new Error("CoinGecko returned no positive SOL price");
+        const priceUsd = Number(payload?.price ?? 0);
+        if (!Number.isFinite(priceUsd) || priceUsd <= 0) throw new Error("Binance returned no positive SOL price");
         solPriceCache = { priceUsd, timestamp: Date.now() };
-        console.log(`SOL price updated: $${priceUsd.toFixed(2)} (CoinGecko)`);
+        console.log(`SOL price updated: $${priceUsd.toFixed(2)} (Binance)`);
         return priceUsd;
-      } catch (fallbackError: any) {
-        console.log(`SOL price fetch failed: Jupiter=${jupiterError?.message ?? String(jupiterError)}; CoinGecko=${fallbackError?.message ?? String(fallbackError)}`);
-        return null;
+      } catch (binanceError: any) {
+        console.log(`SOL price provider failed: Jupiter=${jupiterError?.message ?? String(jupiterError)}; Binance=${binanceError?.message ?? String(binanceError)}`);
+        try {
+          const response = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd", {
+            agent,
+            headers: {
+              Accept: "application/json",
+              "User-Agent": "sniper-bot/1.0 SOL-price-client",
+            },
+          });
+          if (!response.ok) throw new Error(`CoinGecko HTTP ${response.status}`);
+          const payload: any = await response.json();
+          const priceUsd = Number(payload?.solana?.usd ?? 0);
+          if (!Number.isFinite(priceUsd) || priceUsd <= 0) throw new Error("CoinGecko returned no positive SOL price");
+          solPriceCache = { priceUsd, timestamp: Date.now() };
+          console.log(`SOL price updated: $${priceUsd.toFixed(2)} (CoinGecko)`);
+          return priceUsd;
+        } catch (coinGeckoError: any) {
+          console.log(`SOL price provider failed: CoinGecko=${coinGeckoError?.message ?? String(coinGeckoError)}`);
+          return null;
+        }
       }
     }
   })().finally(() => {
