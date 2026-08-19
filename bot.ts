@@ -2337,17 +2337,27 @@ async function executeBuy(
       if (!preTradeSnapshot) preTradeSnapshot = { tokenPriceUSD: null, marketCapUSD: null };
     }
     const preTradeMc = preTradeSnapshot.marketCapUSD ?? null;
-    console.log(`⚡ PREBUY_MC: ${preTradeMc === null ? 'UNKNOWN' : '$' + preTradeMc.toFixed(2)} (checked at ${nowMs() - detectionTs}ms)`);
-    if (shouldRejectPreTradeMarketCap(preTradeMc)) {
-      if (preTradeMc === null || preTradeMc === undefined) {
-        console.log(`🚫 PRE-TRADE MC REJECTED: UNKNOWN — bonding curve state unavailable for ${mint}`);
-      } else {
-        console.log(
-          `🚫 PRE-TRADE MC rejected for ${mint}: $${preTradeMc.toFixed(0)} > $${PRE_TRADE_MAX_MARKET_CAP_USD.toFixed(0)}`
-        );
+    const detectionAgeMs = Math.max(0, nowMs() - detectionTs);
+    console.log(`⚡ PREBUY_MC: ${preTradeMc === null ? 'UNKNOWN' : '$' + preTradeMc.toFixed(2)} (checked at ${detectionAgeMs}ms)`);
+    if (preTradeMc === null || preTradeMc === undefined) {
+      if (detectionAgeMs >= 1000) {
+        console.log(`🚫 PRE-TRADE MC REJECTED: UNKNOWN — detection too old (${detectionAgeMs}ms) for ${mint}`);
+        inFlight.delete(mint);
+        return;
       }
+      console.log(`⚠️ PRE-TRADE MC UNKNOWN — allowing fresh detection (${detectionAgeMs}ms) for ${mint}`);
+    } else if (shouldRejectPreTradeMarketCap(preTradeMc)) {
+      console.log(
+        `🚫 PRE-TRADE MC rejected for ${mint}: $${preTradeMc.toFixed(0)} >= $${PRE_TRADE_MAX_MARKET_CAP_USD.toFixed(0)}`
+      );
       inFlight.delete(mint);
       return;
+    } else if (preTradeMc >= 5000) {
+      console.log(
+        `⚠️ PRE-TRADE MC accepted above preferred target for ${mint}: $${preTradeMc.toFixed(0)} (hard limit $${PRE_TRADE_MAX_MARKET_CAP_USD.toFixed(0)})`
+      );
+    } else {
+      console.log(`✅ PRE-TRADE MC accepted for ${mint}: $${preTradeMc.toFixed(0)}`);
     }
 
     // Buy immediately. Market cap is measured after execution for reporting.

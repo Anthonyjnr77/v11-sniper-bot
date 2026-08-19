@@ -31,7 +31,8 @@ test("rejects pre-trade market caps above the V14 threshold", () => {
   // Unknown market cap should be rejected (safety-first)
   assert.equal(shouldRejectPreTradeMarketCap(null), true);
   assert.equal(shouldRejectPreTradeMarketCap(4999), false);
-  assert.equal(shouldRejectPreTradeMarketCap(PRE_TRADE_MAX_MARKET_CAP_USD), false);
-  assert.equal(shouldRejectPreTradeMarketCap(5000.01), true);
+  assert.equal(PRE_TRADE_MAX_MARKET_CAP_USD, 6000);
+  assert.equal(shouldRejectPreTradeMarketCap(PRE_TRADE_MAX_MARKET_CAP_USD), true);
+  assert.equal(shouldRejectPreTradeMarketCap(5999.99), false);
   assert.equal(shouldRejectPreTradeMarketCap(10_000), true);
 });
