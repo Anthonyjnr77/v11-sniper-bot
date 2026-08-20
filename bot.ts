@@ -972,6 +972,7 @@ function jupHeaders(extra: Record<string, string> = {}) {
 
 let cachedBlockhash: string | null = null;
 let cachedBlockhashAt = 0;
+let cachedLastValidBlockHeight: number | null = null;
 
 // Background blockhash refresher - keeps cache warm without blocking hot path
 let blockhashRefreshInterval: NodeJS.Timeout | null = null;
@@ -1000,8 +1001,9 @@ async function refreshBlockhash() {
   try {
     // Use the fastest submission RPC for lowest blockhash latency.
     const fastest = getFastestSubmissionConnection();
-    const { blockhash } = await fastest.getLatestBlockhash("processed");
+    const { blockhash, lastValidBlockHeight } = await fastest.getLatestBlockhash("processed");
     cachedBlockhash = blockhash;
+    cachedLastValidBlockHeight = lastValidBlockHeight;
     cachedBlockhashAt = Date.now();
   } catch {
     // keep the old one
@@ -1555,7 +1557,10 @@ async function submitSignedTransaction(rawBytes: Uint8Array, useJito = true): Pr
   const orderedPairs = [...submissionPairs].sort((a, b) => (submissionRpcPenalties.get(a.url) ?? 0) - (submissionRpcPenalties.get(b.url) ?? 0));
   const rpcAttempts = orderedPairs.map(({ url, conn }) =>
     conn.sendRawTransaction(rawBytes, { skipPreflight: true, maxRetries: 0 })
-      .then(() => "RPC")
+      .then(() => {
+        console.log(`RPC_ACCEPTED signature=${signature}`);
+        return "RPC";
+      })
       .catch((err: any) => {
         submissionRpcPenalties.set(url, (submissionRpcPenalties.get(url) ?? 0) + 1);
         console.log(`⚠️ RPC submit failure ${url}:`, err?.message ?? String(err));
@@ -1569,19 +1574,14 @@ async function submitSignedTransaction(rawBytes: Uint8Array, useJito = true): Pr
   if (useJito && JITO_BLOCK_ENGINE_URL) {
     jitoAttempt = (async () => {
       try {
-        const blockhash = await getBlockhashFast();
-        const tipLamports = JITO_TIP_LAMPORTS();
         const res = await fetchJson(JITO_BLOCK_ENGINE_URL, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            transactions: [bs58.encode(rawBytes)],
-            aggregation: "none",
-            maxNumberOfTransactionsInBundle: 1,
-            bundleSigner: wallet.publicKey.toString(),
-            tip: tipLamports,
-            clientId: "solana-sniper-bot",
-            blockhash,
+            jsonrpc: "2.0",
+            id: 1,
+            method: "sendBundle",
+            params: [[bs58.encode(rawBytes)], { encoding: "base58" }],
           }),
         });
         if (res?.result) {
@@ -1656,6 +1656,21 @@ async function sendSwapDual(txBase64: string): Promise<string | null> {
 
 async function sendRawTransactionDual(rawTx: Uint8Array): Promise<string | null> {
   return submitSignedTransaction(rawTx);
+}
+
+function validateSignedBuyTransaction(rawTx: Uint8Array): boolean {
+  try {
+    const tx = VersionedTransaction.deserialize(rawTx);
+    const payer = tx.message.staticAccountKeys[0];
+    const signature = tx.signatures[0];
+    return Boolean(
+      payer?.equals(wallet.publicKey) &&
+      tx.message.header.numRequiredSignatures >= 1 &&
+      signature?.some((byte) => byte !== 0)
+    );
+  } catch {
+    return false;
+  }
 }
 
 async function validateBuyTransaction(rawTx: Uint8Array): Promise<boolean> {
@@ -2295,6 +2310,19 @@ async function executeBuy(
     }
     inFlight.add(mint);
 
+    if (!Number.isFinite(BUY_AMOUNT) || BUY_AMOUNT <= 0) {
+      console.log(`🚫 Buy skipped — configured BUY_AMOUNT_SOL is not positive: ${BUY_AMOUNT_SOL}`);
+      inFlight.delete(mint);
+      return;
+    }
+    try {
+      new PublicKey(mint);
+    } catch {
+      console.log(`🚫 Buy skipped — invalid mint: ${mint}`);
+      inFlight.delete(mint);
+      return;
+    }
+
     if (botPaused) {
       console.log("⏸ Buy skipped — bot is paused:", mint);
       inFlight.delete(mint);
@@ -2320,44 +2348,14 @@ async function executeBuy(
     }
 
     const detectionTs = detectionMs ?? nowMs();
-    let preTradeSnapshot: { tokenPriceUSD: number | null; marketCapUSD: number | null } | null = null;
+    type PreTradeSnapshot = { tokenPriceUSD: number | null; marketCapUSD: number | null };
+    const emptyPreTradeSnapshot: PreTradeSnapshot = { tokenPriceUSD: null, marketCapUSD: null };
+    let preTradeSnapshotPromise: Promise<PreTradeSnapshot> = Promise.resolve(emptyPreTradeSnapshot);
     if (targetSnapshotPromise) {
-      preTradeSnapshot = await targetSnapshotPromise;
-    } else {
-      // Attempt to reconstruct a pre-trade snapshot from existing cached data
-      try {
-        console.log(`⚡ PREBUY_MC_CHECK start: ${nowMs() - detectionTs}ms after detection`);
-        const startCheck = nowMs();
-        preTradeSnapshot = await reconstructPreTradeSnapshotFromCache(mint, solAmountLamports ?? 0);
-        const checkElapsed = nowMs() - startCheck;
-        console.log(`⚡ PREBUY_MC_CHECK done: ${checkElapsed}ms`);
-      } catch (e: any) {
-        preTradeSnapshot = { tokenPriceUSD: null, marketCapUSD: null };
-      }
-      if (!preTradeSnapshot) preTradeSnapshot = { tokenPriceUSD: null, marketCapUSD: null };
-    }
-    const preTradeMc = preTradeSnapshot.marketCapUSD ?? null;
-    const detectionAgeMs = Math.max(0, nowMs() - detectionTs);
-    console.log(`⚡ PREBUY_MC: ${preTradeMc === null ? 'UNKNOWN' : '$' + preTradeMc.toFixed(2)} (checked at ${detectionAgeMs}ms)`);
-    if (preTradeMc === null || preTradeMc === undefined) {
-      if (detectionAgeMs >= 1000) {
-        console.log(`🚫 PRE-TRADE MC REJECTED: UNKNOWN — detection too old (${detectionAgeMs}ms) for ${mint}`);
-        inFlight.delete(mint);
-        return;
-      }
-      console.log(`⚠️ PRE-TRADE MC UNKNOWN — allowing fresh detection (${detectionAgeMs}ms) for ${mint}`);
-    } else if (shouldRejectPreTradeMarketCap(preTradeMc)) {
-      console.log(
-        `🚫 PRE-TRADE MC rejected for ${mint}: $${preTradeMc.toFixed(0)} >= $${PRE_TRADE_MAX_MARKET_CAP_USD.toFixed(0)}`
-      );
-      inFlight.delete(mint);
-      return;
-    } else if (preTradeMc >= 5000) {
-      console.log(
-        `⚠️ PRE-TRADE MC accepted above preferred target for ${mint}: $${preTradeMc.toFixed(0)} (hard limit $${PRE_TRADE_MAX_MARKET_CAP_USD.toFixed(0)})`
-      );
-    } else {
-      console.log(`✅ PRE-TRADE MC accepted for ${mint}: $${preTradeMc.toFixed(0)}`);
+      preTradeSnapshotPromise = targetSnapshotPromise.then((snapshot) => snapshot ?? emptyPreTradeSnapshot).catch((error: any) => {
+        console.log(`PREBUY_MC: background reconstruction failed mint=${mint} err=${error?.message ?? String(error)}`);
+        return emptyPreTradeSnapshot;
+      });
     }
 
     // Buy immediately. Market cap is measured after execution for reporting.
@@ -2419,6 +2417,7 @@ async function executeBuy(
           const winner = await Promise.any(racedCandidates);
           selectedBuilder = winner.builderName;
           rawTx = winner.rawTx;
+          console.log(`BUILD_DONE builder=${selectedBuilder} mint=${mint}`);
         } catch {
           // Every builder failed or produced a transaction rejected by simulation.
         }
@@ -2427,14 +2426,53 @@ async function executeBuy(
           console.log("âŒ Buy aborted — all builders failed for", mint);
           return;
         }
-        console.log(`⚡ SIGN: signing/submitting tx (${nowMs() - detectionTs}ms since detection)`);
+        const signStartMs = nowMs();
+        const signedTx = VersionedTransaction.deserialize(rawTx);
+        const payer = signedTx.message.staticAccountKeys[0];
+        const signatureBytes = signedTx.signatures[0];
+        if (!payer?.equals(wallet.publicKey) || signedTx.message.header.numRequiredSignatures < 1 || !signatureBytes?.some((byte) => byte !== 0)) {
+          console.log(`❌ Buy aborted — invalid payer/signature from ${selectedBuilder}: ${mint}`);
+          return;
+        }
+        const signDoneMs = nowMs();
+        const submitStartMs = nowMs();
+        console.log(`SIGN_DONE builder=${selectedBuilder} mint=${mint}`);
+        console.log(`SUBMIT_START builder=${selectedBuilder} mint=${mint}`);
+        console.log(`⚡ SIGN_START builder=${selectedBuilder} mint=${mint}`);
         sig = await sendRawTransactionDual(rawTx);
-        if (sig) console.log(`🚀 SUBMITTED (${selectedBuilder}): ${mint} ${sig} (total ${(nowMs() - detectionTs)}ms since detection)`);
+        if (sig) {
+          const acceptedMs = nowMs();
+          console.log(`HOTPATH mint=${mint} builder=${selectedBuilder === "PumpPortal-trade-local" ? "pumpportal" : "local-sdk"} build_ms=${submitStartMs - detectionTs} sign_ms=${signDoneMs - signStartMs} submit_ms=${acceptedMs - submitStartMs} total_ms=${acceptedMs - detectionTs}`);
+          console.log(`🚀 SUBMITTED (${selectedBuilder}): ${mint} ${sig} (total ${acceptedMs - detectionTs}ms since detection)`);
+        }
         if (!sig) return;
       }
 
+      if (!targetSnapshotPromise) {
+        preTradeSnapshotPromise = new Promise<PreTradeSnapshot>((resolve) => {
+          reconstructPreTradeSnapshotFromCache(mint, solAmountLamports ?? 0).then((snapshot) => {
+            resolve(snapshot ?? emptyPreTradeSnapshot);
+          }).catch((error: any) => {
+            console.log(`PREBUY_MC: background reconstruction failed mint=${mint} err=${error?.message ?? String(error)}`);
+            resolve(emptyPreTradeSnapshot);
+          });
+        });
+        console.log(`⚡ PREBUY_MC deferred until after submit: mint=${mint} policy_limit=$${PRE_TRADE_MAX_MARKET_CAP_USD.toFixed(0)}`);
+      }
+
+      void preTradeSnapshotPromise.then((snapshot) => {
+        const marketCap = snapshot.marketCapUSD;
+        if (marketCap === null || marketCap === undefined) {
+          console.log(`PREBUY_MC_POLICY result=unknown mint=${mint} limit=$${PRE_TRADE_MAX_MARKET_CAP_USD.toFixed(0)} submitted=true`);
+        } else if (shouldRejectPreTradeMarketCap(marketCap)) {
+          console.log(`PREBUY_MC_POLICY result=reject-after-submit mint=${mint} market_cap=$${marketCap.toFixed(0)} limit=$${PRE_TRADE_MAX_MARKET_CAP_USD.toFixed(0)}`);
+        } else {
+          console.log(`PREBUY_MC_POLICY result=accept mint=${mint} market_cap=$${marketCap.toFixed(0)} limit=$${PRE_TRADE_MAX_MARKET_CAP_USD.toFixed(0)}`);
+        }
+      }).catch(() => {});
+
       const myMcPromise = delayedMarketCapSnapshot(mint, 2000);
-      const targetMcPromise = Promise.resolve(preTradeSnapshot);
+      const targetMcPromise = preTradeSnapshotPromise;
       const confirmationPromise = waitForConfirmation(sig);
       let actual = await waitForBalance(mint);
       let confirmation = await confirmationPromise;
@@ -2920,7 +2958,7 @@ async function startPumpPortal() {
         seenSignatures.add(msg.signature);
         const detectionTs = nowMs();
 
-        await primeMintDerivedState(msg.mint, detectionTs).catch((e: any) => {
+        void primeMintDerivedState(msg.mint, detectionTs).catch((e: any) => {
           console.log(`PRIME_FAILED: mint=${msg.mint} dur=${nowMs() - detectionTs}ms err=${e?.message ?? String(e)}`);
         });
 
