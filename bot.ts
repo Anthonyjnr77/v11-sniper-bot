@@ -1793,7 +1793,12 @@ async function validateBuyTransaction(rawTx: Uint8Array): Promise<boolean> {
     return tx.serialize();
   } catch (e: any) {
     const elapsed = nowMs() - startMs;
-    console.log(`❌ Local Pump.fun build unavailable for ${mint}:`, e?.message ?? String(e), `(${elapsed}ms)`);
+    const errorMessage = e?.message ?? String(e);
+    if (errorMessage.includes("bonding curve is complete")) {
+      pumpFallbackCache.set(mint, Date.now() + PUMP_FALLBACK_TTL_MS);
+      console.log(`ℹ️ Bonding curve complete for ${mint}; enabling PumpSwap route`);
+    }
+    console.log(`❌ Local Pump.fun build unavailable for ${mint}:`, errorMessage, `(${elapsed}ms)`);
     return null;
   }
 }
@@ -2379,20 +2384,27 @@ async function executeBuy(
         const candidates: Array<[string, () => Promise<Uint8Array | null>]> = [];
 
         if (!isPumpFallbackActive(mint) && PUMPPORTAL_ENABLED) {
-          candidates.push(["PumpPortal-trade-local", () => buildPumpPortalTx("buy", mint, BUY_AMOUNT / 1e9, true, SLIPPAGE_BPS, "pump")]);
+          candidates.push(["PumpPortal-trade-local", async () => {
+            const tx = await buildPumpPortalTx("buy", mint, BUY_AMOUNT / 1e9, true, SLIPPAGE_BPS, "pump");
+            return isPumpFallbackActive(mint) ? null : tx;
+          }]);
         } else if (isPumpFallbackActive(mint)) {
           console.log(`ℹ️ Skipping PumpPortal build for ${mint} due to recent Anchor 6005 failures`);
         }
 
         if (PREFER_PUMPPORTAL_ONLY && PUMPPORTAL_ENABLED && !isPumpFallbackActive(mint)) {
           candidates.length = 0;
-          candidates.push(["PumpPortal-trade-local", () => buildPumpPortalTx("buy", mint, BUY_AMOUNT / 1e9, true, SLIPPAGE_BPS, "pump")]);
+          candidates.push(["PumpPortal-trade-local", async () => {
+            const tx = await buildPumpPortalTx("buy", mint, BUY_AMOUNT / 1e9, true, SLIPPAGE_BPS, "pump");
+            return isPumpFallbackActive(mint) ? null : tx;
+          }]);
         }
 
         candidates.push(["local Pump SDK", () => buildLocalPumpBuyTx(mint, SLIPPAGE_BPS)]);
+        candidates.push(["local PumpSwap SDK", () => buildLocalPumpSwapBuyTx(mint, SLIPPAGE_BPS)]);
         const orderedCandidates = orderBuyBuilders(candidates.map(([name, build]) => ({ name, kind: "direct", build }))).map(({ name, build }) => [name, build] as [string, () => Promise<Uint8Array | null>]);
 
-        // V14 hot path: only the direct bonding-curve builders are allowed. No Jupiter, no PumpSwap, no fallback routes.
+        // Keep direct builders first; PumpSwap handles tokens whose bonding curve has completed.
         const racedCandidates = orderedCandidates.map(async ([builderName, buildFn]) => {
           const bStart = nowMs();
           try {
