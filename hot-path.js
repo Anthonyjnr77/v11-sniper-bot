@@ -1,6 +1,6 @@
 export const DIRECT_BUILDER_ORDER = [
-  "PumpPortal-trade-local",
   "local Pump SDK",
+  "PumpPortal-trade-local",
   "local PumpSwap SDK",
 ];
 
@@ -33,4 +33,10 @@ export function orderBuyBuilders(candidates) {
 
     return left.name.localeCompare(right.name);
   });
+}
+
+export function selectBuyRoute({ confirmedPumpFunCurve, curveComplete, confirmedMigratedToPumpSwap }) {
+  if (confirmedPumpFunCurve && !curveComplete) return "pumpfun";
+  if (confirmedMigratedToPumpSwap) return "pumpswap";
+  return "recovery";
 }

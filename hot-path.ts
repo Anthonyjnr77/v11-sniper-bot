@@ -4,17 +4,18 @@ export interface BuyBuilderCandidate<T = Uint8Array | null> {
   build: () => Promise<T>;
 }
 
-export const PRE_TRADE_MAX_MARKET_CAP_USD = 5_000;
+export const PRE_TRADE_MAX_MARKET_CAP_USD = 6_000;
 
 export function shouldRejectPreTradeMarketCap(marketCapUsd: number | null | undefined): boolean {
   // Unknown pre-trade market caps are rejected to avoid guessing.
   if (marketCapUsd === null || marketCapUsd === undefined) return true;
-  return Number(marketCapUsd) > PRE_TRADE_MAX_MARKET_CAP_USD;
+  return Number(marketCapUsd) >= PRE_TRADE_MAX_MARKET_CAP_USD;
 }
 
 const DIRECT_BUILDER_ORDER = [
-  "PumpPortal-trade-local",
   "local Pump SDK",
+  "PumpPortal-trade-local",
+  "local PumpSwap SDK",
 ];
 
 export function orderBuyBuilders<T extends BuyBuilderCandidate>(candidates: T[]): T[] {
@@ -35,4 +36,18 @@ export function orderBuyBuilders<T extends BuyBuilderCandidate>(candidates: T[])
 
     return left.name.localeCompare(right.name);
   });
+}
+
+export function selectBuyRoute({
+  confirmedPumpFunCurve,
+  curveComplete,
+  confirmedMigratedToPumpSwap,
+}: {
+  confirmedPumpFunCurve: boolean;
+  curveComplete: boolean;
+  confirmedMigratedToPumpSwap: boolean;
+}): "pumpfun" | "pumpswap" | "recovery" {
+  if (confirmedPumpFunCurve && !curveComplete) return "pumpfun";
+  if (confirmedMigratedToPumpSwap) return "pumpswap";
+  return "recovery";
 }

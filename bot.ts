@@ -12,16 +12,15 @@ import {
 } from "@solana/web3.js";
 import type { Logs } from "@solana/web3.js";
 import { Program, AnchorProvider, BorshEventCoder } from "@coral-xyz/anchor";
-import { getMint, getAssociatedTokenAddress, getAssociatedTokenAddressSync, TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID } from "@solana/spl-token";
+import { getMint, getAssociatedTokenAddress, TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID } from "@solana/spl-token";
 import { OnlinePumpSdk, PUMP_SDK, getBuyTokenAmountFromSolAmount, bondingCurvePda } from "@pump-fun/pump-sdk";
 import { OnlinePumpAmmSdk, PUMP_AMM_PROGRAM_ID, PUMP_AMM_SDK, canonicalPumpPoolPda } from "@pump-fun/pump-swap-sdk";
 import BN from "bn.js";
-import fs from "fs";
 import fetch from "node-fetch";
 import bs58 from "bs58";
 import https from "https";
 import express from "express";
-import { PRE_TRADE_MAX_MARKET_CAP_USD, orderBuyBuilders, shouldRejectPreTradeMarketCap } from "./hot-path.js";
+import { orderBuyBuilders } from "./hot-path.js";
 
 export interface GrpcTradeEvent {
   type: "buy" | "sell";
@@ -69,13 +68,12 @@ function makeConnection(url: string, opts: { disableWs?: boolean } = {}): Connec
   if (!trimmed.startsWith("http://") && !trimmed.startsWith("https://")) {
     throw new Error(`Endpoint URL must start with http: or https:: "${trimmed}"`);
   }
-  // Decide whether to disable websockets for this connection.
-  // Priority: explicit opts.disableWs takes precedence. Otherwise, honor
-  // DISABLE_HELIUS_WS env when set to "true" and the URL looks like Helius.
-  const disableHeliusWsEnv = (process.env.DISABLE_HELIUS_WS ?? "false").toLowerCase() === "true";
-  const looksLikeHelius = trimmed.includes("helius") || trimmed.includes("api.helius") || trimmed.includes("helius.dev");
-  const finalDisableWs = Boolean(opts.disableWs) || (disableHeliusWsEnv && looksLikeHelius);
-  const wsEndpoint = finalDisableWs ? ("" as any) : trimmed.replace("https", "wss");
+  // Optionally disable websocket endpoints for Helius (free-tier) when set.
+  // This keeps Helius usable for HTTP RPC send/getLatestBlockhash but avoids
+  // opening many websocket connections that trigger 429 rate limits.
+  const disableHeliusWs = (process.env.DISABLE_HELIUS_WS ?? "false").toLowerCase() === "true";
+  const isHelius = trimmed.includes("helius") || trimmed.includes("api.helius") || trimmed.includes("helius.dev");
+  const wsEndpoint = disableHeliusWs && isHelius ? ("" as any) : trimmed.replace("https", "wss");
   return new Connection(trimmed, {
     commitment: "processed",
     wsEndpoint,
@@ -192,87 +190,6 @@ function isPumpFallbackActive(mint: string): boolean {
 const MIN_WALLET_BALANCE_SOL = Number(process.env.MIN_WALLET_BALANCE_SOL ?? 0.02);
 
 const SOL_MINT = "So11111111111111111111111111111111111111112";
-const SOL_PRICE_CACHE_TTL_MS = 60_000;
-let solPriceCache: { priceUsd: number; timestamp: number } | null = null;
-let solPriceRefresh: Promise<number | null> | null = null;
-
-function getConfiguredSolPriceUsd(): number | null {
-  const value = Number(process.env.SOL_PRICE_USD ?? 0);
-  return Number.isFinite(value) && value > 0 ? value : null;
-}
-
-async function refreshSolPriceUsd(): Promise<number | null> {
-  if (solPriceRefresh) return solPriceRefresh;
-
-  solPriceRefresh = (async () => {
-    try {
-      const response = await fetch(`https://api.jup.ag/price/v3?ids=${SOL_MINT}`, {
-        agent,
-        headers: process.env.JUP_API_KEY ? { "x-api-key": process.env.JUP_API_KEY } : undefined,
-      });
-      if (!response.ok) throw new Error(`Jupiter HTTP ${response.status}`);
-      const payload: any = await response.json();
-      const priceUsd = Number(payload?.[SOL_MINT]?.usdPrice ?? 0);
-      if (!Number.isFinite(priceUsd) || priceUsd <= 0) throw new Error("Jupiter returned no positive SOL price");
-      solPriceCache = { priceUsd, timestamp: Date.now() };
-      console.log(`SOL price updated: $${priceUsd.toFixed(2)} (Jupiter)`);
-      return priceUsd;
-    } catch (jupiterError: any) {
-      try {
-        const response = await fetch("https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT", { agent });
-        if (!response.ok) throw new Error(`Binance HTTP ${response.status}`);
-        const payload: any = await response.json();
-        const priceUsd = Number(payload?.price ?? 0);
-        if (!Number.isFinite(priceUsd) || priceUsd <= 0) throw new Error("Binance returned no positive SOL price");
-        solPriceCache = { priceUsd, timestamp: Date.now() };
-        console.log(`SOL price updated: $${priceUsd.toFixed(2)} (Binance)`);
-        return priceUsd;
-      } catch (binanceError: any) {
-        console.log(`SOL price provider failed: Jupiter=${jupiterError?.message ?? String(jupiterError)}; Binance=${binanceError?.message ?? String(binanceError)}`);
-        try {
-          const response = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd", {
-            agent,
-            headers: {
-              Accept: "application/json",
-              "User-Agent": "sniper-bot/1.0 SOL-price-client",
-            },
-          });
-          if (!response.ok) throw new Error(`CoinGecko HTTP ${response.status}`);
-          const payload: any = await response.json();
-          const priceUsd = Number(payload?.solana?.usd ?? 0);
-          if (!Number.isFinite(priceUsd) || priceUsd <= 0) throw new Error("CoinGecko returned no positive SOL price");
-          solPriceCache = { priceUsd, timestamp: Date.now() };
-          console.log(`SOL price updated: $${priceUsd.toFixed(2)} (CoinGecko)`);
-          return priceUsd;
-        } catch (coinGeckoError: any) {
-          console.log(`SOL price provider failed: CoinGecko=${coinGeckoError?.message ?? String(coinGeckoError)}`);
-          return null;
-        }
-      }
-    }
-  })().finally(() => {
-    solPriceRefresh = null;
-  });
-
-  return solPriceRefresh;
-}
-
-async function getSolPriceUsd(): Promise<number | null> {
-  if (solPriceCache && Date.now() - solPriceCache.timestamp < SOL_PRICE_CACHE_TTL_MS) {
-    return solPriceCache.priceUsd;
-  }
-
-  const livePrice = await refreshSolPriceUsd();
-  if (livePrice !== null) return livePrice;
-
-  const configuredPrice = getConfiguredSolPriceUsd();
-  if (configuredPrice !== null) {
-    console.log(`SOL price fallback: $${configuredPrice.toFixed(2)} (SOL_PRICE_USD)`);
-  } else {
-    console.log("SOL price unavailable: live providers failed and SOL_PRICE_USD is not set");
-  }
-  return configuredPrice;
-}
 
 const JUP_BASE = process.env.JUP_BASE_URL ?? "https://quote-api.jup.ag/v1";
 const JUP_LEGACY_BASE = process.env.JUP_LEGACY_BASE_URL ?? "https://api.jup.ag/swap/v1";
@@ -366,80 +283,10 @@ interface CachedBondingCurve {
   virtualTokenReserves: BN;
   realQuoteReserves: BN;
   realTokenReserves: BN;
-  tokenTotalSupply?: BN | null;
   timestamp: number;
 }
 
 const bondingCurveCache = new Map<string, CachedBondingCurve>();
-
-async function primeMintDerivedState(mint: string, detectionTs: number = nowMs()): Promise<boolean> {
-  const now = nowMs();
-  const cached = bondingCurveCache.get(mint);
-  const warm = buyStateWarmCache.get(mint);
-  const cacheFresh = Boolean(cached && warm && now - cached.timestamp < BONDING_CURVE_TTL_MS && now - warm.timestamp < 30_000);
-  if (cacheFresh) return true;
-
-  const mintKey = new PublicKey(mint);
-  const bondingCurveKey = bondingCurvePda(mintKey);
-  const primeStart = nowMs();
-  console.log(`PRIME_START: mint=${mint} ts=${Date.now()} rel=${primeStart - detectionTs}ms source=mint-derived`);
-
-  let tokenProgram = TOKEN_PROGRAM_ID;
-  let mintInfo: any = null;
-  try {
-    mintInfo = await pumpSdkConnection.getAccountInfo(mintKey, "processed");
-    if (mintInfo?.owner) {
-      tokenProgram = mintInfo.owner;
-    }
-  } catch (e: any) {
-    console.log(`PRIME_OP_FAILED: mintInfo.getAccountInfo dur=${nowMs() - primeStart}ms err=${e?.message ?? String(e)}`);
-  }
-
-  const associatedBondingCurveKey = getAssociatedTokenAddressSync(mintKey, bondingCurveKey, true, tokenProgram);
-
-  const [bcAccount, abcAccount, feeConfig, global, mintState, buyState] = await Promise.all([
-    pumpSdkConnection.getAccountInfo(bondingCurveKey, "processed"),
-    pumpSdkConnection.getAccountInfo(associatedBondingCurveKey, "processed"),
-    warm?.feeConfig && now - warm.timestamp < 60_000 ? Promise.resolve(warm.feeConfig) : pumpSdkForBuild.fetchFeeConfig(),
-    warm?.global && now - warm.timestamp < 60_000 ? Promise.resolve(warm.global) : pumpSdkForBuild.fetchGlobal(),
-    warm?.mintState && now - warm.timestamp < 60_000 ? Promise.resolve(warm.mintState) : getMint(pumpSdkConnection, mintKey, "processed", tokenProgram),
-    warm?.buyState && now - warm.timestamp < 60_000 ? Promise.resolve(warm.buyState) : pumpSdkForBuild.fetchBuyState(mintKey, wallet.publicKey, tokenProgram),
-  ]);
-
-  let populated = false;
-  try {
-    if (bcAccount?.data && bcAccount.data.length >= 48) {
-      const data = bcAccount.data;
-      const virtualTokenReserves = new BN(data.subarray(8, 16).readBigUInt64LE(0).toString());
-      const virtualQuoteReserves = new BN(data.subarray(16, 24).readBigUInt64LE(0).toString());
-      const realTokenReserves = new BN(data.subarray(24, 32).readBigUInt64LE(0).toString());
-      const realQuoteReserves = new BN(data.subarray(32, 40).readBigUInt64LE(0).toString());
-      const tokenTotalSupply = new BN(data.subarray(40, 48).readBigUInt64LE(0).toString());
-      bondingCurveCache.set(mint, {
-        bondingCurve: bondingCurveKey,
-        associatedBondingCurve: associatedBondingCurveKey,
-        virtualTokenReserves,
-        virtualQuoteReserves,
-        realTokenReserves,
-        realQuoteReserves,
-        tokenTotalSupply,
-        timestamp: Date.now(),
-      });
-      populated = true;
-    }
-  } catch (e: any) {
-    console.log(`PRIME_FAILED: mint=${mint} dur=${nowMs() - primeStart}ms err=${e?.message ?? String(e)}`);
-    return false;
-  }
-
-  if (buyState && mintState && feeConfig && global) {
-    buyStateWarmCache.set(mint, { timestamp: Date.now(), buyState, mintState, feeConfig, global });
-  }
-
-  const primeEnd = nowMs();
-  console.log(`PRIME_COMPLETE: mint=${mint} totalDur=${primeEnd - primeStart}ms populated=${populated} source=mint-derived buyStateWarmCache=${buyState ? "present" : "absent"} feeConfig=${feeConfig ? "present" : "absent"} global=${global ? "present" : "absent"}`);
-  return populated;
-}
 
 // Pump.fun global PDA (constant, never changes)
 const PUMPFUN_GLOBAL_PDA = new PublicKey("4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf");
@@ -483,17 +330,13 @@ async function refreshPrebuildCache() {
         if (bcAccount?.data && abcAccount?.data && feeConfig) {
           const data = bcAccount.data;
           if (data.length >= 48) {
-            // Anchor/SDK BondingCurve layout: discriminator (8) then
-            // virtualTokenReserves (8), virtualQuoteReserves (8),
-            // realTokenReserves (8), realQuoteReserves (8), tokenTotalSupply (8)
             prebuildCache.set(mint, {
               bondingCurve: bondingCurveAddress,
               associatedBondingCurve: associatedBondingCurve,
-              virtualTokenReserves: new BN(data.subarray(8, 16).readBigUInt64LE(0).toString()),
-              virtualQuoteReserves: new BN(data.subarray(16, 24).readBigUInt64LE(0).toString()),
-              realTokenReserves: new BN(data.subarray(24, 32).readBigUInt64LE(0).toString()),
-              realQuoteReserves: new BN(data.subarray(32, 40).readBigUInt64LE(0).toString()),
-              tokenTotalSupply: data.length >= 48 ? new BN(data.subarray(40, 48).readBigUInt64LE(0).toString()) : null,
+              virtualQuoteReserves: new BN(data.subarray(8, 16).readBigUInt64LE(0).toString()),
+              virtualTokenReserves: new BN(data.subarray(16, 24).readBigUInt64LE(0).toString()),
+              realQuoteReserves: new BN(data.subarray(24, 32).readBigUInt64LE(0).toString()),
+              realTokenReserves: new BN(data.subarray(32, 40).readBigUInt64LE(0).toString()),
               timestamp: Date.now(),
             });
             cached++;
@@ -518,8 +361,10 @@ refreshPrebuildCache();
 // Isolate SDK read traffic from detection/write traffic so free-tier Helius
 // rate limits on detection WS don't starve the buy builder.
 const PUMP_SDK_RPC_URL = process.env.PUMP_SDK_RPC_URL ?? "https://rpc.ankr.com/solana";
-const pumpSdkConnection = makeConnection(PUMP_SDK_RPC_URL, {
-  disableWs: (process.env.DISABLE_HELIUS_WS ?? "false").toLowerCase() === "true",
+const pumpSdkConnection = new Connection(PUMP_SDK_RPC_URL, {
+  commitment: "processed",
+  wsEndpoint: PUMP_SDK_RPC_URL.replace("https", "wss"),
+  httpAgent: agent,
 });
 const pumpSdkForBuild = new OnlinePumpSdk(pumpSdkConnection);
 const pumpAmmSdkForBuild = new OnlinePumpAmmSdk(pumpSdkConnection);
@@ -554,7 +399,12 @@ verifyPumpSdkRpc().catch(() => {});
 // Set BUY_EXEC_RPC_URL to a premium endpoint (Helius paid, Triton, QuickNode, etc.)
 // Falls back to main RPC if not set.
 const BUY_EXEC_RPC_URL = process.env.BUY_EXEC_RPC_URL ?? RPC_URL;
-const buyExecConnection = makeConnection(BUY_EXEC_RPC_URL, { disableWs: true });
+const buyExecConnection = new Connection(BUY_EXEC_RPC_URL, {
+  commitment: "processed",
+  httpAgent: agent,
+  // Disable WS for this connection - we only need HTTP for sendRawTransaction
+  wsEndpoint: "" as any,
+});
 
 
 const originalLog = console.log;
@@ -573,11 +423,6 @@ const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const TELEGRAM_EXTENDED = (process.env.TELEGRAM_EXTENDED ?? "false").toLowerCase() === "true";
 const TELEGRAM_COOLDOWN_MS = Number(process.env.TELEGRAM_COOLDOWN_MS ?? 5000);
 const TELEGRAM_COOLDOWN_NOTIFY_MS = Number(process.env.TELEGRAM_COOLDOWN_NOTIFY_MS ?? 60_000);
-const TELEGRAM_WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET || "mysecret123";
-const TELEGRAM_WEBHOOK_MODE = (process.env.TELEGRAM_WEBHOOK_MODE ?? "true").toLowerCase() !== "false" && !!TELEGRAM_BOT_TOKEN;
-const TELEGRAM_WEBHOOK_ROUTE = `/telegram-webhook/${TELEGRAM_WEBHOOK_SECRET}`;
-const TELEGRAM_WEBHOOK_URL = process.env.TELEGRAM_WEBHOOK_URL ||
-  (process.env.RENDER_EXTERNAL_URL ? `${process.env.RENDER_EXTERNAL_URL.replace(/\/$/, "")}${TELEGRAM_WEBHOOK_ROUTE}` : `http://localhost:${process.env.PORT || 3000}${TELEGRAM_WEBHOOK_ROUTE}`);
 
 // Rate-limiting state per chat to avoid command floods
 const telegramLastCommandAt = new Map<string, number>();
@@ -604,117 +449,6 @@ async function sendTelegramAlert(message: string) {
     });
   } catch (e: any) {
     console.log("Telegram alert failed:", e.message);
-  }
-}
-
-async function sendTelegramMessage(chatId: number | string, text: string) {
-  if (!TELEGRAM_BOT_TOKEN) return;
-  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-  try {
-    await fetch(url, {
-      agent,
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: chatId,
-        text,
-        parse_mode: "HTML",
-      }),
-    });
-  } catch (e: any) {
-    console.log("Telegram message failed:", e.message);
-  }
-}
-
-async function setupTelegramWebhook() {
-  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_WEBHOOK_MODE) return;
-  try {
-    const deleteUrl = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/deleteWebhook`;
-    await fetch(deleteUrl, {
-      agent,
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ drop_pending_updates: true }),
-    }).catch(() => undefined);
-
-    const setUrl = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook`;
-    const res = await fetch(setUrl, {
-      agent,
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        url: TELEGRAM_WEBHOOK_URL,
-        drop_pending_updates: true,
-      }),
-    });
-    const data = await res.json().catch(() => ({}));
-    console.log("Webhook setup result:", data);
-  } catch (e: any) {
-    console.log("Webhook setup failed:", e?.message ?? String(e));
-  }
-}
-
-async function handleTelegramCommandMessage(msg: any) {
-  if (!msg || String(msg.chat?.id) !== String(TELEGRAM_CHAT_ID)) return;
-
-  const chatId = String(msg.chat?.id);
-  const now = Date.now();
-  const last = telegramLastCommandAt.get(chatId) ?? 0;
-  if (now - last < TELEGRAM_COOLDOWN_MS) {
-    const lastNotify = telegramLastNotifyAt.get(chatId) ?? 0;
-    if (now - lastNotify > TELEGRAM_COOLDOWN_NOTIFY_MS) {
-      telegramLastNotifyAt.set(chatId, now);
-      try {
-        await sendTelegramAlert(`Please wait ${Math.ceil((TELEGRAM_COOLDOWN_MS - (now - last)) / 1000)}s before sending another command.`);
-      } catch {
-        // ignore notify failures
-      }
-    }
-    return;
-  }
-
-  const msgAgeSec = Math.floor(Date.now() / 1000) - (msg.date ?? 0);
-  if (msgAgeSec > 30) {
-    console.log(`⏩ Skipping stale Telegram update (${msgAgeSec}s old): ${msg.text}`);
-    return;
-  }
-
-  const text = (msg.text ?? "").trim().toLowerCase();
-  if (text === "/pause") {
-    telegramLastCommandAt.set(chatId, Date.now());
-    botPaused = true;
-    console.log("⏸ Bot PAUSED via Telegram command");
-    await sendTelegramAlert("⏸ <b>Bot paused.</b> No new buys will be taken. Existing positions still monitored/sold normally. Send /resume to continue.");
-  } else if (text === "/resume") {
-    telegramLastCommandAt.set(chatId, Date.now());
-    botPaused = false;
-    console.log("▶ Bot RESUMED via Telegram command");
-    await sendTelegramAlert("▶ <b>Bot resumed.</b> New buys re-enabled.");
-  } else if (text === "/status") {
-    telegramLastCommandAt.set(chatId, Date.now());
-    const balanceStr = lastKnownBalanceLamports !== null
-      ? `${(lastKnownBalanceLamports / 1e9).toFixed(4)} SOL`
-      : "unknown";
-    await sendTelegramAlert(
-      `📢 <b>Status</b>\n` +
-      `Paused: ${botPaused ? "YES" : "no"}\n` +
-      `Open positions: ${positions.size}\n` +
-      `Wallet: ${balanceStr}\n` +
-      `WS channels: ${DETECTION_URLS.length}\n` +
-      `PumpPortal: ${pumpPortalConnected ? "✅ connected" : "❌ NOT connected"}`
-    );
-  } else if (text === "/positions" && TELEGRAM_EXTENDED) {
-    telegramLastCommandAt.set(chatId, Date.now());
-    await sendTelegramAlert(await getTelegramPositionsText());
-  } else if (text === "/stats" && TELEGRAM_EXTENDED) {
-    telegramLastCommandAt.set(chatId, Date.now());
-    await sendTelegramAlert(await getTelegramStatsText());
-  } else if (text === "/history" && TELEGRAM_EXTENDED) {
-    telegramLastCommandAt.set(chatId, Date.now());
-    await sendTelegramAlert(await getTelegramHistoryText());
-  } else if (text === "/settings" && TELEGRAM_EXTENDED) {
-    telegramLastCommandAt.set(chatId, Date.now());
-    await sendTelegramAlert(await getTelegramSettingsText());
   }
 }
 
@@ -972,7 +706,6 @@ function jupHeaders(extra: Record<string, string> = {}) {
 
 let cachedBlockhash: string | null = null;
 let cachedBlockhashAt = 0;
-let cachedLastValidBlockHeight: number | null = null;
 
 // Background blockhash refresher - keeps cache warm without blocking hot path
 let blockhashRefreshInterval: NodeJS.Timeout | null = null;
@@ -1001,9 +734,8 @@ async function refreshBlockhash() {
   try {
     // Use the fastest submission RPC for lowest blockhash latency.
     const fastest = getFastestSubmissionConnection();
-    const { blockhash, lastValidBlockHeight } = await fastest.getLatestBlockhash("processed");
+    const { blockhash } = await fastest.getLatestBlockhash("processed");
     cachedBlockhash = blockhash;
-    cachedLastValidBlockHeight = lastValidBlockHeight;
     cachedBlockhashAt = Date.now();
   } catch {
     // keep the old one
@@ -1118,39 +850,6 @@ async function redisGet(key: string): Promise<string | null> {
   }
 }
 
-// Upstash leader-lock helpers for Telegram polling
-async function acquireTelegramLeaderLock(key: string, ttlSec: number): Promise<boolean> {
-  if (!UPSTASH_URL || !UPSTASH_TOKEN) return true; // best-effort: allow polling when Upstash not configured
-  try {
-    const url = `${UPSTASH_URL}/set/${encodeURIComponent(key)}?nx=true&ex=${Math.max(1, Math.floor(ttlSec))}`;
-    const res = await fetch(url, {
-      agent,
-      method: "POST",
-      headers: { Authorization: `Bearer ${UPSTASH_TOKEN}`, "Content-Type": "text/plain" },
-      body: "1",
-    });
-    // Upstash returns a JSON result object for set; treat any truthy `result` as success
-    const data: any = await res.json().catch(() => null);
-    return !!data?.result || res.status === 200;
-  } catch (e: any) {
-    console.log(`acquireTelegramLeaderLock(${key}) error:`, e?.message ?? e);
-    return false;
-  }
-}
-
-async function releaseTelegramLeaderLock(key: string): Promise<void> {
-  if (!UPSTASH_URL || !UPSTASH_TOKEN) return;
-  try {
-    await fetch(`${UPSTASH_URL}/del/${encodeURIComponent(key)}`, {
-      agent,
-      method: "POST",
-      headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` },
-    });
-  } catch (e: any) {
-    console.log(`releaseTelegramLeaderLock(${key}) error:`, e?.message ?? e);
-  }
-}
-
 async function persistPositions() {
   const serialized = JSON.stringify(Array.from(positions.entries()));
   await redisSet("positions", serialized);
@@ -1230,32 +929,12 @@ let pumpPortalConnected = false;
 let botPaused = false;
 let telegramUpdateOffset = 0;
 const processedUpdateIds = new Set<number>();
-let telegramPollingDisabledUntil = 0;
-const TELEGRAM_POLL_INTERVAL_MS = Number(process.env.TELEGRAM_POLL_INTERVAL_MS ?? 30_000);
-const TELEGRAM_GETUPDATES_TIMEOUT_SEC = Number(process.env.TELEGRAM_GETUPDATES_TIMEOUT_SEC ?? 30);
-const TELEGRAM_POLL_BACKOFF_MS = Number(process.env.TELEGRAM_POLL_BACKOFF_MS ?? 5 * 60 * 1000);
 
 async function pollTelegramCommands() {
-  if (TELEGRAM_WEBHOOK_MODE) return;
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
-  if (Date.now() < telegramPollingDisabledUntil) return;
   try {
-    // Use long polling (timeout in seconds) to reduce frequency of requests.
-    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?offset=${telegramUpdateOffset}&timeout=${TELEGRAM_GETUPDATES_TIMEOUT_SEC}`;
-    let data: any;
-    try {
-      data = await fetchJson(url, {}, 2);
-    } catch (e: any) {
-      const msg = String(e?.message ?? e);
-      // Detect Telegram 409 conflict (another getUpdates owner) and back off to avoid constant 409 spam.
-      if (msg.includes("409") || /Conflict|terminated by other getUpdates/i.test(msg)) {
-        console.log(`[33mTelegram polling conflict detected: ${msg}. Backing off ${TELEGRAM_POLL_BACKOFF_MS / 1000}s[0m`);
-        telegramPollingDisabledUntil = Date.now() + TELEGRAM_POLL_BACKOFF_MS;
-        return;
-      }
-      throw e;
-    }
-    if (!data?.result) return;
+    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?offset=${telegramUpdateOffset}&timeout=0`;
+    const data: any = await fetchJson(url);
     if (!data?.result) return;
 
     for (const update of data.result) {
@@ -1271,7 +950,67 @@ async function pollTelegramCommands() {
       telegramUpdateOffset = updateId + 1;
       const msg = update.message;
       if (!msg || String(msg.chat?.id) !== String(TELEGRAM_CHAT_ID)) continue;
-      await handleTelegramCommandMessage(msg);
+
+      // Rate-limit commands per chat
+      const chatId = String(msg.chat?.id);
+      const now = Date.now();
+      const last = telegramLastCommandAt.get(chatId) ?? 0;
+      if (now - last < TELEGRAM_COOLDOWN_MS) {
+        const lastNotify = telegramLastNotifyAt.get(chatId) ?? 0;
+        if (now - lastNotify > TELEGRAM_COOLDOWN_NOTIFY_MS) {
+          telegramLastNotifyAt.set(chatId, now);
+          try {
+            await sendTelegramAlert(`Please wait ${Math.ceil((TELEGRAM_COOLDOWN_MS - (now - last)) / 1000)}s before sending another command.`);
+          } catch {
+            // ignore notify failures
+          }
+        }
+        continue;
+      }
+      // Ignore stale updates (older than 30s) — prevents reprocessing on restart
+      const msgAgeSec = Math.floor(Date.now() / 1000) - (msg.date ?? 0);
+      if (msgAgeSec > 30) {
+        console.log(`⏩ Skipping stale Telegram update (${msgAgeSec}s old): ${msg.text}`);
+        continue;
+      }
+
+      const text = (msg.text ?? "").trim().toLowerCase();
+      if (text === "/pause") {
+        telegramLastCommandAt.set(chatId, Date.now());
+        botPaused = true;
+        console.log("\u{23F8} Bot PAUSED via Telegram command");
+        await sendTelegramAlert("\u{23F8} <b>Bot paused.</b> No new buys will be taken. Existing positions still monitored/sold normally. Send /resume to continue.");
+      } else if (text === "/resume") {
+        telegramLastCommandAt.set(chatId, Date.now());
+        botPaused = false;
+        console.log("\u{25B6} Bot RESUMED via Telegram command");
+        await sendTelegramAlert("\u{25B6} <b>Bot resumed.</b> New buys re-enabled.");
+      } else if (text === "/status") {
+        telegramLastCommandAt.set(chatId, Date.now());
+        const balanceStr = lastKnownBalanceLamports !== null
+          ? `${(lastKnownBalanceLamports / 1e9).toFixed(4)} SOL`
+          : "unknown";
+        await sendTelegramAlert(
+          `\u{1F4E2} <b>Status</b>\n` +
+          `Paused: ${botPaused ? "YES" : "no"}\n` +
+          `Open positions: ${positions.size}\n` +
+          `Wallet: ${balanceStr}\n` +
+          `WS channels: ${DETECTION_URLS.length}\n` +
+          `PumpPortal: ${pumpPortalConnected ? "\u{2705} connected" : "\u{274C} NOT connected"}`
+        );
+      } else if (text === "/positions" && TELEGRAM_EXTENDED) {
+        telegramLastCommandAt.set(chatId, Date.now());
+        await sendTelegramAlert(await getTelegramPositionsText());
+      } else if (text === "/stats" && TELEGRAM_EXTENDED) {
+        telegramLastCommandAt.set(chatId, Date.now());
+        await sendTelegramAlert(await getTelegramStatsText());
+      } else if (text === "/history" && TELEGRAM_EXTENDED) {
+        telegramLastCommandAt.set(chatId, Date.now());
+        await sendTelegramAlert(await getTelegramHistoryText());
+      } else if (text === "/settings" && TELEGRAM_EXTENDED) {
+        telegramLastCommandAt.set(chatId, Date.now());
+        await sendTelegramAlert(await getTelegramSettingsText());
+      }
     }
   } catch (e: any) {
     console.log("Telegram poll error:", e.message);
@@ -1508,17 +1247,10 @@ async function refreshPriorityFee() {
   }
 }
 
-// Refresh priority fee periodically (skip if a forced priority fee is configured)
-if (FORCE_PRIORITY_FEE === 0) {
-  setInterval(refreshPriorityFee, PRIORITY_FEE_TTL_MS);
-  // Initial fetch
-  refreshPriorityFee();
-} else {
-  // Ensure forced fee is recorded in the cache
-  dynamicPriorityFeeLamports = FORCE_PRIORITY_FEE;
-  lastPriorityFeeUpdate = Date.now();
-  console.log(`⚡ Using forced priority fee (no RPC sampling): ${FORCE_PRIORITY_FEE} lamports`);
-}
+// Refresh priority fee periodically
+setInterval(refreshPriorityFee, PRIORITY_FEE_TTL_MS);
+// Initial fetch
+refreshPriorityFee();
 
 function getDynamicPriorityFee(): number {
   if (FORCE_PRIORITY_FEE > 0) return FORCE_PRIORITY_FEE;
@@ -1557,10 +1289,7 @@ async function submitSignedTransaction(rawBytes: Uint8Array, useJito = true): Pr
   const orderedPairs = [...submissionPairs].sort((a, b) => (submissionRpcPenalties.get(a.url) ?? 0) - (submissionRpcPenalties.get(b.url) ?? 0));
   const rpcAttempts = orderedPairs.map(({ url, conn }) =>
     conn.sendRawTransaction(rawBytes, { skipPreflight: true, maxRetries: 0 })
-      .then(() => {
-        console.log(`RPC_ACCEPTED signature=${signature}`);
-        return "RPC";
-      })
+      .then(() => "RPC")
       .catch((err: any) => {
         submissionRpcPenalties.set(url, (submissionRpcPenalties.get(url) ?? 0) + 1);
         console.log(`⚠️ RPC submit failure ${url}:`, err?.message ?? String(err));
@@ -1574,14 +1303,19 @@ async function submitSignedTransaction(rawBytes: Uint8Array, useJito = true): Pr
   if (useJito && JITO_BLOCK_ENGINE_URL) {
     jitoAttempt = (async () => {
       try {
+        const blockhash = await getBlockhashFast();
+        const tipLamports = JITO_TIP_LAMPORTS();
         const res = await fetchJson(JITO_BLOCK_ENGINE_URL, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            jsonrpc: "2.0",
-            id: 1,
-            method: "sendBundle",
-            params: [[bs58.encode(rawBytes)], { encoding: "base58" }],
+            transactions: [bs58.encode(rawBytes)],
+            aggregation: "none",
+            maxNumberOfTransactionsInBundle: 1,
+            bundleSigner: wallet.publicKey.toString(),
+            tip: tipLamports,
+            clientId: "solana-sniper-bot",
+            blockhash,
           }),
         });
         if (res?.result) {
@@ -1656,21 +1390,6 @@ async function sendSwapDual(txBase64: string): Promise<string | null> {
 
 async function sendRawTransactionDual(rawTx: Uint8Array): Promise<string | null> {
   return submitSignedTransaction(rawTx);
-}
-
-function validateSignedBuyTransaction(rawTx: Uint8Array): boolean {
-  try {
-    const tx = VersionedTransaction.deserialize(rawTx);
-    const payer = tx.message.staticAccountKeys[0];
-    const signature = tx.signatures[0];
-    return Boolean(
-      payer?.equals(wallet.publicKey) &&
-      tx.message.header.numRequiredSignatures >= 1 &&
-      signature?.some((byte) => byte !== 0)
-    );
-  } catch {
-    return false;
-  }
 }
 
 async function validateBuyTransaction(rawTx: Uint8Array): Promise<boolean> {
@@ -1774,7 +1493,7 @@ async function validateBuyTransaction(rawTx: Uint8Array): Promise<boolean> {
     }
 
     const dynamicFee = getDynamicPriorityFee();
-    const dynamicComputeUnits = LOCAL_PUMP_COMPUTE_UNITS; // avoid hot-path simulation
+    const dynamicComputeUnits = await simulateAndGetComputeUnits(pumpSdkConnection, instructions, wallet.publicKey);
     const priorityMicroLamports = Math.ceil((dynamicFee * 1_000_000) / dynamicComputeUnits);
     const message = new TransactionMessage({
       payerKey: wallet.publicKey,
@@ -1793,249 +1512,7 @@ async function validateBuyTransaction(rawTx: Uint8Array): Promise<boolean> {
     return tx.serialize();
   } catch (e: any) {
     const elapsed = nowMs() - startMs;
-    const errorMessage = e?.message ?? String(e);
-    if (errorMessage.includes("bonding curve is complete")) {
-      pumpFallbackCache.set(mint, Date.now() + PUMP_FALLBACK_TTL_MS);
-      console.log(`ℹ️ Bonding curve complete for ${mint}; enabling PumpSwap route`);
-    }
-    console.log(`❌ Local Pump.fun build unavailable for ${mint}:`, errorMessage, `(${elapsed}ms)`);
-    return null;
-  }
-}
-
-// Attempt to reconstruct the pre-buy market-cap using the current cache,
-// but prime the mint-derived state first if the cache is empty so a valid buy
-// is not rejected before the local Pump SDK path has a chance to fetch it.
-async function reconstructPreTradeSnapshotFromCache(mint: string, solAmountLamports: number) {
-  try {
-    const primeStart = nowMs();
-    const primed = await primeMintDerivedState(mint, primeStart).catch((e: any) => {
-      console.log(`PREBUY_MC: PRIME_FALLBACK_FAILED mint=${mint} dur=${nowMs() - primeStart}ms err=${e?.message ?? String(e)}`);
-      return false;
-    });
-    if (!primed) {
-      console.log(`PREBUY_MC: cache-prime attempted for ${mint} (primed=${primed})`);
-    }
-
-    const cached = bondingCurveCache.get(mint);
-    const warm = buyStateWarmCache.get(mint);
-    const missingTop: string[] = [];
-    if (!cached) missingTop.push("bondingCurveCache");
-    if (!warm) missingTop.push("buyStateWarmCache");
-    if (missingTop.length > 0) {
-      const diagTop = {
-        bondingCurveCache: !!cached,
-        buyStateWarmCache: !!warm,
-      };
-      console.log(`PREBUY_MC: UNKNOWN reason=missing_top ${missingTop.join(",")} diag=${JSON.stringify(diagTop)}`);
-      return null;
-    }
-
-    // Narrow types for TS after presence checks
-    const cachedState = cached!;
-    const warmState = warm!;
-
-    const Q_post = cachedState.virtualQuoteReserves; // BN
-    const T_post = cachedState.virtualTokenReserves; // BN
-    const realTokenReserves = cachedState.realTokenReserves;
-    const mintSupplyRaw = cachedState.tokenTotalSupply ?? warmState.mintState?.supply;
-    const feeConfig = warmState.feeConfig;
-    const missing: string[] = [];
-    if (!Q_post) missing.push("virtualQuoteReserves");
-    if (!T_post) missing.push("virtualTokenReserves");
-    if (!realTokenReserves) missing.push("realTokenReserves");
-    if (!mintSupplyRaw) missing.push("tokenTotalSupply");
-    if (!feeConfig) missing.push("feeConfig");
-    if (missing.length > 0) {
-      const diag = {
-        bondingCurveCache_present: !!cached,
-        buyStateWarmCache_present: !!warm,
-        virtualTokenReserves: T_post ? (typeof T_post.toString === 'function' ? T_post.toString() : String(T_post)) : null,
-        virtualQuoteReserves: Q_post ? (typeof Q_post.toString === 'function' ? Q_post.toString() : String(Q_post)) : null,
-        realTokenReserves: realTokenReserves ? (typeof realTokenReserves.toString === 'function' ? realTokenReserves.toString() : String(realTokenReserves)) : null,
-        realQuoteReserves: cachedState.realQuoteReserves ? (typeof cachedState.realQuoteReserves.toString === 'function' ? cachedState.realQuoteReserves.toString() : String(cachedState.realQuoteReserves)) : null,
-        tokenTotalSupply_cached: cachedState.tokenTotalSupply != null ? (typeof cachedState.tokenTotalSupply.toString === 'function' ? cachedState.tokenTotalSupply.toString() : String(cachedState.tokenTotalSupply)) : null,
-        mintState_supply: warmState.mintState?.supply ?? null,
-        feeConfig_present: !!feeConfig,
-      };
-      console.log(`PREBUY_MC: UNKNOWN reason=missing ${missing.join(",")} diag=${JSON.stringify(diag)}`);
-      return null;
-    }
-
-    // Extract fee tiers from feeConfig. Prefer SDK shape: feeConfig.feeTiers
-    // where each tier has { marketCapLamportsThreshold: BN, fees: { protocolFeeBps, creatorFeeBps } }
-    let sdkFeeTiers: Array<{ threshold: BN | null; totalFeeBps: number }> = [];
-    try {
-      if (feeConfig) {
-        if (Array.isArray(feeConfig.feeTiers) && feeConfig.feeTiers.length > 0) {
-          sdkFeeTiers = feeConfig.feeTiers.map((t: any) => {
-            const thr = t.marketCapLamportsThreshold ?? t.marketCap ?? null;
-            const thrBN = thr == null ? null : (typeof thr === "object" && typeof thr.toString === "function" ? new BN(thr.toString()) : new BN(String(thr)));
-            const protocol = t.fees?.protocolFeeBps ?? t.protocolFeeBps ?? 0;
-            const creator = t.fees?.creatorFeeBps ?? t.creatorFeeBps ?? 0;
-            const p = typeof protocol === "object" && typeof protocol.toString === "function" ? Number(new BN(protocol.toString()).toString()) : Number(protocol || 0);
-            const c = typeof creator === "object" && typeof creator.toString === "function" ? Number(new BN(creator.toString()).toString()) : Number(creator || 0);
-            return { threshold: thrBN, totalFeeBps: p + c };
-          });
-        } else if (Array.isArray(feeConfig.tiers) && feeConfig.tiers.length > 0) {
-          // fallback shape
-          sdkFeeTiers = feeConfig.tiers.map((t: any) => ({ threshold: null, totalFeeBps: Number(t.feeBps) }));
-        } else if (Array.isArray(feeConfig) && feeConfig.length > 0) {
-          sdkFeeTiers = feeConfig.map((t: any) => ({ threshold: null, totalFeeBps: Number(t.feeBps) }));
-        }
-      }
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      console.log(`PREBUY_MC: UNKNOWN reason=feeTiers_parse_error ${errorMessage}`);
-      return null;
-    }
-
-    if (sdkFeeTiers.length === 0) {
-      const feeDiag = {
-        feeConfig_present: !!feeConfig,
-        feeConfig_keys: feeConfig ? Object.keys(feeConfig).slice(0, 10) : null,
-        feeConfig_sample: feeConfig && typeof feeConfig === 'object' ? JSON.stringify(Object.entries(feeConfig).slice(0, 5)) : null,
-        sdkFeeTiers_length: sdkFeeTiers.length,
-      };
-      console.log(`PREBUY_MC: UNKNOWN reason=missing_feeTiers diag=${JSON.stringify(feeDiag)}`);
-      return null;
-    }
-
-    const candidateBps = [...new Set(sdkFeeTiers
-      .map((tier) => Number(tier.totalFeeBps))
-      .filter((feeBps) => Number.isFinite(feeBps) && feeBps >= 0))];
-    if (candidateBps.length === 0) {
-      console.log(`PREBUY_MC: UNKNOWN reason=no_valid_fee_candidates sdkFeeTiers=${JSON.stringify(sdkFeeTiers)}`);
-      return null;
-    }
-
-    // The bot always buys BUY_AMOUNT; decoded target-trade amounts can be zero
-    // when polling cannot decode the source transaction's buy log.
-    const requestedAmount = Number(solAmountLamports ?? 0);
-    const reconstructionAmount = Number.isFinite(requestedAmount) && requestedAmount > 0
-      ? requestedAmount
-      : BUY_AMOUNT;
-    if (!Number.isFinite(reconstructionAmount) || reconstructionAmount <= 0) {
-      console.log(`PREBUY_MC: UNKNOWN reason=missing_trade_amount requested=${String(solAmountLamports)} configured=${String(BUY_AMOUNT)}`);
-      return null;
-    }
-    const solAmtBn = new BN(Math.trunc(reconstructionAmount));
-
-    const LAMPORTS = new BN(1e9);
-    const solPriceUsd = await getSolPriceUsd() ?? Number(warmState.global?.solPriceUsd ?? warmState.global?.solUsdPrice ?? 0);
-    if (!solPriceUsd || solPriceUsd <= 0) {
-      const solDiag = {
-        env_SOL_PRICE_USD: process.env.SOL_PRICE_USD ?? null,
-        warm_global_present: !!warmState.global,
-        warm_global_keys: warmState.global ? Object.keys(warmState.global).slice(0, 10) : null,
-        solPriceUsd_resolved: solPriceUsd,
-      };
-      console.log(`PREBUY_MC: UNKNOWN reason=missing_solPriceUsd diag=${JSON.stringify(solDiag)}`);
-      return null;
-    }
-
-    let lastSelectedFeeBps: number | null = null;
-    let lastTotalFeeBps: number | null = null;
-    let lastSkipReason: string | null = null;
-    let lastSelectionError: string | null = null;
-    for (const totalFeeBps of candidateBps) {
-      lastTotalFeeBps = totalFeeBps;
-      // inputAmount = floor((amount - 1) * 10000 / (10000 + totalFeeBps))
-      const A = solAmtBn.subn(1).mul(new BN(10000));
-      const D = new BN(10000 + totalFeeBps);
-      if (A.lt(new BN(0))) {
-        lastSkipReason = "negative_fee_adjusted_amount";
-        continue;
-      }
-      const inputAmount = A.div(D);
-      if (Q_post.lte(inputAmount)) {
-        lastSkipReason = "input_exceeds_virtual_quote_reserves";
-        continue;
-      }
-      const numer = inputAmount.mul(T_post);
-      const denom = Q_post.sub(inputAmount);
-      if (denom.lte(new BN(0))) {
-        lastSkipReason = "non_positive_curve_denominator";
-        continue;
-      }
-      const xCand = numer.div(denom);
-      let finalTokens = xCand;
-      if (realTokenReserves && xCand.gte(realTokenReserves)) finalTokens = realTokenReserves;
-
-      const virtualTokenReserves_pre = T_post.add(finalTokens);
-      const virtualQuoteReserves_pre = Q_post.sub(inputAmount);
-      if (virtualTokenReserves_pre.lte(new BN(0)) || virtualQuoteReserves_pre.lte(new BN(0))) {
-        lastSkipReason = "non_positive_pre_trade_reserves";
-        continue;
-      }
-
-      const mintSupplyBN = typeof mintSupplyRaw === "bigint" ? new BN(mintSupplyRaw.toString()) : new BN(String(mintSupplyRaw));
-
-      const preMarketCapQuote = virtualQuoteReserves_pre.mul(mintSupplyBN).div(virtualTokenReserves_pre); // in lamports*units
-      // Convert quote (lamports) to SOL and then to USD
-      const preMarketCapSol = Number(preMarketCapQuote.div(LAMPORTS).toString());
-      const preMarketCapUsd = preMarketCapSol * solPriceUsd;
-
-      let selectedFeeBps: number | null = null;
-      try {
-        const tiersWithThresh = sdkFeeTiers.filter((t): t is { threshold: BN; totalFeeBps: number } => t.threshold != null);
-        if (tiersWithThresh.length > 0) {
-          const sorted = tiersWithThresh.slice().sort((a, b) => a.threshold.cmp(b.threshold));
-          const firstTier = sorted[0];
-          const preMarketCapLamports = preMarketCapQuote;
-          if (firstTier && preMarketCapLamports.lt(firstTier.threshold)) {
-            selectedFeeBps = firstTier.totalFeeBps;
-          } else if (firstTier) {
-            const matchedTier = sorted.slice().reverse().find((tier) => preMarketCapLamports.gte(tier.threshold));
-            selectedFeeBps = matchedTier?.totalFeeBps ?? firstTier.totalFeeBps;
-          }
-        } else {
-          const firstSdk = sdkFeeTiers[0];
-          selectedFeeBps = firstSdk ? firstSdk.totalFeeBps : null;
-        }
-      } catch (error) {
-        lastSelectionError = error instanceof Error ? error.message : String(error);
-        selectedFeeBps = null;
-      }
-
-      lastSelectedFeeBps = selectedFeeBps == null ? null : Number(selectedFeeBps);
-      if (lastSelectedFeeBps != null && lastSelectedFeeBps === Number(totalFeeBps)) {
-        return { tokenPriceUSD: null, marketCapUSD: preMarketCapUsd };
-      }
-      lastSkipReason = "selected_fee_does_not_match_candidate";
-    }
-
-    const feeDiag = {
-      selectedFeeBps: lastSelectedFeeBps,
-      totalFeeBps: lastTotalFeeBps,
-      lastSkipReason,
-      lastSelectionError,
-      candidateBps,
-      sdkFeeTiers: sdkFeeTiers.map((tier) => ({
-        threshold: tier.threshold ? tier.threshold.toString() : null,
-        totalFeeBps: tier.totalFeeBps,
-      })),
-      feeConfig: feeConfig ? {
-        feeTiers: Array.isArray(feeConfig.feeTiers) ? feeConfig.feeTiers.map((tier: any) => ({
-          marketCapLamportsThreshold: tier.marketCapLamportsThreshold ? tier.marketCapLamportsThreshold.toString() : null,
-          fees: tier.fees ? {
-            lpFeeBps: tier.fees.lpFeeBps ? tier.fees.lpFeeBps.toString() : null,
-            protocolFeeBps: tier.fees.protocolFeeBps ? tier.fees.protocolFeeBps.toString() : null,
-            creatorFeeBps: tier.fees.creatorFeeBps ? tier.fees.creatorFeeBps.toString() : null,
-          } : null,
-        })) : null,
-        flatFees: feeConfig.flatFees ? {
-          lpFeeBps: feeConfig.flatFees.lpFeeBps ? feeConfig.flatFees.lpFeeBps.toString() : null,
-          protocolFeeBps: feeConfig.flatFees.protocolFeeBps ? feeConfig.flatFees.protocolFeeBps.toString() : null,
-          creatorFeeBps: feeConfig.flatFees.creatorFeeBps ? feeConfig.flatFees.creatorFeeBps.toString() : null,
-        } : null,
-      } : null,
-    };
-    console.log(`PREBUY_MC: UNKNOWN reason=no_fee_tier_match selectedFeeBps=${lastSelectedFeeBps ?? "null"} totalFeeBps=${lastTotalFeeBps ?? "null"} candidateBps=${JSON.stringify(candidateBps)} sdkFeeTiers=${JSON.stringify(feeDiag.sdkFeeTiers)} feeConfig=${JSON.stringify(feeDiag.feeConfig)}`);
-    return null;
-  } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : String(error);
-    console.log(`PREBUY_MC: UNKNOWN reason=exception ${errorMessage}`);
+    console.log(`❌ Local Pump.fun build unavailable for ${mint}:`, e?.message ?? String(e), `(${elapsed}ms)`);
     return null;
   }
 }
@@ -2129,7 +1606,7 @@ async function buildPumpPortalTx(
   pool: "pump" | "auto" = "auto"
 ): Promise<Uint8Array | null> {
   const url = "https://pumpportal.fun/api/trade-local";
-  for (let attempt = 1; attempt <= 1; attempt++) {
+  for (let attempt = 1; attempt <= 2; attempt++) {
     try {
       const res: any = await fetch(url, {
         agent: pumpPortalAgent,
@@ -2152,6 +1629,7 @@ async function buildPumpPortalTx(
         const truncated = String(errText).slice(0, 240);
         console.log(`✖ trade-local ${action} build failed (pool=${pool}, attempt=${attempt}): status=${res.status} body=${truncated}`);
         if ((res.status >= 500 || res.status === 429 || res.status === 408) && attempt < 2) {
+          await new Promise((resolve) => setTimeout(resolve, 250));
           continue;
         }
         return null;
@@ -2161,15 +1639,37 @@ async function buildPumpPortalTx(
       const tx = VersionedTransaction.deserialize(buf);
       tx.sign([wallet]);
 
-      // NOTE: removed pre-submit simulation for hot-path speed. Deterministic
-      // failures (such as Anchor 6005) will be handled post-submit or via
-      // background reconciliation. This keeps the builder fast and non-blocking.
+      // Quick local simulation on our low-latency buy execution RPC to detect
+      // deterministic failures such as Anchor Custom:6005 (BondingCurveComplete).
+      try {
+        const sim = await buyExecConnection.simulateTransaction(tx, {
+          commitment: "processed",
+          replaceRecentBlockhash: true,
+          sigVerify: false,
+        });
+        if (sim.value?.err) {
+          const logs = sim.value.logs?.filter(Boolean).join(" | ") ?? "no simulation logs";
+          console.log("Buy candidate simulation failed (pumpportal-built):", JSON.stringify(sim.value.err), logs);
+          const l = logs.toLowerCase();
+          if (l.includes("6005") || l.includes("bondingcurvecomplete") || JSON.stringify(sim.value.err).includes("6005")) {
+            pumpFallbackCache.set(mint, Date.now() + PUMP_FALLBACK_TTL_MS);
+            if (!pumpFirstFailureLogged.has(mint)) {
+              pumpFirstFailureLogged.add(mint);
+              console.log(`⚠️ Marked mint ${mint} as pump-fallback for ${PUMP_FALLBACK_TTL_MS}ms (Anchor 6005 / BondingCurveComplete)`);
+            }
+            return null;
+          }
+        }
+      } catch (e: any) {
+        console.log("⚠️ pumpPortal simulation unavailable:", e?.message ?? String(e));
+      }
 
       return tx.serialize();
     } catch (e: any) {
       const message = e?.message ?? String(e);
       console.log(`✖ trade-local ${action} error (pool=${pool}, attempt=${attempt}):`, message);
       if (attempt < 2) {
+        await new Promise((resolve) => setTimeout(resolve, 250));
         continue;
       }
       return null;
@@ -2304,8 +1804,6 @@ async function submitJupiterBuy(mint: string) {
 async function executeBuy(
     mint: string,
     targetSnapshotPromise?: Promise<{ tokenPriceUSD: number | null; marketCapUSD: number | null }>,
-    solAmountLamports?: number,
-    detectionMs?: number,
     skipMcCheck: boolean = false
   ) {
     // Atomic duplicate guard — must be first, before any async
@@ -2314,19 +1812,6 @@ async function executeBuy(
       return;
     }
     inFlight.add(mint);
-
-    if (!Number.isFinite(BUY_AMOUNT) || BUY_AMOUNT <= 0) {
-      console.log(`🚫 Buy skipped — configured BUY_AMOUNT_SOL is not positive: ${BUY_AMOUNT_SOL}`);
-      inFlight.delete(mint);
-      return;
-    }
-    try {
-      new PublicKey(mint);
-    } catch {
-      console.log(`🚫 Buy skipped — invalid mint: ${mint}`);
-      inFlight.delete(mint);
-      return;
-    }
 
     if (botPaused) {
       console.log("⏸ Buy skipped — bot is paused:", mint);
@@ -2352,17 +1837,6 @@ async function executeBuy(
       return;
     }
 
-    const detectionTs = detectionMs ?? nowMs();
-    type PreTradeSnapshot = { tokenPriceUSD: number | null; marketCapUSD: number | null };
-    const emptyPreTradeSnapshot: PreTradeSnapshot = { tokenPriceUSD: null, marketCapUSD: null };
-    let preTradeSnapshotPromise: Promise<PreTradeSnapshot> = Promise.resolve(emptyPreTradeSnapshot);
-    if (targetSnapshotPromise) {
-      preTradeSnapshotPromise = targetSnapshotPromise.then((snapshot) => snapshot ?? emptyPreTradeSnapshot).catch((error: any) => {
-        console.log(`PREBUY_MC: background reconstruction failed mint=${mint} err=${error?.message ?? String(error)}`);
-        return emptyPreTradeSnapshot;
-      });
-    }
-
     // Buy immediately. Market cap is measured after execution for reporting.
     console.log(`⚡ Immediate copy-buy path: ${mint}`);
 
@@ -2382,43 +1856,43 @@ async function executeBuy(
         dryRunStats.pnlSol += (Math.random() - 0.45) * 0.01;
       } else {
         const candidates: Array<[string, () => Promise<Uint8Array | null>]> = [];
-
         if (!isPumpFallbackActive(mint) && PUMPPORTAL_ENABLED) {
-          candidates.push(["PumpPortal-trade-local", async () => {
-            const tx = await buildPumpPortalTx("buy", mint, BUY_AMOUNT / 1e9, true, SLIPPAGE_BPS, "pump");
-            return isPumpFallbackActive(mint) ? null : tx;
-          }]);
+          candidates.push(["PumpPortal-trade-local", () => buildPumpPortalTx("buy", mint, BUY_AMOUNT / 1e9, true, SLIPPAGE_BPS, "auto")]);
         } else if (isPumpFallbackActive(mint)) {
           console.log(`ℹ️ Skipping PumpPortal build for ${mint} due to recent Anchor 6005 failures`);
         }
-
-        if (PREFER_PUMPPORTAL_ONLY && PUMPPORTAL_ENABLED && !isPumpFallbackActive(mint)) {
-          candidates.length = 0;
-          candidates.push(["PumpPortal-trade-local", async () => {
-            const tx = await buildPumpPortalTx("buy", mint, BUY_AMOUNT / 1e9, true, SLIPPAGE_BPS, "pump");
-            return isPumpFallbackActive(mint) ? null : tx;
-          }]);
-        }
-
         candidates.push(["local Pump SDK", () => buildLocalPumpBuyTx(mint, SLIPPAGE_BPS)]);
         candidates.push(["local PumpSwap SDK", () => buildLocalPumpSwapBuyTx(mint, SLIPPAGE_BPS)]);
-        const orderedCandidates = orderBuyBuilders(candidates.map(([name, build]) => ({ name, kind: "direct", build }))).map(({ name, build }) => [name, build] as [string, () => Promise<Uint8Array | null>]);
+        if (isJupiterAvailable() && !skipJupiterForMint(mint)) {
+          candidates.push(["Jupiter", () => buildJupiterBuyTx(mint)]);
+        } else if (!isJupiterAvailable()) {
+          console.log(`ℹ️ Skipping Jupiter build for ${mint} while the endpoint is temporarily disabled`);
+        }
+        const orderedCandidates = orderBuyBuilders(candidates.map(([name, build]) => ({ name, kind: name === "Jupiter" ? "fallback" : "direct", build }))).map(({ name, build }) => [name, build] as [string, () => Promise<Uint8Array | null>]);
 
-        // Keep direct builders first; PumpSwap handles tokens whose bonding curve has completed.
+        // Build and validate every route concurrently. The first valid route wins,
+        // so a slow or unavailable Pump.fun route cannot delay PumpSwap/Jupiter.
         const racedCandidates = orderedCandidates.map(async ([builderName, buildFn]) => {
           const bStart = nowMs();
           try {
-            console.log(`⚡ BUILD START: ${builderName} for ${mint} (${nowMs() - detectionTs}ms since detection)`);
+            console.log(`⏱ Builder start: ${builderName} for ${mint}`);
             const candidate = await buildFn();
             const bElapsed = nowMs() - bStart;
             if (!candidate) {
-              console.log(`↪ ${builderName} returned null (${bElapsed}ms)`);
+              console.log(`â†ª ${builderName} returned null (${bElapsed}ms)`);
               throw new Error(`${builderName} unavailable`);
             }
-            console.log(`✅ BUILDER_READY: ${builderName} (${nowMs() - detectionTs}ms since detection, ${bElapsed}ms build)`);
+            const validStart = nowMs();
+            const ok = await validateBuyTransaction(candidate);
+            const validElapsed = nowMs() - validStart;
+            if (!ok) {
+              console.log(`âš ï¸ ${builderName} simulation rejected (${bElapsed}ms build + ${validElapsed}ms sim)`);
+              throw new Error(`${builderName} simulation failed`);
+            }
+            console.log(`✅ Builder valid: ${builderName} (${bElapsed}ms build + ${validElapsed}ms sim)`);
             return { builderName, rawTx: candidate };
           } catch (e: any) {
-            console.log(`⚠️ ${builderName} build error:`, e?.stack ?? e?.message ?? String(e));
+            console.log(`âš ï¸ ${builderName} build error:`, e?.stack ?? e?.message ?? String(e));
             throw new Error(`${builderName} unavailable`);
           }
         });
@@ -2429,7 +1903,6 @@ async function executeBuy(
           const winner = await Promise.any(racedCandidates);
           selectedBuilder = winner.builderName;
           rawTx = winner.rawTx;
-          console.log(`BUILD_DONE builder=${selectedBuilder} mint=${mint}`);
         } catch {
           // Every builder failed or produced a transaction rejected by simulation.
         }
@@ -2438,54 +1911,14 @@ async function executeBuy(
           console.log("âŒ Buy aborted — all builders failed for", mint);
           return;
         }
-        const signStartMs = nowMs();
-        const signedTx = VersionedTransaction.deserialize(rawTx);
-        const payer = signedTx.message.staticAccountKeys[0];
-        const signatureBytes = signedTx.signatures[0];
-        if (!payer?.equals(wallet.publicKey) || signedTx.message.header.numRequiredSignatures < 1 || !signatureBytes?.some((byte) => byte !== 0)) {
-          console.log(`❌ Buy aborted — invalid payer/signature from ${selectedBuilder}: ${mint}`);
-          return;
-        }
-        const signDoneMs = nowMs();
-        const submitStartMs = nowMs();
-        console.log(`SIGN_DONE builder=${selectedBuilder} mint=${mint}`);
-        console.log(`SUBMIT_START builder=${selectedBuilder} mint=${mint}`);
-        console.log(`⚡ SIGN_START builder=${selectedBuilder} mint=${mint}`);
         sig = await sendRawTransactionDual(rawTx);
-        if (sig) {
-          const acceptedMs = nowMs();
-          console.log(`HOTPATH mint=${mint} builder=${selectedBuilder === "PumpPortal-trade-local" ? "pumpportal" : "local-sdk"} build_ms=${submitStartMs - detectionTs} sign_ms=${signDoneMs - signStartMs} submit_ms=${acceptedMs - submitStartMs} total_ms=${acceptedMs - detectionTs}`);
-          console.log(`🚀 SUBMITTED (${selectedBuilder}): ${mint} ${sig} (total ${acceptedMs - detectionTs}ms since detection)`);
-        }
+        if (sig) console.log(`ðŸš€ BUY submitted (${selectedBuilder}):`, mint, sig);
         if (!sig) return;
       }
 
-      if (!targetSnapshotPromise) {
-        preTradeSnapshotPromise = new Promise<PreTradeSnapshot>((resolve) => {
-          reconstructPreTradeSnapshotFromCache(mint, solAmountLamports ?? 0).then((snapshot) => {
-            resolve(snapshot ?? emptyPreTradeSnapshot);
-          }).catch((error: any) => {
-            console.log(`PREBUY_MC: background reconstruction failed mint=${mint} err=${error?.message ?? String(error)}`);
-            resolve(emptyPreTradeSnapshot);
-          });
-        });
-        console.log(`⚡ PREBUY_MC deferred until after submit: mint=${mint} policy_limit=$${PRE_TRADE_MAX_MARKET_CAP_USD.toFixed(0)}`);
-      }
-
-      void preTradeSnapshotPromise.then((snapshot) => {
-        const marketCap = snapshot.marketCapUSD;
-        if (marketCap === null || marketCap === undefined) {
-          console.log(`PREBUY_MC_POLICY result=unknown mint=${mint} limit=$${PRE_TRADE_MAX_MARKET_CAP_USD.toFixed(0)} submitted=true`);
-        } else if (shouldRejectPreTradeMarketCap(marketCap)) {
-          console.log(`PREBUY_MC_POLICY result=reject-after-submit mint=${mint} market_cap=$${marketCap.toFixed(0)} limit=$${PRE_TRADE_MAX_MARKET_CAP_USD.toFixed(0)}`);
-        } else {
-          console.log(`PREBUY_MC_POLICY result=accept mint=${mint} market_cap=$${marketCap.toFixed(0)} limit=$${PRE_TRADE_MAX_MARKET_CAP_USD.toFixed(0)}`);
-        }
-      }).catch(() => {});
-
       const myMcPromise = delayedMarketCapSnapshot(mint, 2000);
-      const targetMcPromise = preTradeSnapshotPromise;
-      const confirmationPromise = waitForConfirmation(sig);
+      const targetMcPromise = targetSnapshotPromise ?? Promise.resolve({ tokenPriceUSD: null, marketCapUSD: null });
+      let confirmationPromise = waitForConfirmation(sig);
       let actual = await waitForBalance(mint);
       let confirmation = await confirmationPromise;
 
@@ -2711,17 +2144,7 @@ async function handleTxInternal(tx: any, signature: string): Promise<boolean> {
       if (postAmount > preAmount) {
         foundAny = true;
         console.log("ðŸ”¥ DETECTED buy:", post.mint);
-        // Avoid network MC lookups on the hot path; rely on cached reconstruction.
-        const decoded = tryFastDecode(tx.meta.logMessages ?? []);
-        const solAmountLamports =
-          decoded !== null &&
-          decoded.isBuy === true &&
-          decoded.mint === post.mint &&
-          decoded.user === post.owner &&
-          decoded.solAmount > 0
-            ? decoded.solAmount
-            : 0;
-        executeBuy(post.mint, undefined, solAmountLamports, nowMs());
+        executeBuy(post.mint, delayedMarketCapSnapshot(post.mint));
         return true;
       }
     }
@@ -2773,7 +2196,7 @@ function onWalletLog(log: Logs) {
     console.log(`⚡ IDL FAST-PATH BUY: ${fast.mint}`);
     seenSignatures.add(signature);
     // Fire and forget - don't await executeBuy to minimize latency
-    executeBuy(fast.mint, undefined, fast.solAmount, nowMs()).catch(e =>
+    executeBuy(fast.mint, delayedMarketCapSnapshot(fast.mint), true).catch(e =>
       console.log("⚠️ executeBuy error (non-blocking):", e.message)
     );
     return;
@@ -2939,13 +2362,11 @@ async function startPumpPortal() {
     ws.onopen = () => {
       pumpPortalConnected = true;
       reconnectDelayMs = RECONNECT_DELAY_MIN_MS;
-      console.log("BOT_STARTUP: PumpPortal connected");
       console.log("âœ… PumpPortal channel connected");
       ws.send(JSON.stringify({ method: "subscribeAccountTrade", keys: TARGET_WALLET_STRINGS }));
-      console.log("BOT_STARTUP: subscription sent");
     };
 
-    ws.onmessage = async (ev: any) => {
+    ws.onmessage = (ev: any) => {
        try {
          const raw = typeof ev.data === "string" ? ev.data : ev.data.toString();
          const msg = JSON.parse(raw);
@@ -2966,73 +2387,8 @@ async function startPumpPortal() {
          }
          if (msg.txType !== "buy") return;
 
-        console.log("âš¡ PUMPPORTAL detected buy:", msg.mint);
-        seenSignatures.add(msg.signature);
-        const detectionTs = nowMs();
-
-        void primeMintDerivedState(msg.mint, detectionTs).catch((e: any) => {
-          console.log(`PRIME_FAILED: mint=${msg.mint} dur=${nowMs() - detectionTs}ms err=${e?.message ?? String(e)}`);
-        });
-
-         // Temporary read-only capture for verifier: save raw PumpPortal event
-         // plus any already-cached bonding-curve / warm-state data. This does
-         // NOT change buy logic nor perform additional network calls.
-         try {
-           (async () => {
-             try {
-               const captureDir = "verifier/real-events";
-               await fs.promises.mkdir(captureDir, { recursive: true });
-               const cached = bondingCurveCache.get(msg.mint) || null;
-               const warm = buyStateWarmCache.get(msg.mint) || null;
-
-               function bnToStr(v: any) {
-                 if (v == null) return null;
-                 if (typeof v === "object" && typeof v.toString === "function") return v.toString();
-                 return String(v);
-               }
-
-               const capture: any = {
-                 rawEvent: msg,
-                 mint: msg.mint,
-                 solAmount: msg.solAmount ?? null,
-                 signature: msg.signature ?? null,
-                 slot: msg.slot ?? null,
-                 timestamp: Date.now(),
-                 bondingCurveCache: null,
-                 buyStateWarmCache: null,
-               };
-
-               if (cached) {
-                 capture.bondingCurveCache = {
-                   associatedBondingCurve: cached.associatedBondingCurve ? String(cached.associatedBondingCurve) : null,
-                   virtualQuoteReserves: bnToStr(cached.virtualQuoteReserves),
-                   virtualTokenReserves: bnToStr(cached.virtualTokenReserves),
-                   realQuoteReserves: bnToStr(cached.realQuoteReserves),
-                   realTokenReserves: bnToStr(cached.realTokenReserves),
-                   timestamp: cached.timestamp ?? null,
-                 };
-               }
-
-               if (warm) {
-                 capture.buyStateWarmCache = {
-                   feeConfig: warm.feeConfig ?? null,
-                   mintSupply: warm.mintState?.supply ? String(warm.mintState.supply) : null,
-                   buyStateBondingCurve: warm.buyState?.bondingCurve ?? null,
-                   timestamp: warm.timestamp ?? null,
-                 };
-               }
-
-               const fileName = `${Date.now()}-${msg.mint}.json`;
-               const filePath = `${captureDir}/${fileName}`;
-               await fs.promises.writeFile(filePath, JSON.stringify(capture, null, 2));
-               console.log("🔒 Wrote PumpPortal capture:", filePath);
-             } catch (e: any) {
-               console.log("⚠️ failed to write PumpPortal capture:", e?.message ?? String(e));
-             }
-           })();
-         } catch (e) {
-           // swallow errors to avoid impacting hot path
-         }
+         console.log("âš¡ PUMPPORTAL detected buy:", msg.mint);
+         seenSignatures.add(msg.signature);
 
           // Prime bonding curve cache from PumpPortal event (if present)
           // PumpPortal sometimes includes bonding curve account in the trade event
@@ -3042,95 +2398,42 @@ async function startPumpPortal() {
               const associatedBondingCurveKey = new PublicKey(msg.associatedBondingCurve);
               // Fetch and cache asynchronously, don't block the hot path
               (async () => {
-                const primeStart = nowMs();
-                console.log(`PRIME_START: mint=${msg.mint} ts=${Date.now()} rel=${primeStart - detectionTs}ms`);
-                // Start operations in parallel but capture start times
-                const bcStart = nowMs();
-                const bcPromise = pumpSdkConnection.getAccountInfo(bondingCurveKey, "processed");
-                console.log(`PRIME_OP_START: bondingCurve.getAccountInfo start=${bcStart}`);
-
-                const abcStart = nowMs();
-                const abcPromise = pumpSdkConnection.getAccountInfo(associatedBondingCurveKey, "processed");
-                console.log(`PRIME_OP_START: associatedBondingCurve.getAccountInfo start=${abcStart}`);
-
-                const feeStart = nowMs();
-                const feePromise = pumpSdkForBuild.fetchFeeConfig();
-                console.log(`PRIME_OP_START: fetchFeeConfig start=${feeStart}`);
-
-                let bcAccount: any = null;
-                let abcAccount: any = null;
-                let feeConfig: any = null;
                 try {
-                  try {
-                    bcAccount = await bcPromise;
-                    const bcEnd = nowMs();
-                    console.log(`PRIME_OP_END: bondingCurve.getAccountInfo end=${bcEnd} dur=${bcEnd - bcStart}ms`);
-                  } catch (e: any) {
-                    const bcFail = nowMs();
-                    console.log(`PRIME_OP_FAILED: bondingCurve.getAccountInfo dur=${bcFail - bcStart}ms err=${e?.message ?? String(e)}`);
-                    throw e;
-                  }
-
-                  try {
-                    abcAccount = await abcPromise;
-                    const abcEnd = nowMs();
-                    console.log(`PRIME_OP_END: associatedBondingCurve.getAccountInfo end=${abcEnd} dur=${abcEnd - abcStart}ms`);
-                  } catch (e: any) {
-                    const abcFail = nowMs();
-                    console.log(`PRIME_OP_FAILED: associatedBondingCurve.getAccountInfo dur=${abcFail - abcStart}ms err=${e?.message ?? String(e)}`);
-                    throw e;
-                  }
-
-                  try {
-                    feeConfig = await feePromise;
-                    const feeEnd = nowMs();
-                    console.log(`PRIME_OP_END: fetchFeeConfig end=${feeEnd} dur=${feeEnd - feeStart}ms`);
-                  } catch (e: any) {
-                    const feeFail = nowMs();
-                    console.log(`PRIME_OP_FAILED: fetchFeeConfig dur=${feeFail - feeStart}ms err=${e?.message ?? String(e)}`);
-                    throw e;
-                  }
-
+                  const [bcAccount, abcAccount, feeConfig] = await Promise.all([
+                    pumpSdkConnection.getAccountInfo(bondingCurveKey, "processed"),
+                    pumpSdkConnection.getAccountInfo(associatedBondingCurveKey, "processed"),
+                    pumpSdkForBuild.fetchFeeConfig(),
+                  ]);
                   if (bcAccount && abcAccount && feeConfig) {
+                    // Parse bonding curve state (ASCII layout from Pump.fun)
                     const data = bcAccount.data;
                     if (data.length >= 8 + 8 + 8 + 8 + 8 + 8) {
-                      const virtualTokenReserves = new BN(data.subarray(8, 16).readBigUInt64LE(0).toString());
-                      const virtualQuoteReserves = new BN(data.subarray(16, 24).readBigUInt64LE(0).toString());
-                      const realTokenReserves = new BN(data.subarray(24, 32).readBigUInt64LE(0).toString());
-                      const realQuoteReserves = new BN(data.subarray(32, 40).readBigUInt64LE(0).toString());
-                      const tokenTotalSupply = data.length >= 48 ? new BN(data.subarray(40, 48).readBigUInt64LE(0).toString()) : null;
+                      // Discriminator (8) + virtualQuoteReserves (8) + virtualTokenReserves (8) + realQuoteReserves (8) + realTokenReserves (8) + totalSupply (8)
+                      const virtualQuoteReserves = new BN(data.subarray(8, 16).readBigUInt64LE(0).toString());
+                      const virtualTokenReserves = new BN(data.subarray(16, 24).readBigUInt64LE(0).toString());
+                      const realQuoteReserves = new BN(data.subarray(24, 32).readBigUInt64LE(0).toString());
+                      const realTokenReserves = new BN(data.subarray(32, 40).readBigUInt64LE(0).toString());
                       bondingCurveCache.set(msg.mint, {
                         bondingCurve: bondingCurveKey,
                         associatedBondingCurve: associatedBondingCurveKey,
-                        virtualTokenReserves,
                         virtualQuoteReserves,
-                        realTokenReserves,
+                        virtualTokenReserves,
                         realQuoteReserves,
-                        tokenTotalSupply,
+                        realTokenReserves,
                         timestamp: Date.now(),
                       });
-                      const primeEnd = nowMs();
-                      const warm = buyStateWarmCache.get(msg.mint) || null;
-                      const solPriceUsd = Number(process.env.SOL_PRICE_USD ?? warm?.global?.solPriceUsd ?? warm?.global?.solUsdPrice ?? 0);
-                      console.log(`PRIME_COMPLETE: mint=${msg.mint} totalDur=${primeEnd - primeStart}ms populated=true buyStateWarmCache=${warm ? "present" : "absent"} fields={virtualTokenReserves:${virtualTokenReserves != null},virtualQuoteReserves:${virtualQuoteReserves != null},realTokenReserves:${realTokenReserves != null},tokenTotalSupply:${tokenTotalSupply != null},feeConfig:${feeConfig != null},solPriceUsd:${!!solPriceUsd}}`);
-                    } else {
-                      const primeEnd = nowMs();
-                      console.log(`PRIME_COMPLETE: mint=${msg.mint} totalDur=${primeEnd - primeStart}ms populated=false reason=insufficient_account_data_len=${data?.length ?? 0}`);
+                      console.log("ðŸ’¾ Cached bonding curve for", msg.mint);
                     }
-                  } else {
-                    const primeEnd = nowMs();
-                    console.log(`PRIME_COMPLETE: mint=${msg.mint} totalDur=${primeEnd - primeStart}ms populated=false reason=missing_accounts_or_feeConfig`);
                   }
                 } catch (e: any) {
-                  const primeFail = nowMs();
-                  console.log(`PRIME_FAILED: mint=${msg.mint} dur=${primeFail - primeStart}ms err=${e?.message ?? String(e)}`);
+                  console.log("âš ï¸ Bonding curve cache prime failed:", e.message);
                 }
               })();
             } catch {}
           }
 
-         executeBuy(msg.mint, undefined, msg.solAmount, nowMs()).catch(e =>
-            console.log("⚠️ executeBuy error (non-blocking):", e.message)
+         executeBuy(msg.mint, delayedMarketCapSnapshot(msg.mint), true).catch(e =>
+            console.log("âš ï¸ executeBuy error (non-blocking):", e.message)
           );
        } catch {
          // non-JSON frame, ignore
@@ -3210,7 +2513,6 @@ async function pollForMissedTrades() {
 /* ================= KEEP-ALIVE SERVER ================= */
 
 const app = express();
-app.use(express.json());
 app.get("/", (_req, res) => res.send("Engine Active"));
 app.get("/health", (_req, res) => {
   const mem = process.memoryUsage().heapUsed / 1024 / 1024;
@@ -3224,20 +2526,6 @@ app.get("/health", (_req, res) => {
     memoryMB: Math.round(mem),
     timestamp: Date.now(),
   });
-});
-
-app.post(TELEGRAM_WEBHOOK_ROUTE, async (req, res) => {
-  try {
-    const update = req.body ?? {};
-    const msg = update.message;
-    if (msg) {
-      await handleTelegramCommandMessage(msg);
-    }
-    res.sendStatus(200);
-  } catch (err: any) {
-    console.error("Webhook error:", err?.message ?? String(err));
-    res.sendStatus(500);
-  }
 });
 
 // Simple HTTP endpoint to pre-warm a specific mint in the prebuild/buyState cache.
@@ -3368,22 +2656,11 @@ let grpcManager: {
 } | null = null;
 
 async function start() {
-  console.log("BOT_STARTUP: process entered");
   console.log("ðŸš€ Copy-trade bot starting. Targets:", TARGET_WALLETS.map(w => w.toString()).join(", "));
 
   logFeeSizingWarning();
 
   await Promise.all([loadPositions(), initPumpDecoder(), initPollingCursor()]);
-  await refreshSolPriceUsd();
-  setInterval(() => {
-    refreshSolPriceUsd().catch(() => {});
-  }, SOL_PRICE_CACHE_TTL_MS);
-
-  // Log Helius WS / detection configuration for debugging 429 sources
-  const heliusWsEnv = (process.env.DISABLE_HELIUS_WS ?? "false").toLowerCase() === "true";
-  const heliusWsDisabled = heliusWsEnv || PUMPPORTAL_ENABLED;
-  console.log(`âœ… Helius WS disabled: ${heliusWsDisabled} (DISABLE_HELIUS_WS=${process.env.DISABLE_HELIUS_WS ?? "unset"}, PUMPPORTAL=${PUMPPORTAL_ENABLED})`);
-  console.log(`âœ… Detection channels configured: ${DETECTION_URLS.length} URLs, extra unique: ${uniqueDetectionUrls.length}`);
 
   // Start background blockhash refresher (replaces old 25s interval)
   startBlockhashRefresher();
@@ -3430,12 +2707,7 @@ async function start() {
   rotateSubscriptions();
   setInterval(pollForMissedTrades, POLL_INTERVAL_MS);
   setInterval(checkWalletBalance, 60 * 1000);
-  if (TELEGRAM_WEBHOOK_MODE) {
-    await setupTelegramWebhook();
-  } else {
-    // Poll Telegram commands using long-polling; default every 30s interval
-    setInterval(pollTelegramCommands, TELEGRAM_POLL_INTERVAL_MS);
-  }
+  setInterval(pollTelegramCommands, 3000);
 
   // Probe and rank submission RPCs, then warm them periodically
   await probeSubmissionConnections().catch(() => {});
@@ -3454,11 +2726,7 @@ async function start() {
     }
   }, 30_000);
 
-  if (PUMPPORTAL_ENABLED) {
-    console.log("BOT_STARTUP: starting PumpPortal");
-    await startPumpPortal();
-    console.log("BOT_STARTUP: PumpPortal connected");
-  }
+  if (PUMPPORTAL_ENABLED) await startPumpPortal();
 
   await checkWalletBalance();
 
@@ -3471,16 +2739,12 @@ async function start() {
   await sendTelegramAlert(
     `✅ <b>Bot Active</b>\nTargets:\n${targetList}\n` +
     `Buy: ${BUY_AMOUNT_SOL} SOL | Minimum copied buy: disabled\n` +
-    `Buy path: PumpPortal + local Pump SDK (direct only)\n` +
+    `Buy path: concurrent PumpPortal / Pump SDK / PumpSwap / Jupiter\n` +
     `Channels: ${channelsDesc}\n` +
-    `Pre-buy MC filter: $${PRE_TRADE_MAX_MARKET_CAP_USD.toLocaleString()} max\n` +
+    `Pre-buy MC filter: disabled\n` +
     `Commands: /pause /resume /status${TELEGRAM_EXTENDED ? ' /positions /stats /history /settings' : ''}`
   );
 }
-
-start().catch((err) => {
-  console.error("BOT_STARTUP FAILED:", err);
-});
 
 // Handle gRPC trade events
 async function handleGrpcTradeEvent(event: GrpcTradeEvent) {
@@ -3489,7 +2753,7 @@ async function handleGrpcTradeEvent(event: GrpcTradeEvent) {
 
     if (event.type === "buy") {
       // Fire and forget - don't await executeBuy to minimize latency
-      executeBuy(event.mint, undefined, event.solAmount, nowMs()).catch(e =>
+      executeBuy(event.mint, delayedMarketCapSnapshot(event.mint), true).catch(e =>
         console.log("⚠️ executeBuy error (non-blocking):", e.message)
       );
     } else if (event.type === "sell") {
@@ -3507,3 +2771,24 @@ async function handleGrpcTradeEvent(event: GrpcTradeEvent) {
     console.error("[gRPC] Event handler error:", err.message);
   }
 }
+
+start();
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

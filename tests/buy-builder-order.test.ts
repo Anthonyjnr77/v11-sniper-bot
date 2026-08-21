@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   PRE_TRADE_MAX_MARKET_CAP_USD,
   orderBuyBuilders,
+  selectBuyRoute,
   shouldRejectPreTradeMarketCap,
   type BuyBuilderCandidate,
 } from "../hot-path.js";
@@ -19,12 +20,45 @@ test("keeps the buy hot path direct-only", () => {
   const ordered = orderBuyBuilders(candidates);
 
   const names = ordered.map((candidate: BuyBuilderCandidate) => candidate.name);
-  // V15 contract: direct builders must be exactly these two and come first
-  assert.equal(names[0], "PumpPortal-trade-local");
-  assert.equal(names[1], "local Pump SDK");
+  // Direct local Pump.fun is the primary builder; external/local fallbacks follow.
+  assert.equal(names[0], "local Pump SDK");
+  assert.equal(names[1], "PumpPortal-trade-local");
   // Ensure the direct kinds are first
   assert.equal(ordered[0]?.kind, "direct");
   assert.equal(ordered[1]?.kind, "direct");
+});
+
+test("routes confirmed incomplete curves to Pump.fun only", () => {
+  assert.equal(
+    selectBuyRoute({
+      confirmedPumpFunCurve: true,
+      curveComplete: false,
+      confirmedMigratedToPumpSwap: false,
+    }),
+    "pumpfun",
+  );
+});
+
+test("routes PumpSwap only after confirmed migration", () => {
+  assert.equal(
+    selectBuyRoute({
+      confirmedPumpFunCurve: true,
+      curveComplete: true,
+      confirmedMigratedToPumpSwap: true,
+    }),
+    "pumpswap",
+  );
+});
+
+test("does not select a venue when migration state is unknown", () => {
+  assert.equal(
+    selectBuyRoute({
+      confirmedPumpFunCurve: false,
+      curveComplete: false,
+      confirmedMigratedToPumpSwap: false,
+    }),
+    "recovery",
+  );
 });
 
 test("rejects pre-trade market caps above the V14 threshold", () => {
