@@ -13,8 +13,8 @@ export function shouldRejectPreTradeMarketCap(marketCapUsd: number | null | unde
 }
 
 const DIRECT_BUILDER_ORDER = [
-  "local Pump SDK",
   "PumpPortal-trade-local",
+  "local Pump SDK",
   "local PumpSwap SDK",
 ];
 

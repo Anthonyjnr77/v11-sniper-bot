@@ -20,9 +20,9 @@ test("keeps the buy hot path direct-only", () => {
   const ordered = orderBuyBuilders(candidates);
 
   const names = ordered.map((candidate: BuyBuilderCandidate) => candidate.name);
-  // Direct local Pump.fun is the primary builder; external/local fallbacks follow.
-  assert.equal(names[0], "local Pump SDK");
-  assert.equal(names[1], "PumpPortal-trade-local");
+  // PumpPortal trade-local is the primary builder; local builders follow.
+  assert.equal(names[0], "PumpPortal-trade-local");
+  assert.equal(names[1], "local Pump SDK");
   // Ensure the direct kinds are first
   assert.equal(ordered[0]?.kind, "direct");
   assert.equal(ordered[1]?.kind, "direct");
