@@ -12,7 +12,7 @@ import {
 test("keeps the buy hot path direct-only", () => {
   const candidates: BuyBuilderCandidate[] = [
     { name: "Jupiter", kind: "fallback", build: async () => null },
-    { name: "local PumpSwap SDK", kind: "fallback", build: async () => null },
+    { name: "local PumpSwap SDK", kind: "direct", build: async () => null },
     { name: "PumpPortal-trade-local", kind: "direct", build: async () => null },
     { name: "local Pump SDK", kind: "direct", build: async () => null },
   ];
@@ -20,9 +20,9 @@ test("keeps the buy hot path direct-only", () => {
   const ordered = orderBuyBuilders(candidates);
 
   const names = ordered.map((candidate: BuyBuilderCandidate) => candidate.name);
-  // PumpPortal trade-local is the primary builder; local builders follow.
-  assert.equal(names[0], "PumpPortal-trade-local");
-  assert.equal(names[1], "local Pump SDK");
+  // Local builders are primary; PumpPortal is the secondary fallback.
+  assert.equal(names[0], "local Pump SDK");
+  assert.equal(names[1], "local PumpSwap SDK");
   // Ensure the direct kinds are first
   assert.equal(ordered[0]?.kind, "direct");
   assert.equal(ordered[1]?.kind, "direct");
@@ -61,9 +61,9 @@ test("does not select a venue when migration state is unknown", () => {
   );
 });
 
-test("rejects pre-trade market caps above the V14 threshold", () => {
-  // Unknown market cap should be rejected (safety-first)
-  assert.equal(shouldRejectPreTradeMarketCap(null), true);
+test("rejects only known pre-trade market caps above the V14 threshold", () => {
+  // Fresh detections can have an unknown market cap without being blocked.
+  assert.equal(shouldRejectPreTradeMarketCap(null), false);
   assert.equal(shouldRejectPreTradeMarketCap(4999), false);
   assert.equal(PRE_TRADE_MAX_MARKET_CAP_USD, 6000);
   assert.equal(shouldRejectPreTradeMarketCap(PRE_TRADE_MAX_MARKET_CAP_USD), true);

@@ -12,7 +12,7 @@ import {
 } from "@solana/web3.js";
 import type { Logs } from "@solana/web3.js";
 import { Program, AnchorProvider, BorshEventCoder } from "@coral-xyz/anchor";
-import { getMint, getAssociatedTokenAddress, getAssociatedTokenAddressSync, TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID } from "@solana/spl-token";
+import { createAssociatedTokenAccountIdempotentInstruction, getMint, getAssociatedTokenAddress, getAssociatedTokenAddressSync, TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID } from "@solana/spl-token";
 import { OnlinePumpSdk, PUMP_SDK, getBuyTokenAmountFromSolAmount, bondingCurvePda } from "@pump-fun/pump-sdk";
 import { OnlinePumpAmmSdk, PUMP_AMM_PROGRAM_ID, PUMP_AMM_SDK, canonicalPumpPoolPda } from "@pump-fun/pump-swap-sdk";
 import BN from "bn.js";
@@ -1806,6 +1806,14 @@ const localPumpRpcReadsByMint = new Map<string, number>();
     if (!Array.isArray(instructions) || instructions.length === 0) {
       throw new Error("buyInstructions returned no instructions");
     }
+    const associatedTokenAccount = getAssociatedTokenAddressSync(mintKey, wallet.publicKey, false, tokenProgram);
+    const ataInstruction = createAssociatedTokenAccountIdempotentInstruction(
+      wallet.publicKey,
+      associatedTokenAccount,
+      wallet.publicKey,
+      mintKey,
+      tokenProgram,
+    );
 
     const dynamicFee = getDynamicPriorityFee();
     const dynamicComputeUnits = LOCAL_PUMP_COMPUTE_UNITS; // avoid hot-path simulation
@@ -1824,6 +1832,7 @@ const localPumpRpcReadsByMint = new Map<string, number>();
         ComputeBudgetProgram.setComputeUnitLimit({ units: dynamicComputeUnits }),
         ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityMicroLamports }),
         ...jitoTipInstructions,
+        ataInstruction,
         ...instructions,
       ],
     }).compileToV0Message();
@@ -2130,6 +2139,14 @@ async function buildLocalPumpSwapBuyTx(mint: string, slippageBps = SLIPPAGE_BPS)
     if (!Array.isArray(instructions) || instructions.length === 0) {
       throw new Error("buyQuoteInput returned no instructions");
     }
+    const associatedTokenAccount = getAssociatedTokenAddressSync(mintKey, wallet.publicKey, false, TOKEN_PROGRAM_ID);
+    const ataInstruction = createAssociatedTokenAccountIdempotentInstruction(
+      wallet.publicKey,
+      associatedTokenAccount,
+      wallet.publicKey,
+      mintKey,
+      TOKEN_PROGRAM_ID,
+    );
 
     const dynamicFee = getDynamicPriorityFee();
     const dynamicComputeUnits = await simulateAndGetComputeUnits(pumpSdkConnection, instructions, wallet.publicKey);
@@ -2148,6 +2165,7 @@ async function buildLocalPumpSwapBuyTx(mint: string, slippageBps = SLIPPAGE_BPS)
         ComputeBudgetProgram.setComputeUnitLimit({ units: dynamicComputeUnits }),
         ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityMicroLamports }),
         ...jitoTipInstructions,
+        ataInstruction,
         ...instructions,
       ],
     }).compileToV0Message();
@@ -2439,23 +2457,25 @@ async function executeBuy(
         let rawTx: Uint8Array | null = null;
         const buildStartMs = nowMs();
         console.log(`BUILD_START mint=${mint} event_to_build_start_ms=${(buildStartMs - detectionTs).toFixed(2)}`);
-        if (PUMPPORTAL_ENABLED && !isPumpFallbackActive(mint)) {
-          console.log(`⚡ BUILD START: PumpPortal trade-local for ${mint} (${nowMs() - detectionTs}ms since detection)`);
-          rawTx = await buildPumpPortalTx("buy", mint, BUY_AMOUNT / 1e9, true, SLIPPAGE_BPS, "pump");
-          if (rawTx) selectedBuilder = "PumpPortal-trade-local";
+        const route = getBuyRouteForMint(mint);
+        if (route === "pumpfun" || route === "recovery") {
+          console.log(`⚡ BUILD START: local Pump SDK primary for ${mint}`);
+          rawTx = await buildLocalPumpBuyTx(mint, SLIPPAGE_BPS);
+          if (rawTx) selectedBuilder = "local Pump SDK";
         }
 
-        if (!rawTx) {
-          const route = getBuyRouteForMint(mint);
-          if (route === "pumpfun" || route === "recovery") {
-            console.log(`⚡ BUILD START: local Pump SDK fallback for ${mint}`);
-            rawTx = await buildLocalPumpBuyTx(mint, SLIPPAGE_BPS);
-            if (rawTx) selectedBuilder = "local Pump SDK";
-          } else if (route === "pumpswap") {
-            console.log(`⚡ BUILD START: local PumpSwap SDK fallback for ${mint}`);
-            rawTx = await buildLocalPumpSwapBuyTx(mint, SLIPPAGE_BPS);
-            if (rawTx) selectedBuilder = "local PumpSwap SDK";
-          }
+        // A complete curve is deterministic; switch venues immediately.
+        if (!rawTx && (route === "pumpswap" || isPumpFallbackActive(mint))) {
+          console.log(`⚡ BUILD START: local PumpSwap SDK fallback for ${mint}`);
+          rawTx = await buildLocalPumpSwapBuyTx(mint, SLIPPAGE_BPS);
+          if (rawTx) selectedBuilder = "local PumpSwap SDK";
+        }
+
+        if (!rawTx && PUMPPORTAL_ENABLED) {
+          const pool = route === "pumpswap" || isPumpFallbackActive(mint) ? "auto" : "pump";
+          console.log(`⚡ BUILD START: PumpPortal trade-local fallback for ${mint} (${nowMs() - detectionTs}ms since detection)`);
+          rawTx = await buildPumpPortalTx("buy", mint, BUY_AMOUNT / 1e9, true, SLIPPAGE_BPS, pool);
+          if (rawTx) selectedBuilder = "PumpPortal-trade-local";
         }
 
         if (!rawTx) {

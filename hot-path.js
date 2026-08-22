@@ -1,14 +1,14 @@
 export const DIRECT_BUILDER_ORDER = [
-  "PumpPortal-trade-local",
   "local Pump SDK",
   "local PumpSwap SDK",
+  "PumpPortal-trade-local",
 ];
 
 export const PRE_TRADE_MAX_MARKET_CAP_USD = 6000;
 
 export function shouldRejectPreTradeMarketCap(marketCapUsd) {
-  // Unknown pre-trade market caps are rejected to avoid guessing.
-  if (marketCapUsd === null || marketCapUsd === undefined) return true;
+  // Fresh detections may not have a reconstructed market cap yet.
+  if (marketCapUsd === null || marketCapUsd === undefined) return false;
   return Number(marketCapUsd) >= PRE_TRADE_MAX_MARKET_CAP_USD;
 }
 
